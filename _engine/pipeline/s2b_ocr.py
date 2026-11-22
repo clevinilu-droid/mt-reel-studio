@@ -297,21 +297,14 @@ def run_step2b(target_dir: Path, force: bool = False, batch_size: int = 64) -> d
     if not vlm_url:
         from rapidocr_onnxruntime import RapidOCR
 
-        use_cuda = False
-        try:
-            import onnxruntime as ort
-
-            use_cuda = "CUDAExecutionProvider" in ort.get_available_providers()
-        except Exception:
-            pass
         ocr_engine = RapidOCR(
             use_angle_cls=False,
-            det_use_cuda=use_cuda,
+            det_use_cuda=False,
             det_model_path=None,
-            rec_use_cuda=use_cuda,
+            rec_use_cuda=False,
             rec_model_path=None,
         )
-        engine_used = f"rapidocr_{'cuda' if use_cuda else 'cpu'}"
+        engine_used = "rapidocr_cpu"
 
     total_todo = len(todo)
     processed = 0

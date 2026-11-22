@@ -340,18 +340,8 @@ def _run_spotcheck(
     if prog_cb:
         prog_cb(82.0, "Đang nạp Whisper + RapidOCR cho Spot-Check...")
     t_load0 = time.perf_counter()
-    try:
-        import torch
-
-        use_cuda = torch.cuda.is_available()
-    except Exception:
-        use_cuda = False
-
-    whisper = WhisperModel(
-        "small",
-        device="cuda" if use_cuda else "cpu",
-        compute_type="float16" if use_cuda else "int8",
-    )
+    # Dùng Whisper small CPU int8 + RapidOCR CPU cho 3 đoạn 20s để tránh xung đột/treo cuDNN trong container
+    whisper = WhisperModel("small", device="cpu", compute_type="int8")
     ocr = RapidOCR()
     load_s = time.perf_counter() - t_load0
 
@@ -379,7 +369,7 @@ def _run_spotcheck(
             log_cb(f"[STEP 1C] Spot-Check điểm {wi}/{len(windows)} tại {ws:.1f}s ({window_dur:.0f}s)...")
 
         audio_arr = _read_wav_slice(wav_16k, ws, window_dur)
-        segs_iter, _ = whisper.transcribe(audio_arr, language="zh", vad_filter=True, beam_size=1)
+        segs_iter, _ = whisper.transcribe(audio_arr, language="zh", vad_filter=False, beam_size=1)
         asr_segs = [
             {"start": round(ws + s.start, 2), "end": round(ws + s.end, 2), "text": s.text.strip()}
             for s in segs_iter
@@ -510,6 +500,70 @@ def run_step1(
     # Nếu đang chọn Test 5p mà bản Full đã xong sẵn -> chỉ cắt 300s đầu trong ~2 giây!
     if is_test and not force and step1_artifacts_valid(work_dir):
         return _derive_test_5min_from_full(work_dir, target_dir, log_cb=log_cb, prog_cb=prog_cb)
+
+    # Nếu đã kéo gói Cách B từ Google Drive (có sẵn step1_audit.json + 2 WAV ở work_dir) -> chỉ encode video CFR, bỏ qua Spot-Check!
+    drive_audit_ok = (
+        not force
+        and (work_dir / "step1_audit.json").exists()
+        and (work_dir / "01_orig_48k_stereo.wav").exists()
+        and (work_dir / "01_orig_16k_ai.wav").exists()
+    )
+    if drive_audit_ok:
+        full_audit = json.loads((work_dir / "step1_audit.json").read_text(encoding="utf-8"))
+        if log_cb:
+            log_cb("[STEP 1] Đã có hồ sơ Spot-Check & Audio 48k từ Google Drive → chỉ chuẩn hóa lại video CFR (bỏ qua Spot-Check).")
+        src_info = full_audit.get("source_probe") or probe_media(src_mp4)
+        enc_name, hw_args, enc_args = detect_gpu_encoder()
+        max_dur = min(300.0, float(src_info.get("duration_s") or 300.0)) if is_test else None
+        expected_dur = max_dur if max_dur is not None else float(src_info.get("duration_s") or 0.0)
+        cfr_mp4 = target_dir / "01_cfr_raw.mp4"
+        wav_48k = target_dir / "01_orig_48k_stereo.wav"
+        wav_16k = target_dir / "01_orig_16k_ai.wav"
+        t1 = time.perf_counter()
+        if not cfr_mp4.exists() or cfr_mp4.stat().st_size < 100_000:
+            vf = (
+                "fps=30,"
+                "scale=1080:1920:force_original_aspect_ratio=decrease,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
+                "format=nv12"
+            )
+            t_args = ["-t", f"{max_dur:.3f}"] if max_dur is not None else []
+            vcmd = [
+                "ffmpeg", "-y", "-v", "warning", "-progress", "pipe:1", "-nostats",
+                "-fflags", "+genpts", *hw_args, "-i", str(src_mp4), *t_args,
+                "-map", "0:v:0", "-vf", vf, _ffmpeg_cfr_flag(), "cfr", *enc_args, "-an", str(cfr_mp4),
+            ]
+            proc = subprocess.Popen(vcmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+            if proc.stdout:
+                for raw_line in proc.stdout:
+                    if cancel_event and cancel_event.is_set():
+                        proc.terminate()
+                        raise InterruptedError("Người dùng đã tạm dừng Bước 1")
+                    m = FF_TIME_RE.search(raw_line.strip())
+                    if m and expected_dur > 0 and prog_cb:
+                        cur_s = int(m.group(1)) / 1_000_000.0
+                        prog_cb(min(92.0, 10.0 + (cur_s / expected_dur) * 82.0), f"Encode video CFR {cur_s:.0f}/{expected_dur:.0f}s ({enc_name})")
+            if proc.wait() != 0:
+                raise RuntimeError("FFmpeg encode video CFR từ gói Drive thất bại")
+        if is_test:
+            _slice_wav_head(work_dir / "01_orig_48k_stereo.wav", wav_48k, 300.0)
+            _slice_wav_head(work_dir / "01_orig_16k_ai.wav", wav_16k, 300.0)
+        out_info = probe_media(cfr_mp4)
+        elapsed = round(time.perf_counter() - t1, 2)
+        report = {
+            "mode": mode,
+            "derived_from_drive": True,
+            "source": str(src_mp4.resolve()),
+            "encoder_used": enc_name,
+            "source_probe": src_info,
+            "normalized_probe": out_info,
+            "timings_s": {"total_step1_s": elapsed},
+            "spotcheck": full_audit.get("spotcheck", {}),
+        }
+        atomic_write_json(audit_json, report)
+        if prog_cb:
+            prog_cb(100.0, f"Xong CFR nhanh từ gói Drive ({enc_name}, {elapsed}s)")
+        return report
 
     t_total0 = time.perf_counter()
     if prog_cb:
