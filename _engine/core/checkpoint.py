@@ -172,7 +172,10 @@ def load_or_create_manifest(
             "updated_at": now_iso(),
         }
     else:
-        # Bổ sung step mới nếu schema mở rộng
+        # Luôn cập nhật đường dẫn work_dir/work_rel theo máy hiện tại (tránh dính D:\... khi kéo từ Drive sang Linux)
+        data["work_dir"] = str(work_dir)
+        data["work_rel"] = norm_rel
+        data["job_id"] = make_job_id(norm_rel)
         base_steps = default_steps_state()
         for k, v in base_steps.items():
             data.setdefault("steps", {}).setdefault(k, v)
@@ -180,6 +183,10 @@ def load_or_create_manifest(
             data["source_path"] = str(source_path.resolve())
             if not data.get("source_fingerprint"):
                 data["source_fingerprint"] = compute_source_fingerprint(source_path)
+        elif not data.get("source_path") or not Path(data["source_path"]).exists():
+            local_src = work_dir / "source.mp4"
+            if local_src.exists():
+                data["source_path"] = str(local_src.resolve())
 
     # Đồng bộ trạng thái thực tế của Bước 1 (cả bản Full và bản Test 5 phút)
     full_ok = step1_artifacts_valid(work_dir)
