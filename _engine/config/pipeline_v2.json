@@ -25,7 +25,7 @@
   "vllm": {
     "host": "127.0.0.1",
     "port": 8001,
-    "gpu_memory_utilization": 0.88,
+    "gpu_memory_utilization": 0.92,
     "max_model_len": 4096
   },
   "clone_ref": {

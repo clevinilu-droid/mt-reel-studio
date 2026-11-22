@@ -231,7 +231,7 @@ def load_or_create_manifest(
                 {
                     "status": "done",
                     "progress_pct": 100.0,
-                    "detail": f"Đã xong bản Test 5 phút ({t_s}s)",
+                    "detail": f"Đã xong bản Test 2 phút ({t_s}s)",
                     "elapsed_s": float(t_s or 0.0),
                     "updated_at": now_iso(),
                 }

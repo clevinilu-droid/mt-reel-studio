@@ -446,13 +446,13 @@ def _derive_test_5min_from_full(work_dir: Path, target_dir: Path, log_cb: LogFn 
     """Cắt siêu nhanh 5 phút đầu (-c copy) từ bản Full đã xong Bước 1 mà không chạy GPU/Spot-Check lại."""
     t0 = time.perf_counter()
     if prog_cb:
-        prog_cb(25.0, "Đã có bản Full Bước 1 → đang cắt nhanh 5 phút đầu (-c copy)...")
+        prog_cb(25.0, "Đã có bản Full Bước 1 → đang cắt nhanh 2 phút đầu (-c copy)...")
     subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(work_dir / "01_cfr_raw.mp4"), "-t", "300", "-c:v", "copy", "-an", str(target_dir / "01_cfr_raw.mp4")],
+        ["ffmpeg", "-y", "-v", "error", "-i", str(work_dir / "01_cfr_raw.mp4"), "-t", "120", "-c:v", "copy", "-an", str(target_dir / "01_cfr_raw.mp4")],
         check=True,
     )
-    _slice_wav_head(work_dir / "01_orig_48k_stereo.wav", target_dir / "01_orig_48k_stereo.wav", 300.0)
-    _slice_wav_head(work_dir / "01_orig_16k_ai.wav", target_dir / "01_orig_16k_ai.wav", 300.0)
+    _slice_wav_head(work_dir / "01_orig_48k_stereo.wav", target_dir / "01_orig_48k_stereo.wav", 120.0)
+    _slice_wav_head(work_dir / "01_orig_16k_ai.wav", target_dir / "01_orig_16k_ai.wav", 120.0)
 
     full_audit = json.loads((work_dir / "step1_audit.json").read_text(encoding="utf-8"))
     out_info = probe_media(target_dir / "01_cfr_raw.mp4")
@@ -516,7 +516,7 @@ def run_step1(
             log_cb("[STEP 1] Đã có hồ sơ Spot-Check & Audio 48k từ Google Drive → chỉ chuẩn hóa lại video CFR (bỏ qua Spot-Check).")
         src_info = full_audit.get("source_probe") or probe_media(src_mp4)
         enc_name, hw_args, enc_args = detect_gpu_encoder()
-        max_dur = min(300.0, float(src_info.get("duration_s") or 300.0)) if is_test else None
+        max_dur = min(120.0, float(src_info.get("duration_s") or 120.0)) if is_test else None
         expected_dur = max_dur if max_dur is not None else float(src_info.get("duration_s") or 0.0)
         cfr_mp4 = target_dir / "01_cfr_raw.mp4"
         wav_48k = target_dir / "01_orig_48k_stereo.wav"
@@ -548,8 +548,8 @@ def run_step1(
             if proc.wait() != 0:
                 raise RuntimeError("FFmpeg encode video CFR từ gói Drive thất bại")
         if is_test:
-            _slice_wav_head(work_dir / "01_orig_48k_stereo.wav", wav_48k, 300.0)
-            _slice_wav_head(work_dir / "01_orig_16k_ai.wav", wav_16k, 300.0)
+            _slice_wav_head(work_dir / "01_orig_48k_stereo.wav", wav_48k, 120.0)
+            _slice_wav_head(work_dir / "01_orig_16k_ai.wav", wav_16k, 120.0)
         out_info = probe_media(cfr_mp4)
         elapsed = round(time.perf_counter() - t1, 2)
         report = {
@@ -575,7 +575,7 @@ def run_step1(
     enc_name, hw_args, enc_args = detect_gpu_encoder()
     t_probe = round(time.perf_counter() - t0, 2)
 
-    max_dur = min(300.0, src_info["duration_s"]) if is_test else None
+    max_dur = min(120.0, src_info["duration_s"]) if is_test else None
     expected_dur = max_dur if max_dur is not None else src_info["duration_s"]
     if log_cb:
         log_cb(

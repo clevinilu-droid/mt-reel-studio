@@ -82,6 +82,8 @@ def managed_vllm_server(model_id: str, cfg: dict[str, Any]):
         gpu_util,
         "--max-model-len",
         max_len,
+        "--language-model-only",
+        "--enforce-eager",
         "--trust-remote-code",
     ]
     low_id = model_id.lower()
@@ -94,14 +96,18 @@ def managed_vllm_server(model_id: str, cfg: dict[str, Any]):
     log_path = Path(log_fh.name)
     proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, text=True)
     try:
-        # Chờ vLLM tải weights (lần đầu ~27B có thể mất 5–10 phút) & nạp VRAM (tối đa 900s)
+        # Chờ vLLM tải weights (lần đầu ~17GB mất vài phút) & nạp VRAM (tối đa 900s)
         deadline = time.time() + 900.0
         ready = False
         while time.time() < deadline:
             if proc.poll() is not None:
                 log_fh.flush()
-                err = log_path.read_text(encoding="utf-8", errors="replace")[-1200:]
-                raise RuntimeError(f"vLLM khởi chạy thất bại cho {model_id}: {err}")
+                full_log = log_path.read_text(encoding="utf-8", errors="replace")
+                # In các dòng lỗi gốc EngineCore trước rồi nâng RuntimeError rõ ràng
+                err_lines = [ln for ln in full_log.splitlines() if any(k in ln for k in ("ERROR", "Exception", "ValueError", "RuntimeError", "OutOfMemory", "not supported", "AssertionError"))]
+                root_msg = "\n".join(err_lines[-12:]) if err_lines else full_log[-2500:]
+                print(f"[S5 vLLM LOG]\n{full_log[-3500:]}", flush=True)
+                raise RuntimeError(f"vLLM khởi chạy thất bại cho {model_id}:\n{root_msg}")
             try:
                 _http_json(f"{base_url}/models", timeout=3)
                 ready = True
@@ -224,7 +230,14 @@ def _phase5a_qwen_analyze(
         emit_progress(32.0, f"Tái sử dụng Pha 5A Qwen ({len(done_roles)} câu đã phân vai)")
         return glossary, done_roles
 
-    model_id = cfg.get("models", {}).get("zh_analyst_model", "Qwen/Qwen3.8-27B")
+    model_id = cfg.get("models", {}).get("zh_analyst_model", "mattbucci/Qwen3.8-27B-AWQ")
+    fallback_models = [
+        model_id,
+        "philbert440/Qwen3.8-27B-W4A16-AWQ",
+        cfg.get("models", {}).get("vi_translate_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit"),
+    ]
+    # Loại trùng giữ nguyên thứ tự
+    cand_models = list(dict.fromkeys(fallback_models))
     emit_progress(5.0, f"Pha 5A: Nạp {model_id} phân tích tiếng Trung & phân vai...")
 
     sys_prompt = (
@@ -232,7 +245,23 @@ def _phase5a_qwen_analyze(
         "Trả về DUY NHẤT JSON hợp lệ, không giải thích thêm."
     )
     batch_size = 50
-    with managed_vllm_server(model_id, cfg) as (base_url, mid):
+    vllm_ctx = None
+    last_exc = None
+    for cand_m in cand_models:
+        try:
+            emit_progress(6.0, f"Pha 5A: Khởi chạy {cand_m}...")
+            ctx = managed_vllm_server(cand_m, cfg)
+            conn_pair = ctx.__enter__()
+            vllm_ctx = (ctx, conn_pair)
+            break
+        except Exception as exc:
+            last_exc = exc
+            print(f"[S5A WARN] {cand_m} lỗi -> thử model dự phòng ({exc})", flush=True)
+    if vllm_ctx is None:
+        raise RuntimeError(f"Tất cả model Pha 5A đều lỗi: {last_exc}")
+
+    ctx_mgr, (base_url, mid) = vllm_ctx
+    try:
         for i in range(0, len(todo_turns), batch_size):
             batch = todo_turns[i : i + batch_size]
             packed = []
@@ -287,6 +316,8 @@ def _phase5a_qwen_analyze(
 
             pct = 8.0 + (len(done_roles) / max(1, len(turns))) * 25.0
             emit_progress(pct, f"Pha 5A Qwen: đã phân vai {len(done_roles)}/{len(turns)} câu")
+    finally:
+        ctx_mgr.__exit__(None, None, None)
 
     atomic_write_json(glossary_path, glossary)
     atomic_write_json(bible_path, bible)
