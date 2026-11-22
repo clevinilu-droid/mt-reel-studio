@@ -54,6 +54,19 @@ body {
 .tab:hover:not(.active) { color: var(--text); }
 
 .sysinfo { font-size: 12px; color: var(--muted); }
+.topbar-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.target-pill {
+  background: var(--panel-2);
+  border-color: #3b82f680;
+  color: #e2e8f0;
+  font-weight: 600;
+  max-width: 240px;
+}
+.target-pill.remote-on {
+  border-color: var(--green);
+  background: rgba(34, 197, 94, 0.14);
+  color: #bbf7d0;
+}
 
 .container { max-width: 960px; margin: 24px auto; padding: 0 20px 40px; }
 
@@ -348,3 +361,58 @@ table.vast-tbl th, table.vast-tbl td {
 table.vast-tbl th { color: var(--muted); font-weight: 600; }
 .btn.danger { background: rgba(239, 68, 68, 0.16); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
 .btn.danger:hover { background: rgba(239, 68, 68, 0.3); }
+
+.vast-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 12px;
+}
+.vast-card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.vast-card-title { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.vast-card-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin: 12px 0;
+  font-size: 12.5px;
+}
+@media (max-width: 760px) { .vast-card-grid { grid-template-columns: repeat(2, 1fr); } }
+.vast-kv .k { color: var(--muted); font-size: 11px; margin-bottom: 2px; }
+.vast-kv .v { color: var(--text); font-weight: 600; line-height: 1.4; }
+.vast-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.vast-status-line {
+  margin-top: 10px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--border);
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  color: #cbd5e1;
+  word-break: break-word;
+}
+.bar-fill.indeterminate {
+  width: 45% !important;
+  animation: mtIndeterminate 1.2s ease-in-out infinite;
+}
+@keyframes mtIndeterminate {
+  0% { transform: translateX(-60%); }
+  50% { transform: translateX(130%); }
+  100% { transform: translateX(-60%); }
+}

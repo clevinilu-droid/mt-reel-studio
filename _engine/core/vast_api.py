@@ -37,15 +37,22 @@ def get_vast_api_key() -> str:
     return os.environ.get("VAST_API_KEY", "").strip()
 
 
-def _vast_request(method: str, path: str, payload: dict[str, Any] | None = None, timeout: int = 20) -> Any:
+def _vast_request(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None = None,
+    timeout: int = 20,
+    api_ver: str = "v0",
+) -> Any:
     api_key = get_vast_api_key()
     if not api_key:
         raise RuntimeError("Chưa có VAST_API_KEY trong file .env trên máy local.")
 
-    url = f"{VAST_BASE}{path}"
+    url = f"https://console.vast.ai/api/{api_ver}{path}"
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {
         "Authorization": f"Bearer {api_key}",
+        "User-Agent": "MT-Reel-Studio/2.0",
         "Accept": "application/json",
     }
     if data is not None:
@@ -181,6 +188,7 @@ def rent_instance(
     env_map: dict[str, str] = {
         "-p 7860:7860": "1",
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "NVIDIA_DRIVER_CAPABILITIES": "compute,utility,video",
     }
     if include_rclone:
         rc_b64 = _read_local_rclone_b64()
@@ -203,8 +211,8 @@ def rent_instance(
 
 
 def list_instances() -> list[dict[str, Any]]:
-    """Lấy danh sách các máy đang thuê trên Vast.ai kèm URL mở thẳng cổng 7860."""
-    data = _vast_request("GET", "/instances/", timeout=20)
+    """Lấy danh sách đầy đủ các máy đang thuê trên Vast.ai (/api/v1/instances/) kèm thông số phần cứng & trạng thái live."""
+    data = _vast_request("GET", "/instances/", timeout=20, api_ver="v1")
     raw_list = data.get("instances", []) if isinstance(data, dict) else []
     out = []
     for inst in raw_list:
@@ -216,15 +224,49 @@ def list_instances() -> list[dict[str, Any]]:
             if isinstance(p_info, list) and p_info:
                 mapped_7860 = p_info[0].get("HostPort")
         direct_url = f"http://{pub_ip}:{mapped_7860}" if (pub_ip and mapped_7860) else ""
+        vram_total_gb = round(float(inst.get("gpu_ram") or 0) / 1024.0, 1)
+        vram_used_raw = inst.get("vram_usage")
+        vram_used_gb = round(float(vram_used_raw) / 1024.0, 1) if vram_used_raw is not None else 0.0
+        ram_total_gb = round(float(inst.get("cpu_ram") or 0) / 1024.0, 1)
+        ram_used_raw = inst.get("mem_usage")
+        ram_used_gb = round(float(ram_used_raw), 1) if ram_used_raw is not None else 0.0
+        disk_total_gb = round(float(inst.get("disk_space") or 0), 1)
+        disk_used_raw = inst.get("disk_usage")
+        disk_used_gb = round(float(disk_used_raw), 1) if (disk_used_raw is not None and float(disk_used_raw) >= 0) else 0.0
+        rel_raw = inst.get("reliability2") or inst.get("reliability") or 0.0
+
         out.append(
             {
                 "id": inst.get("id"),
-                "gpu_name": inst.get("gpu_name"),
-                "actual_status": inst.get("actual_status") or inst.get("cur_state"),
-                "status_msg": inst.get("status_msg") or "",
-                "dph_total": round(float(inst.get("dph_total") or 0), 4),
-                "geolocation": inst.get("geolocation") or "",
+                "machine_id": inst.get("machine_id") or "",
+                "host_id": inst.get("host_id") or "",
+                "gpu_name": inst.get("gpu_name") or "",
+                "vram_total_gb": vram_total_gb,
+                "vram_used_gb": vram_used_gb,
+                "gpu_util": inst.get("gpu_util"),
+                "cuda_max": inst.get("cuda_max_good") or "",
+                "dlperf": round(float(inst.get("dlperf") or 0), 1),
+                "actual_status": inst.get("actual_status") or inst.get("cur_state") or "unknown",
+                "intended_status": inst.get("intended_status") or "",
+                "status_msg": (inst.get("status_msg") or "").strip(),
+                "public_ipaddr": pub_ip,
+                "port_7860": mapped_7860 or "",
                 "direct_ui_url": direct_url,
+                "dph_total": round(float(inst.get("dph_total") or 0), 3),
+                "geolocation": inst.get("geolocation") or "",
+                "reliability_pct": round(float(rel_raw) * 100.0, 2),
+                "inet_down_mbps": round(float(inst.get("inet_down") or 0), 0),
+                "inet_up_mbps": round(float(inst.get("inet_up") or 0), 0),
+                "cpu_name": inst.get("cpu_name") or "",
+                "cpu_cores": round(float(inst.get("cpu_cores_effective") or 0), 1),
+                "ram_used_gb": ram_used_gb,
+                "ram_total_gb": ram_total_gb,
+                "disk_name": inst.get("disk_name") or "NVMe",
+                "disk_bw_mbs": round(float(inst.get("disk_bw") or 0), 1),
+                "disk_used_gb": disk_used_gb,
+                "disk_total_gb": disk_total_gb,
+                "pcie_bw_gbs": round(float(inst.get("pcie_bw") or 0), 1),
+                "image_uuid": inst.get("image_uuid") or "",
                 "ssh_host": inst.get("ssh_host") or "",
                 "ssh_port": inst.get("ssh_port") or "",
             }
@@ -232,6 +274,38 @@ def list_instances() -> list[dict[str, Any]]:
     return out
 
 
+def fetch_instance_logs(instance_id: int, tail: int = 120) -> dict[str, Any]:
+    """Lấy log mới nhất của container Vast.ai (tự trích link Cloudflare Tunnel nếu có)."""
+    import re
+    import time
+
+    res = _vast_request(
+        "PUT",
+        f"/instances/request_logs/{int(instance_id)}/",
+        payload={"tail": str(int(tail))},
+        timeout=20,
+        api_ver="v0",
+    )
+    temp_url = res.get("result_url") or ""
+    text = ""
+    if temp_url:
+        # Chờ Vast upload log ra URL tạm 1–2 giây rồi tải về
+        for _ in range(4):
+            try:
+                req = urllib.request.Request(temp_url, headers={"User-Agent": "MT-Reel-Studio/2.0"})
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    text = r.read().decode("utf-8", errors="replace")
+                    if text.strip():
+                        break
+            except Exception:
+                time.sleep(0.8)
+    m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", text)
+    return {
+        "logs": text.strip(),
+        "tunnel_url": m.group(0) if m else "",
+    }
+
+
 def destroy_instance(instance_id: int) -> dict[str, Any]:
     """Hủy vĩnh viễn máy thuê Vast.ai để ngừng tính tiền ngay lập tức."""
-    return _vast_request("DELETE", f"/instances/{int(instance_id)}/", timeout=20)
+    return _vast_request("DELETE", f"/instances/{int(instance_id)}/", timeout=20, api_ver="v0")

@@ -15,8 +15,51 @@
   let activeTab = "work";
   let pickedLocalFile = null;
   let downloadsMap = {};
+  let remoteTarget = localStorage.getItem("mt_remote_target") || "";
+  let remoteStateTimer = null;
 
   const $ = (id) => document.getElementById(id);
+
+  function apiFetch(url, opts = {}) {
+    const headers = { ...(opts.headers || {}) };
+    if (remoteTarget) headers["X-Remote-Target"] = remoteTarget;
+    return fetch(url, { ...opts, headers });
+  }
+
+  async function pullRemoteStateOnce() {
+    if (!remoteTarget) return;
+    try {
+      const res = await apiFetch("/api/state");
+      if (!res.ok) return;
+      state = await res.json();
+      $("wsDot").className = "dot";
+      renderAll();
+    } catch (_) {
+      $("wsDot").className = "dot off";
+    }
+  }
+
+  function setRemoteTarget(url, goTab = null) {
+    remoteTarget = (url || "").trim();
+    if (remoteTarget) localStorage.setItem("mt_remote_target", remoteTarget);
+    else localStorage.removeItem("mt_remote_target");
+
+    const sel = $("targetMachineSelect");
+    if (sel) {
+      sel.value = remoteTarget;
+      sel.classList.toggle("remote-on", Boolean(remoteTarget));
+    }
+    if (remoteStateTimer) { clearInterval(remoteStateTimer); remoteStateTimer = null; }
+    selectedJobId = null;
+    if (remoteTarget) {
+      pullRemoteStateOnce();
+      remoteStateTimer = setInterval(pullRemoteStateOnce, 1200);
+    } else {
+      fetch("/api/state").then((r) => r.json()).then((d) => { state = d; renderAll(); }).catch(() => {});
+    }
+    if (activeTab === "add") { loadDownloads(); loadDriveProjects(); }
+    if (goTab) switchTab(goTab);
+  }
 
   function esc(s) {
     return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -61,7 +104,7 @@
     const sel = $("driveSelect");
     sel.innerHTML = '<option value="">Đang quét Google Drive...</option>';
     try {
-      const res = await fetch("/api/drive/projects");
+      const res = await apiFetch("/api/drive/projects");
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       sel.innerHTML = '<option value="">-- Chọn gói phim trên Google Drive --</option>';
@@ -85,28 +128,53 @@
       alert("Hãy bấm 🔄 để tải danh sách và chọn 1 gói phim trên Drive trước.");
       return;
     }
-    const opts = readAddOptions("full");
+    const opts = readAddOptions("test_5min");
     $("btnPullDrive").disabled = true;
     $("btnPullDrive").textContent = "Đang kéo...";
+    $("drivePullWrap").style.display = "block";
+    $("drivePullLabel").textContent = `Đang kéo ${work_rel} từ Google Drive...`;
+    $("drivePullBar").style.width = "10%";
+    $("drivePullBar").classList.add("indeterminate");
+
+    const t0 = Date.now();
+    const pullTimer = setInterval(() => {
+      const dp = state.drive_pull;
+      if (dp && dp.status === "running" && dp.progress_pct > 0) {
+        $("drivePullBar").classList.remove("indeterminate");
+        $("drivePullBar").style.width = `${dp.progress_pct}%`;
+        $("drivePullLabel").textContent = dp.detail || `Đang tải từ Drive: ${dp.progress_pct}%`;
+      } else {
+        const sec = Math.floor((Date.now() - t0) / 1000);
+        $("drivePullLabel").textContent = `Đang kéo & giải nén ${work_rel} từ Google Drive... (${sec}s)`;
+      }
+    }, 500);
+
     try {
-      const res = await fetch("/api/jobs/from-drive", {
+      const res = await apiFetch("/api/jobs/from-drive", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           work_rel,
-          mode: "full",
+          mode: "test_5min",
           langs: opts.langs,
           voice_mode: opts.voice_mode,
-          auto_start: true,
+          auto_start: false,
         }),
       });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
+      $("drivePullBar").classList.remove("indeterminate");
+      $("drivePullBar").style.width = "100%";
+      $("drivePullLabel").textContent = "✓ Đã kéo xong từ Google Drive!";
       selectedJobId = data.job.job_id;
+      if (remoteTarget) await pullRemoteStateOnce();
       switchTab("work");
     } catch (err) {
       alert(`Kéo Drive thất bại: ${err.message || err}`);
     } finally {
+      clearInterval(pullTimer);
+      $("drivePullBar").classList.remove("indeterminate");
+      $("drivePullWrap").style.display = "none";
       $("btnPullDrive").disabled = false;
       $("btnPullDrive").textContent = "⬇ Kéo Drive";
     }
@@ -114,7 +182,7 @@
 
   async function loadDownloads() {
     try {
-      const res = await fetch("/api/downloads");
+      const res = await apiFetch("/api/downloads");
       const data = await res.json();
       const sel = $("downloadSelect");
       const prev = sel.value;
@@ -183,7 +251,8 @@
     // 2A. Hộp Tiến Trình LIVE: CHỈ hiện cho các task đang thực sự chạy/xếp hàng
     const isRunning = job.status === "running" || job.status === "queued";
     const ds = job.drive_sync || {};
-    const isDriveLive = ds.status === "running" || ds.status === "queued";
+    const isGhostLocalSync = Boolean(remoteTarget && String(ds.detail || "").includes("WAV -> FLAC"));
+    const isDriveLive = !isGhostLocalSync && (ds.status === "running" || ds.status === "queued");
     const liveTasks = [];
 
     if (isRunning) {
@@ -255,9 +324,9 @@
       $("dynPrimary").onclick = () => postJobAction("pause");
     } else if (hasCuda) {
       if (job.status === "done") {
-        const driveDisabled = !state.drive_ready || ds.status === "running";
-        slot.innerHTML = `<button type="button" class="btn green lg" id="dynPrimary" ${driveDisabled ? "disabled" : ""}>☁️ Upload Google Drive</button>`;
-        $("dynPrimary").onclick = () => postJobAction("push-drive");
+        const driveDisabled = !state.drive_ready || isDriveLive;
+        slot.innerHTML = `<button type="button" class="btn green lg" id="dynPrimary" ${driveDisabled ? "disabled" : ""}>📦 Upload Output lên Drive</button>`;
+        $("dynPrimary").onclick = () => postJobAction("push-output");
       } else if (job.step1_test_ready && job.mode === "test_5min") {
         slot.innerHTML = `<button type="button" class="btn green lg" id="dynPrimary">🚀 Chạy Full (6 bước)</button>`;
         $("dynPrimary").onclick = () => postJobAction("start", { mode: "full", force_step1: false, target_stage: "all" });
@@ -381,7 +450,7 @@
         $("uploadWrap").style.display = "block";
         $("uploadLabel").textContent = `Chuẩn bị tải ${pickedLocalFile.name}...`;
         $("uploadBar").style.width = "0%";
-        const initRes = await fetch("/api/upload/init", {
+        const initRes = await apiFetch("/api/upload/init", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ filename: pickedLocalFile.name, size: pickedLocalFile.size }),
@@ -393,7 +462,7 @@
           let offset = 0;
           while (offset < pickedLocalFile.size) {
             const end = Math.min(pickedLocalFile.size, offset + CHUNK_SIZE);
-            const cRes = await fetch(`/api/upload/chunk?upload_id=${encodeURIComponent(upload_id)}`, {
+            const cRes = await apiFetch(`/api/upload/chunk?upload_id=${encodeURIComponent(upload_id)}`, {
               method: "POST",
               body: pickedLocalFile.slice(offset, end),
             });
@@ -404,7 +473,7 @@
             $("uploadLabel").textContent = `Đang tải lên: ${pct}% (${(offset / 1024 / 1024).toFixed(0)}/${(pickedLocalFile.size / 1024 / 1024).toFixed(0)} MB)`;
           }
         }
-        const finRes = await fetch("/api/upload/finish", {
+        const finRes = await apiFetch("/api/upload/finish", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ upload_id, ...opts, auto_start: true }),
@@ -415,7 +484,7 @@
         $("uploadWrap").style.display = "none";
         setPickedFile(null);
       } else {
-        const res = await fetch("/api/jobs/from-path", {
+        const res = await apiFetch("/api/jobs/from-path", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ source_path: dlPath, ...opts, auto_start: true }),
@@ -424,6 +493,7 @@
         const data = await res.json();
         selectedJobId = data.job.job_id;
       }
+      if (remoteTarget) await pullRemoteStateOnce();
       switchTab("work");
     } catch (err) {
       alert(`Lỗi: ${err.message || err}`);
@@ -436,26 +506,28 @@
   async function postJobAction(endpoint, body = null) {
     if (!selectedJobId) return;
     $("moreMenu").open = false;
-    const res = await fetch(`/api/jobs/${encodeURIComponent(selectedJobId)}/${endpoint}`, {
+    const res = await apiFetch(`/api/jobs/${encodeURIComponent(selectedJobId)}/${endpoint}`, {
       method: "POST",
       headers: body ? { "Content-Type": "application/json" } : {},
       body: body ? JSON.stringify(body) : undefined,
     });
     if (!res.ok) alert(`Thao tác thất bại: ${await res.text()}`);
+    else if (remoteTarget) await pullRemoteStateOnce();
   }
 
   function connectWS() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/ws`);
-    ws.onopen = () => { $("wsDot").className = "dot"; };
+    ws.onopen = () => { if (!remoteTarget) $("wsDot").className = "dot"; };
     ws.onmessage = (ev) => {
+      if (remoteTarget) return;
       try {
         state = JSON.parse(ev.data);
         renderAll();
       } catch (_) {}
     };
     ws.onclose = () => {
-      $("wsDot").className = "dot off";
+      if (!remoteTarget) $("wsDot").className = "dot off";
       setTimeout(connectWS, 1500);
     };
   }
@@ -534,9 +606,59 @@
       });
       if (!res.ok) throw new Error(await res.text());
       await refreshVastInstances();
-      alert("Đã gửi lệnh thuê máy Vast.ai! Chờ 1–2 phút để container khởi động.");
+      $("vastInstancesWrap").scrollIntoView({ behavior: "smooth", block: "nearest" });
+      alert("Đã gửi lệnh thuê máy Vast.ai thành công! Xem trạng thái tải Docker & khởi động ngay ở hộp bên dưới.");
     } catch (err) {
       alert(`Thuê thất bại: ${err.message || err}`);
+    }
+  }
+
+  let vastPollTimer = null;
+  let vastOpenLogs = {};
+
+  function vastStatusBadge(x) {
+    const st = String(x.actual_status || "").toLowerCase();
+    if (st === "running") return '<span class="badge b-done">🟢 Đang chạy (Sẵn sàng)</span>';
+    if (st === "loading" || st === "creating" || st === "created") return '<span class="badge b-run">⏳ Đang tải & khởi tạo...</span>';
+    return `<span class="badge b-wait">${esc(st || "chưa rõ")}</span>`;
+  }
+
+  async function loadVastLogs(instanceId) {
+    vastOpenLogs[instanceId] = "Đang tải log từ Vast.ai...";
+    const box = document.getElementById(`vastLog_${instanceId}`);
+    if (box) { box.style.display = "block"; box.textContent = vastOpenLogs[instanceId]; }
+    try {
+      const res = await fetch(`/api/vast/instances/${instanceId}/logs`);
+      if (!res.ok) throw new Error(await res.text());
+      const d = await res.json();
+      vastOpenLogs[instanceId] = (d.tunnel_url ? `Tunnel HTTPS: ${d.tunnel_url}\n\n` : "") + (d.logs || "(Chưa có log container — máy có thể vẫn đang giải nén Docker)");
+      if (box) box.textContent = vastOpenLogs[instanceId];
+    } catch (err) {
+      vastOpenLogs[instanceId] = `Lỗi lấy log: ${err.message || err}`;
+      if (box) box.textContent = vastOpenLogs[instanceId];
+    }
+  }
+
+  function syncTargetMachineDropdown(list) {
+    const sel = $("targetMachineSelect");
+    if (!sel) return;
+    sel.innerHTML = '<option value="">🖥️ Máy nhà (Local)</option>';
+    const validUrls = new Set();
+    for (const x of list || []) {
+      const u = x.direct_ui_url || "";
+      if (u) {
+        validUrls.add(u);
+        const opt = document.createElement("option");
+        opt.value = u;
+        opt.textContent = `⚡ #${x.id} ${x.gpu_name} (${x.actual_status})`;
+        sel.appendChild(opt);
+      }
+    }
+    if (remoteTarget && !validUrls.has(remoteTarget)) {
+      setRemoteTarget("");
+    } else {
+      sel.value = remoteTarget;
+      sel.classList.toggle("remote-on", Boolean(remoteTarget));
     }
   }
 
@@ -547,39 +669,87 @@
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       if (!data.configured) {
+        syncTargetMachineDropdown([]);
         wrap.innerHTML = '<div class="muted">Chưa có VAST_API_KEY trong file .env trên máy local.</div>';
         return;
       }
       const list = data.instances || [];
+      syncTargetMachineDropdown(list);
       if (!list.length) {
-        wrap.innerHTML = '<div class="muted">Hiện không có máy Vast.ai nào đang chạy.</div>';
+        wrap.innerHTML = '<div class="muted">Hiện không có máy Vast.ai nào đang thuê.</div>';
         return;
       }
-      wrap.innerHTML = `
-        <table class="vast-tbl">
-          <thead><tr><th>ID</th><th>GPU</th><th>Trạng thái</th><th>Public IP : Web UI</th><th>Giá</th><th></th></tr></thead>
-          <tbody>
-            ${list.map((x) => {
-              const uiLink = x.direct_ui_url || "";
-              return `
-                <tr>
-                  <td>#${esc(x.id)}</td>
-                  <td>${esc(x.gpu_name)}</td>
-                  <td><span class="badge ${x.actual_status === "running" ? "b-done" : "b-wait"}">${esc(x.actual_status)}</span></td>
-                  <td>${uiLink ? `<a href="${esc(uiLink)}" target="_blank" style="color:#93c5fd;">${esc(uiLink)}</a>` : esc(x.status_msg || "Đang khởi tạo...")}</td>
-                  <td>$${Number(x.dph_total || 0).toFixed(3)}/h</td>
-                  <td><button type="button" class="btn danger sm" data-destroy="${x.id}">🗑 Hủy máy</button></td>
-                </tr>`;
-            }).join("")}
-          </tbody>
-        </table>`;
+      wrap.innerHTML = list.map((x) => {
+        const uiLink = x.direct_ui_url || "";
+        const stMsg = x.status_msg || (x.actual_status === "running" ? "Container đang chạy bình thường" : "Đang chờ Vast.ai phản hồi trạng thái...");
+        const savedLog = vastOpenLogs[x.id] || "";
+        const isCurrent = Boolean(uiLink && remoteTarget === uiLink);
+        return `
+          <div class="vast-card">
+            <div class="vast-card-top">
+              <div class="vast-card-title">
+                <span>1x ${esc(x.gpu_name)}</span>
+                ${vastStatusBadge(x)}
+                <span class="muted">${esc(x.geolocation)} · Rel ${esc(x.reliability_pct)}%</span>
+                ${x.public_ipaddr ? `<span class="badge b-wait">${esc(x.public_ipaddr)}</span>` : ""}
+              </div>
+              <div style="font-size:15px; font-weight:700; color:#86efac;">$${Number(x.dph_total || 0).toFixed(3)}/hr</div>
+            </div>
+
+            <div class="vast-card-grid">
+              <div class="vast-kv">
+                <div class="k">Instance / Host / Machine</div>
+                <div class="v">ID: #${esc(x.id)}<br/>Host ${esc(x.host_id)} · M:${esc(x.machine_id)}<br/>VRAM ${esc(x.vram_used_gb)}/${esc(x.vram_total_gb)} GB (CUDA ${esc(x.cuda_max)})</div>
+              </div>
+              <div class="vast-kv">
+                <div class="k">Mạng & PCIe</div>
+                <div class="v">⬆ ${esc(x.inet_up_mbps)} Mbps<br/>⬇ ${esc(x.inet_down_mbps)} Mbps<br/>PCIe ${esc(x.pcie_bw_gbs)} GB/s · DLPerf ${esc(x.dlperf)}</div>
+              </div>
+              <div class="vast-kv">
+                <div class="k">CPU & RAM</div>
+                <div class="v">${esc(x.cpu_cores)} CPU<br/>${esc((x.cpu_name || "").slice(0, 26))}<br/>RAM ${esc(x.ram_used_gb)} / ${esc(x.ram_total_gb)} GB</div>
+              </div>
+              <div class="vast-kv">
+                <div class="k">Ổ cứng (${esc(x.disk_name)})</div>
+                <div class="v">${esc(x.disk_bw_mbs)} MB/s<br/>Disk ${esc(x.disk_used_gb)} / ${esc(x.disk_total_gb)} GB<br/>Port 7860 → ${x.port_7860 ? esc(x.port_7860) : "Đang mở..."}</div>
+              </div>
+            </div>
+
+            <div class="vast-card-actions">
+              <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                ${uiLink ? `<button type="button" class="btn ${isCurrent ? "secondary" : "primary"} sm" data-use-target="${esc(uiLink)}">${isCurrent ? "✓ Đang điều khiển máy này tại đây" : "⚡ Điều khiển ngay trên trang này"}</button>` : `<button type="button" class="btn ghost sm" disabled>⏳ Chờ container chạy...</button>`}
+                ${uiLink ? `<a href="${esc(uiLink)}" target="_blank" class="btn ghost sm" style="text-decoration:none;" title="Mở tab riêng nếu cần">↗ Tab riêng</a>` : ""}
+                <button type="button" class="btn secondary sm" data-logs="${x.id}">📜 Xem Log / Tunnel</button>
+              </div>
+              <button type="button" class="btn danger sm" data-destroy="${x.id}">🗑 Hủy máy</button>
+            </div>
+
+            <div class="vast-status-line">Status: ${esc(stMsg)}</div>
+            <pre id="vastLog_${x.id}" class="logbox" style="display:${savedLog ? "block" : "none"}; max-height:180px;">${esc(savedLog)}</pre>
+          </div>`;
+      }).join("");
+
+      wrap.querySelectorAll("[data-use-target]").forEach((btn) => {
+        btn.onclick = () => setRemoteTarget(btn.dataset.useTarget, "add");
+      });
       wrap.querySelectorAll("[data-destroy]").forEach((btn) => {
         btn.onclick = () => destroyVastInstance(Number(btn.dataset.destroy));
+      });
+      wrap.querySelectorAll("[data-logs]").forEach((btn) => {
+        btn.onclick = () => loadVastLogs(Number(btn.dataset.logs));
       });
     } catch (err) {
       wrap.innerHTML = `<div class="muted" style="color:#fca5a5;">${esc(err.message || err)}</div>`;
     }
   }
+
+  function ensureVastAutoPoll() {
+    if (vastPollTimer) clearInterval(vastPollTimer);
+    vastPollTimer = setInterval(() => {
+      if (activeTab === "vast") refreshVastInstances();
+    }, 4000);
+  }
+  ensureVastAutoPoll();
 
   async function destroyVastInstance(instanceId) {
     if (!confirm(`Hủy vĩnh viễn máy Vast.ai #${instanceId} để ngừng tính tiền?`)) return;
@@ -594,11 +764,12 @@
 
   // Tabs
   $("tabWork").onclick = () => switchTab("work");
-  $("tabAdd").onclick = () => switchTab("add");
+  $("tabAdd").onclick = () => { switchTab("add"); loadDriveProjects(); };
   $("tabList").onclick = () => switchTab("list");
   $("tabVast").onclick = () => switchTab("vast");
-  $("btnEmptyAdd").onclick = () => switchTab("add");
-  $("btnListAdd").onclick = () => switchTab("add");
+  $("targetMachineSelect").onchange = () => setRemoteTarget($("targetMachineSelect").value);
+  $("btnEmptyAdd").onclick = () => { switchTab("add"); loadDriveProjects(); };
+  $("btnListAdd").onclick = () => { switchTab("add"); loadDriveProjects(); };
   $("btnRefreshDrive").onclick = loadDriveProjects;
   $("btnPullDrive").onclick = pullDriveJob;
   $("btnSearchVast").onclick = searchVastOffers;
@@ -634,5 +805,7 @@
   $("actPushOutput").onclick = () => postJobAction("push-output");
 
   loadDownloads();
+  refreshVastInstances();
+  if (remoteTarget) setRemoteTarget(remoteTarget);
   connectWS();
 })();

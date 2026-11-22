@@ -114,6 +114,12 @@ def detect_gpu_encoder() -> tuple[str, list[str], list[str]]:
     return "libx264", [], ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
 
 
+def _ffmpeg_cfr_flag() -> str:
+    """Dùng `-fps_mode` cho FFmpeg 5.1+, fallback `-vsync` cho FFmpeg 4.x (Ubuntu 22.04)."""
+    res = subprocess.run(["ffmpeg", "-h", "full"], capture_output=True, text=True, errors="ignore")
+    return "-fps_mode" if "fps_mode" in (res.stdout or "") else "-vsync"
+
+
 def _fmt_eta(sec: float) -> str:
     sec = max(0, int(sec))
     m, s = divmod(sec, 60)
@@ -159,7 +165,7 @@ def _run_ffmpeg_normalize(
         "0:v:0",
         "-vf",
         vf,
-        "-fps_mode",
+        _ffmpeg_cfr_flag(),
         "cfr",
         *enc_args,
         "-an",

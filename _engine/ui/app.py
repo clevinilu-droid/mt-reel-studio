@@ -13,11 +13,14 @@ import os
 import platform
 import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -27,6 +30,7 @@ from _engine.core.drive_sync import list_drive_projects
 from _engine.core.job_manager import JobManager
 from _engine.core.vast_api import (
     destroy_instance,
+    fetch_instance_logs,
     get_vast_api_key,
     list_instances,
     rent_instance,
@@ -41,6 +45,51 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 manager = JobManager()
 _upload_sessions: dict[str, dict[str, Any]] = {}
+
+
+def _forward_remote_sync(target_url: str, method: str, path_qs: str, headers_in: dict[str, str], body: bytes, timeout: int) -> tuple[int, str, bytes]:
+    full_url = f"{target_url.rstrip('/')}{path_qs}"
+    fwd_headers: dict[str, str] = {"User-Agent": "MT-Reel-Proxy/2.0"}
+    if "content-type" in headers_in:
+        fwd_headers["Content-Type"] = headers_in["content-type"]
+    req = urllib.request.Request(full_url, data=body if body else None, headers=fwd_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.headers.get("Content-Type", "application/json"), resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Content-Type", "application/json"), e.read()
+
+
+@app.middleware("http")
+async def proxy_remote_target(request: Request, call_next):
+    target = (request.headers.get("x-remote-target") or "").strip()
+    path = request.url.path
+    if target and path.startswith("/api/") and not path.startswith("/api/vast/"):
+        parsed = urllib.parse.urlparse(target)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in ("http", "https") or not host or host in ("127.0.0.1", "localhost", "0.0.0.0"):
+            raise HTTPException(status_code=400, detail="Địa chỉ máy Vast điều khiển từ xa không hợp lệ.")
+        path_qs = f"{path}?{request.url.query}" if request.url.query else path
+        body = await request.body()
+        timeout = 300 if (path == "/api/jobs/from-drive" or path.startswith("/api/upload/")) else 25
+        try:
+            status, ctype, raw = await asyncio.to_thread(
+                _forward_remote_sync,
+                f"{parsed.scheme}://{parsed.netloc}",
+                request.method,
+                path_qs,
+                {k.lower(): v for k, v in request.headers.items()},
+                body,
+                timeout,
+            )
+            return Response(content=raw, status_code=status, media_type=ctype)
+        except Exception as exc:
+            return Response(
+                content=f'{{"detail":"Không kết nối được tới máy RTX thuê: {exc}"}}',
+                status_code=502,
+                media_type="application/json",
+            )
+    return await call_next(request)
 
 
 class FromPathReq(BaseModel):
@@ -295,6 +344,16 @@ def vast_rent(req: VastRentReq):
         )
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Thuê máy Vast.ai thất bại: {exc}")
+
+
+@app.get("/api/vast/instances/{instance_id}/logs")
+def vast_instance_logs(instance_id: int, tail: int = 120):
+    if not get_vast_api_key():
+        raise HTTPException(status_code=400, detail="Chưa cấu hình VAST_API_KEY.")
+    try:
+        return fetch_instance_logs(instance_id, tail=tail)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Lỗi lấy log máy #{instance_id}: {exc}")
 
 
 @app.delete("/api/vast/instances/{instance_id}")

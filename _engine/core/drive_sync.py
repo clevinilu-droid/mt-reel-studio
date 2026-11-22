@@ -183,18 +183,40 @@ def pull_from_drive(
     work_dir.mkdir(parents=True, exist_ok=True)
     remote_src = f"{remote_root.rstrip('/')}/{work_rel.strip('/')}"
     if prog_cb:
-        prog_cb(10.0, f"Đang tải từ {remote_src}...")
+        prog_cb(5.0, f"Đang kết nối {remote_src}...")
     if log_cb:
         log_cb(f"[DRIVE PULL] Kéo dữ liệu từ {remote_src} -> {work_dir}")
 
-    subprocess.run([rclone, "copy", remote_src, str(work_dir), "--transfers", "4"], check=True)
+    proc = subprocess.Popen(
+        [rclone, "copy", remote_src, str(work_dir), "--transfers", "4", "--stats=1s", "--stats-one-line"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if proc.stdout:
+        for raw in proc.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            m = RCLONE_PCT_RE.search(line)
+            if m:
+                pct = float(m.group(1))
+                if prog_cb:
+                    prog_cb(min(72.0, 5.0 + pct * 0.67), f"Đang tải từ Drive: {int(pct)}% — {line}")
+            elif log_cb:
+                log_cb(f"[DRIVE PULL] {line}")
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"rclone pull thất bại (mã {rc})")
 
     flac_in = work_dir / "audio_48k.flac"
     wav_48k = work_dir / "01_orig_48k_stereo.wav"
     wav_16k = work_dir / "01_orig_16k_ai.wav"
     if flac_in.exists() and not wav_48k.exists():
         if prog_cb:
-            prog_cb(70.0, "Đang giải nén audio_48k.flac -> 2 bản WAV chuẩn...")
+            prog_cb(80.0, "Đang giải nén audio_48k.flac -> 2 bản WAV chuẩn...")
         subprocess.run(
             [
                 "ffmpeg",

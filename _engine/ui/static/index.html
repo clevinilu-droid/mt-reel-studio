@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>MT Reel Studio v2</title>
-  <link rel="stylesheet" href="/static/style.css?v=6" />
+  <link rel="stylesheet" href="/static/style.css?v=10" />
 </head>
 <body>
   <header class="topbar">
@@ -20,7 +20,12 @@
       <button class="tab" id="tabVast">☁️ Vast.ai</button>
     </nav>
 
-    <div class="sysinfo" id="sysInfo">Đang kết nối...</div>
+    <div class="topbar-right">
+      <select id="targetMachineSelect" class="select-sm target-pill" title="Chọn máy xử lý ngay trong 1 tab này">
+        <option value="">🖥️ Máy nhà (Local)</option>
+      </select>
+      <div class="sysinfo" id="sysInfo">Đang kết nối...</div>
+    </div>
   </header>
 
   <main class="container">
@@ -52,6 +57,11 @@
           </select>
           <button type="button" class="btn ghost sm" id="btnRefreshDrive" title="Tải danh sách Drive">🔄</button>
           <button type="button" class="btn secondary sm" id="btnPullDrive">⬇ Kéo Drive</button>
+        </div>
+
+        <div id="drivePullWrap" class="upload-wrap" style="display:none; margin-top:12px;">
+          <div class="muted" id="drivePullLabel">Đang kết nối Google Drive...</div>
+          <div class="bar-wrap"><div class="bar-fill" id="drivePullBar"></div></div>
         </div>
 
         <details class="adv-box">
@@ -223,6 +233,6 @@
     </section>
   </main>
 
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=10"></script>
 </body>
 </html>

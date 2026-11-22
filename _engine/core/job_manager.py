@@ -54,6 +54,7 @@ class JobManager:
         self._pipeline_queue: queue.Queue[tuple[str, bool, str]] = queue.Queue()
         self._drive_queue: queue.Queue[str] = queue.Queue()
         self._ws_clients: set[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = set()
+        self.drive_pull: dict[str, Any] = {"status": "idle", "work_rel": "", "progress_pct": 0.0, "detail": ""}
 
         self._load_existing()
 
@@ -69,6 +70,9 @@ class JobManager:
                 for st in m.get("steps", {}).values():
                     if st.get("status") == "running":
                         st["status"] = "paused"
+                save_manifest(m)
+            if (m.get("drive_sync") or {}).get("status") in ("running", "queued"):
+                m["drive_sync"] = {"status": "idle", "progress_pct": 0.0, "remote": "", "detail": ""}
                 save_manifest(m)
             self.jobs[jid] = m
             self.logs.setdefault(jid, deque(maxlen=400))
@@ -135,12 +139,14 @@ class JobManager:
         with self._lock:
             jobs_list = sorted(self.jobs.values(), key=lambda x: x.get("updated_at", ""), reverse=True)
             logs_map = {jid: list(dq)[-80:] for jid, dq in self.logs.items()}
+            dp = dict(self.drive_pull)
         return {
             "telemetry": self.telemetry.snapshot(),
             "drive_ready": drive_ok,
             "drive_info": "" if drive_ok else drive_info,
             "vast_configured": bool(get_vast_api_key()),
             "tunnel_url": tunnel_url,
+            "drive_pull": dp,
             "jobs": jobs_list,
             "logs": logs_map,
         }
@@ -156,13 +162,35 @@ class JobManager:
         """Kéo gói Cách B từ `gdrive:MT-Video/<work_rel>/` về `_engine/work/` (dùng trên Vast.ai) rồi nạp vào hàng đợi."""
         rel = work_rel.replace("\\", "/").strip("/")
         work_dir = WORK_ROOT / rel
-        pull_from_drive(work_rel=rel, work_dir=work_dir)
+
+        def _on_pull_prog(pct: float, det: str):
+            with self._lock:
+                self.drive_pull = {
+                    "status": "running",
+                    "work_rel": rel,
+                    "progress_pct": round(float(pct), 1),
+                    "detail": det,
+                }
+            self._notify_ws()
+
+        _on_pull_prog(2.0, f"Chuẩn bị kéo {rel} từ Google Drive...")
+        try:
+            pull_from_drive(work_rel=rel, work_dir=work_dir, prog_cb=_on_pull_prog)
+        except Exception as exc:
+            with self._lock:
+                self.drive_pull = {"status": "error", "work_rel": rel, "progress_pct": 0.0, "detail": str(exc)}
+            self._notify_ws()
+            raise
+
+        with self._lock:
+            self.drive_pull = {"status": "done", "work_rel": rel, "progress_pct": 100.0, "detail": "Đã kéo xong!"}
+        self._notify_ws()
 
         src_mp4 = work_dir / "source.mp4"
         if not src_mp4.exists():
             raise FileNotFoundError(f"Gói Drive `{rel}` chưa có source.mp4 sau khi tải.")
 
-        return self.add_or_attach_job(
+        m = self.add_or_attach_job(
             source_path=src_mp4,
             work_rel=rel,
             mode=mode,
@@ -172,6 +200,12 @@ class JobManager:
             auto_start=auto_start,
             force_step1=False,
         )
+        if (m.get("drive_sync") or {}).get("status") in ("running", "queued"):
+            with self._lock:
+                m["drive_sync"] = {"status": "idle", "progress_pct": 0.0, "remote": "", "detail": ""}
+                save_manifest(m)
+            self._notify_ws()
+        return m
 
     def push_output_drive(self, job_id: str) -> dict[str, Any]:
         """Đẩy thư mục thành phẩm `output/<work_rel>/` lên Google Drive."""

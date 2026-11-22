@@ -52,6 +52,17 @@ RUN uv venv /opt/venvs/tts_ui --python python3.11 && \
       fastapi "uvicorn[standard]" python-multipart websockets pydantic python-dotenv \
       hf-transfer soundfile numpy
 
+# 5. FFmpeg bản mới (hỗ trợ -fps_mode & NVENC chuẩn) + bật NVIDIA video encode/decode
+# Đặt SAU 3 venv để giữ nguyên 100% cache build từ các tầng trên
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends xz-utils && rm -rf /var/lib/apt/lists/* && \
+    curl -fsSL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o /tmp/ffmpeg.tar.xz && \
+    tar -xJf /tmp/ffmpeg.tar.xz -C /tmp && \
+    cp /tmp/ffmpeg-*/bin/ffmpeg /tmp/ffmpeg-*/bin/ffprobe /usr/local/bin/ && \
+    chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe && \
+    rm -rf /tmp/ffmpeg*
+
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+
 WORKDIR /workspace/mt_video
 COPY _engine /workspace/mt_video/_engine
 COPY branding /workspace/mt_video/branding
