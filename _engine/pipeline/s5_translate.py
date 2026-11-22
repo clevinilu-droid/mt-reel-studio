@@ -87,15 +87,20 @@ def managed_vllm_server(model_id: str, cfg: dict[str, Any]):
     low_id = model_id.lower()
     if any(k in low_id for k in ("26b", "27b", "31b", "32b")) and not any(q in low_id for q in ("awq", "gptq", "fp8", "gguf")):
         cmd += ["--quantization", "bitsandbytes", "--load-format", "bitsandbytes"]
+    import tempfile
+
     print(f"[S5 vLLM] Khởi chạy {model_id} tại {base_url}...", flush=True)
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    log_fh = tempfile.NamedTemporaryFile(mode="w+", prefix="vllm_", suffix=".log", delete=False, encoding="utf-8")
+    log_path = Path(log_fh.name)
+    proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, text=True)
     try:
-        # Chờ vLLM sẵn sàng (tối đa 240s cho lần nạp model 27B)
-        deadline = time.time() + 240.0
+        # Chờ vLLM tải weights (lần đầu ~27B có thể mất 5–10 phút) & nạp VRAM (tối đa 900s)
+        deadline = time.time() + 900.0
         ready = False
         while time.time() < deadline:
             if proc.poll() is not None:
-                err = (proc.stderr.read() if proc.stderr else "")[-500:]
+                log_fh.flush()
+                err = log_path.read_text(encoding="utf-8", errors="replace")[-1200:]
                 raise RuntimeError(f"vLLM khởi chạy thất bại cho {model_id}: {err}")
             try:
                 _http_json(f"{base_url}/models", timeout=3)
@@ -104,7 +109,9 @@ def managed_vllm_server(model_id: str, cfg: dict[str, Any]):
             except Exception:
                 time.sleep(2.0)
         if not ready:
-            raise TimeoutError(f"Quá thời gian chờ vLLM khởi động cho {model_id}")
+            log_fh.flush()
+            tail = log_path.read_text(encoding="utf-8", errors="replace")[-800:]
+            raise TimeoutError(f"Quá thời gian chờ vLLM khởi động cho {model_id}: {tail}")
         yield base_url, model_id
     finally:
         print(f"[S5 vLLM] Đang tắt {model_id} để giải phóng sạch 24GB VRAM...", flush=True)
@@ -113,6 +120,8 @@ def managed_vllm_server(model_id: str, cfg: dict[str, Any]):
             proc.wait(timeout=12)
         except subprocess.TimeoutExpired:
             proc.kill()
+        log_fh.close()
+        log_path.unlink(missing_ok=True)
         time.sleep(2.0)
         release_vram()
 
