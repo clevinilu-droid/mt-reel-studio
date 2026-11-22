@@ -5,6 +5,7 @@ FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    UV_NO_CACHE=1 \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     HF_HOME=/workspace/hf_cache \
     MT_VENV_ASR_SEP=/opt/venvs/asr_sep/bin/python \
@@ -14,7 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # 1. Gói hệ thống + FFmpeg + sox + rclone (bản mới) + cloudflared + uv
 RUN apt-get update -qq && \
     apt-get install -y -qq --no-install-recommends \
-      software-properties-common curl wget git unzip ca-certificates \
+      software-properties-common build-essential curl wget git unzip ca-certificates \
       ffmpeg espeak-ng sox libsndfile1 && \
     add-apt-repository -y ppa:deadsnakes/ppa && \
     apt-get update -qq && \
