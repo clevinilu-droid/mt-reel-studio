@@ -11,6 +11,7 @@ Luồng tuần tự tiết kiệm 24 GB VRAM (xong model nào tắt sạch model
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -45,8 +46,12 @@ def _http_json(url: str, payload: dict[str, Any] | None = None, timeout: int = 1
         headers={"Content-Type": "application/json"},
         method="POST" if data is not None else "GET",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
 
 
 @contextmanager
@@ -132,46 +137,103 @@ def managed_vllm_server(model_id: str, cfg: dict[str, Any]):
         release_vram()
 
 
+def _try_decode_json_candidate(cand: str) -> Any | None:
+    """Thử giải mã một ứng viên JSON bằng các bước nới lỏng an toàn."""
+    variants = [
+        cand,
+        re.sub(r",\s*([}\]])", r"\1", cand),
+    ]
+    quoted = re.sub(r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', variants[1])
+    if quoted != variants[1]:
+        variants.append(quoted)
+
+    for v in variants:
+        try:
+            obj = json.loads(v)
+            if isinstance(obj, (dict, list)):
+                return obj
+        except Exception:
+            pass
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(v):
+            if ch not in "{[":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(v[idx:])
+                if isinstance(obj, (dict, list)):
+                    return obj
+            except Exception:
+                continue
+        try:
+            obj = ast.literal_eval(v)
+            if isinstance(obj, (dict, list)):
+                return obj
+        except Exception:
+            pass
+    return None
+
+
 def _parse_json_lenient(raw: str) -> Any:
     txt = (raw or "").strip()
+    # Loại bỏ thẻ suy nghĩ đầy đủ hoặc bị cắt cụt (Qwen3.5/3.8, Gemma 4)
+    txt = re.sub(r"<think>[\s\S]*?</think>", "", txt, flags=re.IGNORECASE).strip()
+    txt = re.sub(r"<thought>[\s\S]*?</thought>", "", txt, flags=re.IGNORECASE).strip()
+    for closing in ("</think>", "</thought>"):
+        low = txt.lower()
+        pos = low.rfind(closing)
+        if pos != -1:
+            txt = txt[pos + len(closing) :].strip()
+
+    candidates: list[str] = []
     if "```" in txt:
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", txt)
-        if m:
-            txt = m.group(1).strip()
-    # Bỏ khối <think>...</think> nếu model reasoning sinh ra
-    txt = re.sub(r"<think>[\s\S]*?</think>", "", txt).strip()
-    try:
-        return json.loads(txt)
-    except json.JSONDecodeError:
-        m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", txt)
-        if m:
-            return json.loads(m.group(1))
-        raise
+        blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", txt, flags=re.IGNORECASE)
+        candidates.extend(reversed([b.strip() for b in blocks if b.strip()]))
+    candidates.append(txt)
+
+    for cand in candidates:
+        parsed = _try_decode_json_candidate(cand)
+        if parsed is not None:
+            return parsed
+
+    snippet = repr(txt[:240])
+    raise ValueError(f"Không parse được JSON từ output LLM: {snippet}")
 
 
 def _chat_json(base_url: str, model_id: str, system_prompt: str, user_prompt: str, temp: float = 0.15) -> Any:
     last_err = None
-    for attempt in range(3):
+    use_json_mode = True
+    use_no_think = True
+    for attempt in range(4):
+        payload: dict[str, Any] = {
+            "model": model_id,
+            "temperature": temp,
+            "max_tokens": 8192,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        if use_json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        if use_no_think:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         try:
-            resp = _http_json(
-                f"{base_url}/chat/completions",
-                {
-                    "model": model_id,
-                    "temperature": temp,
-                    "max_tokens": 4096,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                },
-                timeout=240,
-            )
-            content = resp["choices"][0]["message"]["content"]
+            resp = _http_json(f"{base_url}/chat/completions", payload, timeout=240)
+            msg = resp["choices"][0]["message"]
+            content = msg.get("content") or msg.get("reasoning_content") or ""
             return _parse_json_lenient(content)
         except Exception as exc:
             last_err = exc
+            err_s = str(exc).lower()
+            if "http 400" in err_s or "http 422" in err_s:
+                if use_no_think and ("chat_template_kwargs" in err_s or "extra_forbidden" in err_s):
+                    use_no_think = False
+                    continue
+                if use_json_mode and ("response_format" in err_s or "json_object" in err_s):
+                    use_json_mode = False
+                    continue
             time.sleep(2.0 * (attempt + 1))
-    raise RuntimeError(f"Gọi LLM thất bại sau 3 lần ({model_id}): {last_err}")
+    raise RuntimeError(f"Gọi LLM thất bại sau 4 lần ({model_id}): {last_err}")
 
 
 def _load_jsonl_map(path: Path, key: str = "id") -> dict[int, dict[str, Any]]:
@@ -244,7 +306,7 @@ def _phase5a_qwen_analyze(
         "Bạn là biên kịch kiêm đạo diễn lồng tiếng chuyên phim ngắn Trung Quốc. "
         "Trả về DUY NHẤT JSON hợp lệ, không giải thích thêm."
     )
-    batch_size = 50
+    batch_size = 25
     vllm_ctx = None
     last_exc = None
     for cand_m in cand_models:
@@ -289,13 +351,16 @@ def _phase5a_qwen_analyze(
                 f"Danh sách câu:\n{json.dumps(packed, ensure_ascii=False)}"
             )
             res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.1)
+            if isinstance(res, list):
+                res = {"glossary_add": {}, "roles": res}
             for k, v in (res.get("glossary_add") or {}).items():
                 if k and v and k not in glossary:
                     glossary[k] = v
             atomic_write_json(glossary_path, glossary)
 
             role_items = []
-            res_map = {int(r["id"]): r for r in (res.get("roles") or []) if "id" in r}
+            raw_roles = res.get("roles") or res.get("items") or []
+            res_map = {int(r["id"]): r for r in raw_roles if isinstance(r, dict) and "id" in r}
             for t in batch:
                 tid = int(t["id"])
                 ac = acoustics_map.get(tid, {})
@@ -350,7 +415,7 @@ def _phase5b_gemma4_vi(
         "Dịch tiếng Trung sang văn nói Tiếng Việt tự nhiên, sắc sảo, không dịch sượng Hán Việt, "
         "độ dài câu khớp thời lượng giây cho phép. Chỉ trả JSON hợp lệ."
     )
-    batch_size = 40
+    batch_size = 25
     ctx = nullcontext(conn) if conn else managed_vllm_server(model_id, cfg)
     with ctx as (base_url, mid):
         for i in range(0, len(todo_turns), batch_size):
@@ -378,7 +443,8 @@ def _phase5b_gemma4_vi(
                 f"{json.dumps(packed, ensure_ascii=False)}"
             )
             res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.25)
-            rmap = {int(x["id"]): str(x.get("vi", "")).strip() for x in (res.get("items") or []) if "id" in x}
+            raw_items = res if isinstance(res, list) else (res.get("items") or [])
+            rmap = {int(x["id"]): str(x.get("vi") or x.get("text") or "").strip() for x in raw_items if isinstance(x, dict) and "id" in x}
             out_items = []
             for t in batch:
                 tid = int(t["id"])
@@ -428,7 +494,7 @@ def _phase5c_translategemma_foreign(
     model_id = cfg.get("models", {}).get("foreign_translate_model", "google/gemma-4-26B-A4B-it")
     emit_progress(67.0, f"Pha 5C: Nạp {model_id} dịch {', '.join(foreign_langs).upper()}...")
 
-    batch_size = 40
+    batch_size = 25
     ctx = nullcontext(conn) if conn else managed_vllm_server(model_id, cfg)
     with ctx as (base_url, mid):
         for l_idx, lang in enumerate(foreign_langs):
@@ -455,7 +521,8 @@ def _phase5c_translategemma_foreign(
                     f"Lines: {json.dumps(packed, ensure_ascii=False)}"
                 )
                 res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.15)
-                rmap = {int(x["id"]): str(x.get("text", "")).strip() for x in (res.get("items") or []) if "id" in x}
+                raw_items = res if isinstance(res, list) else (res.get("items") or [])
+                rmap = {int(x["id"]): str(x.get("text") or "").strip() for x in raw_items if isinstance(x, dict) and "id" in x}
                 out_items = []
                 for t in batch:
                     tid = int(t["id"])
