@@ -3,6 +3,14 @@ set -euo pipefail
 
 mkdir -p /root/.config/rclone /workspace/mt_video/Download /workspace/mt_video/output /workspace/hf_cache
 
+# 0. Tự đồng bộ code mới nhất từ GitHub (~0.5s) để không bao giờ phải rebuild Docker khi sửa Python/UI
+if [ "${MT_AUTO_SYNC:-1}" = "1" ]; then
+  if curl -fsSL --max-time 8 https://github.com/clevinilu-droid/mt-reel-studio/archive/refs/heads/main.tar.gz \
+      | tar -xz --strip-components=1 -C /workspace/mt_video mt-reel-studio-main/_engine mt-reel-studio-main/branding 2>/dev/null; then
+    echo "[BOOT] Đã cập nhật code mới nhất từ GitHub."
+  fi
+fi
+
 # 1. Tự khôi phục rclone.conf nếu được truyền từ Vast Template / UI
 if [ -n "${RCLONE_CONF_B64:-}" ]; then
   echo "${RCLONE_CONF_B64}" | base64 -d > /root/.config/rclone/rclone.conf
