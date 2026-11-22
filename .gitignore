@@ -1,0 +1,39 @@
+# Bảo mật tuyệt đối: không bao giờ đưa .env, API keys hay dữ liệu cá nhân lên Git
+.env
+.env.*
+*.key
+*.pem
+_tunnel.log
+_tunnel_url.txt
+
+# Virtual environments & cache Python
+.venv
+.venv*
+__pycache__/
+*.py[cod]
+*.log
+
+# Thư mục video nặng, kết quả làm việc, tài liệu kinh doanh riêng & công cụ rời
+Download/
+output/
+_engine/work/
+_engine/tools/
+node_modules/
+docs/
+cloud/
+data/
+DANH_SACH_PHIM*
+hongguo-downloader-*.exe
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.onnx
+*.pt
+*.pth
+*.safetensors
+*.bin

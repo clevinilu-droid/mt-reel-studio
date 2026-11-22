@@ -1,0 +1,415 @@
+"""Bước 6 (s6_tts_render): Lồng tiếng VieNeu (VI) + Qwen3-TTS-1.7B (EN/JA/KO/ES Clone 1 Nam/1 Nữ) + Mix & Render NVENC.
+
+Đặc điểm chuẩn studio:
+  - Tiếng Việt (`vi`): dùng `VieNeu TTS` 4 giọng stock map theo giới tính + độ tuổi từ Bước 5A.
+  - Ngoại ngữ (`en, ja, ko, es`): bỏ hoàn toàn `edge-tts`, dùng `Qwen3-TTS-1.7B` chạy thẳng GPU 3090:
+      * Chế độ `clone_2`: clone trực tiếp từ 2 mẫu vàng `04_ref_male.wav` & `04_ref_female.wav` (6–10s).
+      * Chế độ `voice_design`: sinh giọng bản xứ chuẩn theo mô tả giới tính + cảm xúc nếu không muốn accent Trung.
+  - Cache từng câu `tts_cache/<lang>/turn_XXXX.wav` (resume-safe 100%).
+  - Trộn lên `04_clean_bed.wav` (giữ nguyên 100% SFX/tiếng reo hò gốc ngoài thoại) -> xuất `audio/audio_<lang>.m4a`.
+  - Render HQ bằng `h264_nvenc` (hoặc `h264_qsv` / `libx264`), gắn watermark + soft sub, không dùng `setpts` gây lỗi cắt phim.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import shutil
+import subprocess
+import time
+import wave
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+from _engine.core.checkpoint import ENGINE_DIR, OUTPUT_ROOT, ROOT_DIR, atomic_write_json, read_json_safe
+from _engine.core.vram_guard import emit_progress, load_pipeline_config, release_vram
+from _engine.pipeline.s1_prepare import detect_gpu_encoder
+
+SR = 48000
+QWEN_LANG_MAP = {"en": "English", "ja": "Japanese", "ko": "Korean", "es": "Spanish", "zh": "Chinese"}
+EMOTION_INSTRUCT = {
+    "NEUTRAL": "natural clear cinematic dubbing tone",
+    "ANGRY": "angry intense forceful tone",
+    "HAPPY": "warm cheerful upbeat tone",
+    "SAD": "soft emotional sorrowful tone",
+    "WHISPER": "low quiet urgent whisper",
+    "URGENT": "fast tense dramatic tone",
+}
+
+
+def _load_jsonl_map(path: Path) -> dict[int, dict[str, Any]]:
+    out: dict[int, dict[str, Any]] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            out[int(obj["id"])] = obj
+        except Exception:
+            continue
+    return out
+
+
+def _pick_vieneu_voice(role: dict[str, Any], stock_cfg: dict[str, Any]) -> str:
+    """Ánh xạ giới tính + độ tuổi sang 1 trong 4 giọng chuẩn của VieNeu."""
+    g = str(role.get("gender", "MALE")).upper()
+    age = str(role.get("age_tone", "YOUNG")).upper()
+    arch = ("NU_TRUNG" if age == "MATURE" else "NU_TRE") if g == "FEMALE" else ("NAM_GIA" if age == "MATURE" else "NAM_TRE")
+    archetypes = stock_cfg.get("archetypes", {})
+    return archetypes.get(arch) or archetypes.get("NAM_TRE") or "Vinh (nam miền Nam)"
+
+
+def _synth_vieneu_vi(target_dir: Path, turns: list[dict[str, Any]], vi_map: dict[int, str], roles_map: dict[int, dict[str, Any]]) -> list[Path]:
+    """Tạo giọng đọc Tiếng Việt theo batch bằng VieNeu TTS + cache từng câu."""
+    cache_dir = target_dir / "tts_cache" / "vi"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    stock_cfg = read_json_safe(ENGINE_DIR / "config" / "vieneu_stock_cast.json") or {}
+
+    turn_paths: list[Path] = []
+    todo: list[tuple[int, str, str, Path]] = []
+    for t in turns:
+        tid = int(t["id"])
+        txt = (vi_map.get(tid) or "").strip()
+        voice_id = _pick_vieneu_voice(roles_map.get(tid, {}), stock_cfg)
+        h = hashlib.sha1(f"{voice_id}|{txt}".encode("utf-8")).hexdigest()[:8]
+        wav_p = cache_dir / f"turn_{tid:04d}_{h}.wav"
+        turn_paths.append(wav_p)
+        if txt and (not wav_p.exists() or wav_p.stat().st_size <= 2000):
+            todo.append((tid, txt, voice_id, wav_p))
+
+    if not todo:
+        emit_progress(30.0, f"Tái sử dụng cache VieNeu VI ({len(turns)} câu)")
+        return turn_paths
+
+    emit_progress(5.0, f"Đang nạp VieNeu TTS ({len(todo)} câu Tiếng Việt)...")
+    from vieneu import Vieneu
+
+    try:
+        import torch
+
+        use_cuda = torch.cuda.is_available()
+    except Exception:
+        use_cuda = False
+
+    tts = Vieneu(mode="standard", backbone_device="cuda" if use_cuda else "cpu", codec_device="cuda" if use_cuda else "cpu")
+    voice_cache: dict[str, Any] = {}
+
+    # Gom theo từng giọng để chạy infer_batch tốc độ cao trên RTX 3090
+    by_voice: dict[str, list[tuple[int, str, Path]]] = {}
+    for tid, txt, vid, wp in todo:
+        by_voice.setdefault(vid, []).append((tid, txt, wp))
+
+    done = 0
+    for vid, items in by_voice.items():
+        if vid not in voice_cache:
+            voice_cache[vid] = tts.get_preset_voice(vid)
+        v_obj = voice_cache[vid]
+        bsz = 32 if use_cuda else 1
+        for i in range(0, len(items), bsz):
+            chunk = items[i : i + bsz]
+            texts = [c[1] for c in chunk]
+            if bsz > 1 and hasattr(tts, "infer_batch"):
+                audios = tts.infer_batch(texts=texts, voice=v_obj)
+            else:
+                audios = [tts.infer(text=tx, voice=v_obj) for tx in texts]
+            for (_, _, wp), audio_arr in zip(chunk, audios):
+                tts.save(audio_arr, str(wp))
+                done += 1
+            pct = 6.0 + (done / max(1, len(todo))) * 28.0
+            emit_progress(pct, f"VieNeu VI: {done}/{len(todo)} câu")
+
+    del tts
+    release_vram()
+    return turn_paths
+
+
+def _synth_qwen3_tts_foreign(
+    target_dir: Path,
+    lang: str,
+    turns: list[dict[str, Any]],
+    txt_map: dict[int, str],
+    roles_map: dict[int, dict[str, Any]],
+    voice_mode: str,
+    cfg: dict[str, Any],
+    prog_base: float,
+    prog_span: float,
+) -> list[Path]:
+    """Tạo giọng đọc EN / JA / KO / ES bằng Qwen3-TTS-1.7B (Clone 1 Nam + 1 Nữ hoặc Voice Design)."""
+    cache_dir = target_dir / "tts_cache" / lang
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    ref_male = target_dir / "04_ref_male.wav"
+    ref_female = target_dir / "04_ref_female.wav"
+    use_clone = voice_mode == "clone_2" and ref_male.exists() and ref_female.exists()
+
+    turn_paths: list[Path] = []
+    todo: list[tuple[int, str, dict[str, Any], Path]] = []
+    for t in turns:
+        tid = int(t["id"])
+        txt = (txt_map.get(tid) or "").strip()
+        r = roles_map.get(tid, {})
+        sig = f"{'clone' if use_clone else 'design'}|{r.get('gender','MALE')}|{r.get('emotion','NEUTRAL')}|{txt}"
+        h = hashlib.sha1(sig.encode("utf-8")).hexdigest()[:8]
+        wp = cache_dir / f"turn_{tid:04d}_{h}.wav"
+        turn_paths.append(wp)
+        if txt and (not wp.exists() or wp.stat().st_size <= 2000):
+            todo.append((tid, txt, r, wp))
+
+    if not todo:
+        emit_progress(prog_base + prog_span, f"Tái sử dụng cache Qwen3-TTS {lang.upper()} ({len(turns)} câu)")
+        return turn_paths
+
+    import soundfile as sf
+    import torch
+    from qwen_tts import Qwen3TTSModel
+
+    models_cfg = cfg.get("models", {})
+    model_id = (
+        models_cfg.get("tts_foreign_clone_model", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+        if use_clone
+        else models_cfg.get("tts_foreign_design_model", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
+    )
+    emit_progress(prog_base, f"Nạp Qwen3-TTS ({lang.upper()}, {'Clone 1 Nam/1 Nữ' if use_clone else 'Voice Design'})...")
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    model = Qwen3TTSModel.from_pretrained(model_id, device_map=device, dtype=dtype)
+    q_lang = QWEN_LANG_MAP.get(lang, "English")
+
+    for idx, (tid, txt, r, wp) in enumerate(todo, start=1):
+        gender = str(r.get("gender", "MALE")).upper()
+        emo = EMOTION_INSTRUCT.get(str(r.get("emotion", "NEUTRAL")).upper(), EMOTION_INSTRUCT["NEUTRAL"])
+        if use_clone:
+            ref_p = str(ref_female if gender == "FEMALE" else ref_male)
+            wavs, sr_out = model.generate_voice_clone(text=txt, language=q_lang, ref_audio=ref_p, x_vector_only_mode=True)
+        else:
+            persona = (
+                f"Confident adult female native {q_lang} speaker, {emo}"
+                if gender == "FEMALE"
+                else f"Deep resonant adult male native {q_lang} speaker, {emo}"
+            )
+            wavs, sr_out = model.generate_voice_design(text=txt, language=q_lang, instruct=persona)
+        sf.write(str(wp), wavs[0], sr_out)
+        if idx % 5 == 0 or idx == len(todo):
+            emit_progress(prog_base + (idx / len(todo)) * prog_span, f"Qwen3-TTS {lang.upper()}: {idx}/{len(todo)} câu")
+
+    del model
+    release_vram()
+    return turn_paths
+
+
+def _prepare_slot_pcm(wav_path: Path, slot_dur: float) -> np.ndarray:
+    """Chuyển 1 câu TTS sang 48kHz mono float32 và tăng tốc nhẹ (tối đa 1.32x) nếu câu dài hơn khung giờ."""
+    tmp_48 = wav_path.with_suffix(".48k.wav")
+    try:
+        # Đo độ dài gốc của câu TTS
+        out_probe = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(wav_path)],
+            text=True,
+        ).strip()
+        raw_dur = float(out_probe or 0.0)
+        af = "aresample=48000"
+        if raw_dur > slot_dur > 0.25:
+            spd = min(1.32, raw_dur / slot_dur)
+            af = f"atempo={spd:.3f},aresample=48000"
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(wav_path), "-af", af, "-ac", "1", "-ar", str(SR), "-c:a", "pcm_s16le", str(tmp_48)],
+            check=True,
+        )
+        with wave.open(str(tmp_48), "rb") as wf:
+            raw = wf.readframes(wf.getnframes())
+        arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        pk = float(np.max(np.abs(arr))) + 1e-8
+        if pk > 0.05:
+            arr = arr * min(1.8, 0.86 / pk)
+        return arr
+    finally:
+        tmp_48.unlink(missing_ok=True)
+
+
+def _mix_track_streaming(turns: list[dict[str, Any]], turn_files: list[Path], clean_bed_wav: Path, out_m4a: Path):
+    """Trộn giọng TTS vào 04_clean_bed.wav theo từng chunk 30s (nhẹ RAM, giữ nguyên 100% SFX ngoài thoại)."""
+    out_m4a.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(clean_bed_wav), "rb") as wf_bed:
+        total_frames = wf_bed.getnframes()
+        total_dur = total_frames / float(SR)
+
+    planned: list[tuple[int, int, np.ndarray]] = []
+    cursor_end = 0
+    for idx, t in enumerate(turns):
+        wp = turn_files[idx]
+        if not wp.exists() or wp.stat().st_size <= 2000:
+            continue
+        start_s = float(t["start"])
+        next_s = float(turns[idx + 1]["start"]) if idx + 1 < len(turns) else total_dur
+        hard_end = min(next_s - 0.04, max(float(t["end"]) + 0.30, start_s + 0.55))
+        slot_dur = max(0.30, hard_end - start_s)
+        samples = _prepare_slot_pcm(wp, slot_dur)
+        if len(samples) == 0:
+            continue
+        s_idx = int(round(start_s * SR))
+        min_idx = cursor_end + int(0.03 * SR) if cursor_end > 0 else 0
+        if s_idx < min_idx:
+            s_idx = min_idx
+        if s_idx >= total_frames:
+            break
+        e_idx = min(total_frames, s_idx + len(samples))
+        planned.append((s_idx, e_idx, np.clip(samples[: e_idx - s_idx] * 32767.0, -32768, 32767).astype(np.int16)))
+        cursor_end = e_idx
+
+    raw_wav = out_m4a.with_suffix(".tmp.wav")
+    duck_ramp = int(0.14 * SR)
+    chunk_frames = 30 * SR
+    try:
+        with wave.open(str(clean_bed_wav), "rb") as wf_bed, wave.open(str(raw_wav), "wb") as wf_out:
+            wf_out.setnchannels(2)
+            wf_out.setsampwidth(2)
+            wf_out.setframerate(SR)
+            for c0 in range(0, total_frames, chunk_frames):
+                c1 = min(total_frames, c0 + chunk_frames)
+                clen = c1 - c0
+                wf_bed.setpos(c0)
+                bed = np.frombuffer(wf_bed.readframes(clen), dtype=np.int16).astype(np.float32).reshape(-1, 2) / 32768.0
+                gain = np.full(clen, 0.94, dtype=np.float32)
+                speech = np.zeros(clen, dtype=np.float32)
+                for ts, te, s16 in planned:
+                    if te + duck_ramp <= c0 or ts - duck_ramp >= c1:
+                        continue
+                    o0, o1 = max(c0, ts), min(c1, te)
+                    if o1 > o0:
+                        speech[o0 - c0 : o1 - c0] += s16[o0 - ts : o1 - ts].astype(np.float32) / 32768.0
+                        gain[o0 - c0 : o1 - c0] = np.minimum(gain[o0 - c0 : o1 - c0], 0.45)
+                mixed = bed * gain[:, None] + speech[:, None]
+                pk = float(np.max(np.abs(mixed))) if len(mixed) else 0.0
+                if pk > 0.96:
+                    mixed *= 0.96 / pk
+                wf_out.writeframes(np.clip(mixed * 32767.0, -32768, 32767).astype(np.int16).tobytes())
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(raw_wav), "-c:a", "aac", "-b:a", "192k", "-ar", str(SR), "-ac", "2", str(out_m4a)],
+            check=True,
+        )
+    finally:
+        raw_wav.unlink(missing_ok=True)
+
+
+def _render_master_mp4(cfr_mp4: Path, master_audio: Path, master_srt: Path | None, out_mp4: Path):
+    """Render MP4 chuẩn chất lượng cao dùng GPU NVENC/QSV + Watermark + Soft Sub (không setpts lỗi cắt phim)."""
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+    enc_name, hw_args, enc_args = detect_gpu_encoder()
+    wm_png = ROOT_DIR / "branding" / "MT_Reel_Strip_Watermark.png"
+
+    cmd = ["ffmpeg", "-y", "-v", "warning", *hw_args, "-i", str(cfr_mp4), "-i", str(master_audio)]
+    sub_idx = None
+    wm_idx = None
+    next_i = 2
+    if wm_png.exists():
+        cmd += ["-i", str(wm_png)]
+        wm_idx = next_i
+        next_i += 1
+    if master_srt and master_srt.exists():
+        cmd += ["-i", str(master_srt)]
+        sub_idx = next_i
+
+    if wm_idx is not None:
+        cmd += [
+            "-filter_complex",
+            f"[{wm_idx}:v]scale=iw*0.92:-1,format=rgba,colorchannelmixer=aa=0.82[wm];[0:v][wm]overlay=(W-w)/2:H*0.03[vout]",
+            "-map",
+            "[vout]",
+        ]
+    else:
+        cmd += ["-map", "0:v:0"]
+
+    cmd += ["-map", "1:a:0", *enc_args, "-c:a", "copy", "-movflags", "+faststart"]
+    if sub_idx is not None:
+        cmd += ["-map", f"{sub_idx}:0", "-c:s", "mov_text", "-metadata:s:s:0", "language=vie"]
+    cmd.append(str(out_mp4))
+    print(f"[S6 RENDER] Encoder={enc_name} -> {out_mp4}", flush=True)
+    subprocess.run(cmd, check=True)
+
+
+def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str = "clone_2", is_test_5min: bool = False) -> dict[str, Any]:
+    master = read_json_safe(target_dir / "03_aligned_master.json")
+    clean_bed = target_dir / "04_clean_bed.wav"
+    cfr_mp4 = target_dir / "01_cfr_raw.mp4"
+    if not master or not clean_bed.exists() or not cfr_mp4.exists():
+        raise FileNotFoundError("Thiếu file đầu vào từ Bước 1/3/4 cho Bước 6.")
+
+    t0 = time.perf_counter()
+    cfg = load_pipeline_config()
+    turns = master["turns"]
+    roles_map = _load_jsonl_map(target_dir / "05a_roles.jsonl")
+
+    out_base = OUTPUT_ROOT / work_rel / ("preview_5min" if is_test_5min else "")
+    audio_out_dir = out_base / "audio"
+    sub_out_dir = out_base / "subtitles"
+    audio_out_dir.mkdir(parents=True, exist_ok=True)
+    sub_out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 6A. Tiếng Việt (VieNeu)
+    if "vi" in langs:
+        vi_map = {k: v["vi"] for k, v in _load_jsonl_map(target_dir / "05b_sub_vi.jsonl").items()}
+        vi_files = _synth_vieneu_vi(target_dir, turns, vi_map, roles_map)
+        emit_progress(35.0, "Đang trộn audio_vi.m4a lên nền sạch 04_clean_bed.wav...")
+        _mix_track_streaming(turns, vi_files, clean_bed, audio_out_dir / "audio_vi.m4a")
+        if (target_dir / "tracks" / "vi.srt").exists():
+            shutil.copy2(target_dir / "tracks" / "vi.srt", sub_out_dir / "vi.srt")
+
+    # 6B. Ngoại ngữ (Qwen3-TTS-1.7B)
+    foreign_langs = [x for x in langs if x != "vi"]
+    if foreign_langs:
+        span = 45.0 / len(foreign_langs)
+        for idx, lang in enumerate(foreign_langs):
+            tmap = {k: v["text"] for k, v in _load_jsonl_map(target_dir / f"05c_sub_{lang}.jsonl").items()}
+            wavs = _synth_qwen3_tts_foreign(target_dir, lang, turns, tmap, roles_map, voice_mode, cfg, 38.0 + idx * span, span * 0.85)
+            _mix_track_streaming(turns, wavs, clean_bed, audio_out_dir / f"audio_{lang}.m4a")
+            if (target_dir / "tracks" / f"{lang}.srt").exists():
+                shutil.copy2(target_dir / "tracks" / f"{lang}.srt", sub_out_dir / f"{lang}.srt")
+
+    # Copy 2 mẫu clone vàng ra thư mục preview để cậu nghe thử dễ dàng trong bản Test 5 phút
+    for ref_name in ("04_ref_male.wav", "04_ref_female.wav", "glossary.json"):
+        rp = target_dir / ref_name
+        if rp.exists():
+            shutil.copy2(rp, out_base / ref_name)
+
+    # 6C. Render MP4 thành phẩm
+    emit_progress(86.0, "Đang render MP4 thành phẩm bằng GPU (NVENC/QSV)...")
+    primary_lang = "vi" if "vi" in langs else langs[0]
+    master_audio = audio_out_dir / f"audio_{primary_lang}.m4a"
+    master_srt = sub_out_dir / f"{primary_lang}.srt"
+    mp4_name = f"preview_5min_{primary_lang}.mp4" if is_test_5min else f"final_{primary_lang}.mp4"
+    out_mp4 = out_base / mp4_name
+    _render_master_mp4(cfr_mp4, master_audio, master_srt, out_mp4)
+
+    elapsed = round(time.perf_counter() - t0, 2)
+    meta = {
+        "elapsed_s": elapsed,
+        "mode": "test_5min" if is_test_5min else "full",
+        "langs": langs,
+        "voice_mode": voice_mode,
+        "output_mp4": str(out_mp4),
+    }
+    atomic_write_json(out_base / "render_meta.json", meta)
+    emit_progress(100.0, f"Hoàn tất xuất phim ({mp4_name}, {elapsed}s)")
+    print(f"[S6 DONE] {out_mp4} trong {elapsed}s", flush=True)
+    return meta
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Bước 6: VieNeu (VI) + Qwen3-TTS-1.7B (EN/JA/KO/ES) + Mix + Render GPU.")
+    parser.add_argument("target_dir", type=Path, help="Thư mục work mục tiêu")
+    parser.add_argument("--work-rel", required=True, help="Đường dẫn tương đối <Series>/<Part>")
+    parser.add_argument("--langs", default="vi,en,ja,ko,es", help="Ngôn ngữ xuất")
+    parser.add_argument("--voice-mode", default="clone_2", choices=["clone_2", "voice_design"])
+    parser.add_argument("--test-5min", action="store_true", help="Xuất vào thư mục preview_5min")
+    args = parser.parse_args()
+    langs = [x.strip().lower() for x in args.langs.split(",") if x.strip()]
+    run_step6(args.target_dir.resolve(), work_rel=args.work_rel, langs=langs, voice_mode=args.voice_mode, is_test_5min=args.test_5min)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MT Reel Studio v2</title>
+  <link rel="stylesheet" href="/static/style.css?v=6" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span id="wsDot" class="dot off"></span>
+      <span>MT Reel Studio</span>
+    </div>
+
+    <nav class="tabs">
+      <button class="tab active" id="tabWork">Đang làm</button>
+      <button class="tab" id="tabAdd">+ Thêm phim mới</button>
+      <button class="tab" id="tabList">Kho phim (<span id="jobCountBadge">0</span>)</button>
+      <button class="tab" id="tabVast">☁️ Vast.ai</button>
+    </nav>
+
+    <div class="sysinfo" id="sysInfo">Đang kết nối...</div>
+  </header>
+
+  <main class="container">
+    <!-- MÀN HÌNH 1: THÊM PHIM MỚI (SIÊU GỌN) -->
+    <section id="viewAdd" class="view" style="display:none;">
+      <div class="center-card">
+        <h1>Chọn video phim gốc để bắt đầu</h1>
+        <p class="sub">Kéo thả video hoặc bấm Browse. Nếu phim đã từng làm Bước 1, hệ thống sẽ tự nhận và không chạy lại.</p>
+
+        <div id="dropzone" class="dropzone">
+          <div class="dz-icon">🎬</div>
+          <div class="dz-title">Kéo & thả file video (.mp4 / .mkv) vào đây</div>
+          <button type="button" class="btn secondary" id="btnBrowse">📂 Browse chọn file từ máy...</button>
+          <input type="file" id="fileInput" accept=".mp4,.mkv,.mov,video/*" hidden />
+          <div id="pickedFile" class="picked-badge" style="display:none;"></div>
+        </div>
+
+        <div class="or-line"><span>hoặc chọn nhanh video đã có sẵn trong Download/</span></div>
+
+        <select id="downloadSelect" class="select-lg">
+          <option value="">-- Chọn file có sẵn trong Download/ --</option>
+        </select>
+
+        <div class="or-line"><span>hoặc kéo gói Bước 1 từ Google Drive (dùng trên Vast.ai)</span></div>
+
+        <div class="drive-pull-row">
+          <select id="driveSelect" class="select-lg" style="margin:0;">
+            <option value="">-- Bấm 🔄 để tải danh sách phim trên Drive --</option>
+          </select>
+          <button type="button" class="btn ghost sm" id="btnRefreshDrive" title="Tải danh sách Drive">🔄</button>
+          <button type="button" class="btn secondary sm" id="btnPullDrive">⬇ Kéo Drive</button>
+        </div>
+
+        <details class="adv-box">
+          <summary>⚙ Tùy chọn nâng cao (mặc định đã cấu hình chuẩn)</summary>
+          <div class="adv-body">
+            <div class="field">
+              <label>Tên thư mục Work (để trống sẽ tự đặt theo tên phim)</label>
+              <input type="text" id="workRelInput" placeholder="Tự động nhận diện..." />
+            </div>
+            <div class="field">
+              <label>Ngôn ngữ xuất</label>
+              <div class="row-wrap">
+                <label class="ck"><input type="checkbox" class="langCk" value="vi" checked /> VI</label>
+                <label class="ck"><input type="checkbox" class="langCk" value="en" checked /> EN</label>
+                <label class="ck"><input type="checkbox" class="langCk" value="ja" checked /> JA</label>
+                <label class="ck"><input type="checkbox" class="langCk" value="ko" checked /> KO</label>
+                <label class="ck"><input type="checkbox" class="langCk" value="es" checked /> ES</label>
+              </div>
+            </div>
+            <div class="field">
+              <label>Giọng ngoại ngữ (Qwen3-TTS)</label>
+              <div class="row-wrap">
+                <label class="ck"><input type="radio" name="voiceMode" value="clone_2" checked /> Clone 1 Nam + 1 Nữ (6–10s)</label>
+                <label class="ck"><input type="radio" name="voiceMode" value="voice_design" /> Voice Design bản địa</label>
+              </div>
+            </div>
+            <div class="field">
+              <label class="ck"><input type="checkbox" id="autoDriveCk" /> Tự Upload Google Drive sau khi xong Bước 1</label>
+            </div>
+          </div>
+        </details>
+
+        <div id="uploadWrap" class="upload-wrap" style="display:none;">
+          <div class="muted" id="uploadLabel">Đang tải lên...</div>
+          <div class="bar-wrap"><div class="bar-fill" id="uploadBar"></div></div>
+        </div>
+
+        <div class="submit-row">
+          <button type="button" class="btn primary lg" id="btnStartTest">🧪 Chạy Test 5 phút đầu (Khuyên dùng)</button>
+          <button type="button" class="btn ghost" id="btnStartFull">hoặc chạy Full luôn</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- MÀN HÌNH 2: PHIM ĐANG LÀM (TẬP TRUNG 1 NÚT CHÍNH) -->
+    <section id="viewWork" class="view">
+      <div id="workEmpty" class="center-card" style="display:none; text-align:center;">
+        <h1>Chưa có phim nào đang mở</h1>
+        <p class="sub">Bấm nút dưới để kéo thả hoặc chọn video phim gốc đầu tiên.</p>
+        <button type="button" class="btn primary lg" id="btnEmptyAdd">+ Thêm phim mới</button>
+      </div>
+
+      <div id="workContent" style="display:none;">
+        <!-- HỘP TRẠNG THÁI & 1 NÚT HÀNH ĐỘNG CHÍNH DUY NHẤT -->
+        <div class="hero-card">
+          <div class="hero-top">
+            <div>
+              <div class="eyebrow">PHIM ĐANG CHỌN</div>
+              <h1 id="wTitle" class="hero-title">...</h1>
+              <div id="wSubtitle" class="muted"></div>
+            </div>
+            <span id="wBadge" class="badge b-wait">...</span>
+          </div>
+
+          <!-- THANH STEPPER 6 BƯỚC GỌN 1 HÀNG -->
+          <div class="stepper" id="stepper"></div>
+
+          <!-- CHỈ HIỆN CÁC TIẾN TRÌNH ĐANG CHẠY LIVE (MỖI TASK 1 THANH RIÊNG) -->
+          <div id="liveTasksBox" class="live-box" style="display:none;"></div>
+
+          <!-- TÓM TẮT NHỮNG HẠNG MỤC ĐÃ XONG (TÁCH RIÊNG KHỎI THANH LIVE) -->
+          <div id="completedSummaryBox" class="done-summary" style="display:none;"></div>
+
+          <!-- 1 NÚT CHÍNH NỔI BẬT + MENU THAO TÁC PHỤ THU GỌN -->
+          <div class="hero-actions">
+            <div id="primaryActionSlot"></div>
+            <div class="secondary-actions">
+              <button type="button" class="btn ghost sm" id="btnOpenFolder">📂 Mở thư mục</button>
+              <details class="more-menu" id="moreMenu">
+                <summary class="btn ghost sm">••• Khác</summary>
+                <div class="more-pop">
+                  <button type="button" id="actTest5">🧪 Chạy Test 5 phút</button>
+                  <button type="button" id="actTestS3">🔍 Chạy thử B1 → B3 (Test 5p)</button>
+                  <button type="button" id="actFullAll">🚀 Chạy Full (Đủ 6 bước)</button>
+                  <button type="button" id="actForceS1">🔄 Chạy lại Bước 1 (Force)</button>
+                  <button type="button" id="actPushDrive">☁️ Upload Bước 1 lên Drive</button>
+                  <button type="button" id="actPushOutput">📦 Upload Output lên Drive</button>
+                </div>
+              </details>
+            </div>
+          </div>
+        </div>
+
+        <!-- KẾT QUẢ KHÁM BỆNH PHIM GỐC (HIỆN NGAY TRONG TẦM MẮT) -->
+        <div class="card" id="auditCard" style="display:none;">
+          <div class="card-head">
+            <h2>Kết quả kiểm tra video gốc (Bước 1)</h2>
+            <span class="muted" id="auditModeLabel"></span>
+          </div>
+          <div class="metrics" id="auditMetrics"></div>
+          <details class="samples-box">
+            <summary>Xem mẫu so sánh Giọng nói gốc (ASR) ↔ Phụ đề trên hình (OCR)</summary>
+            <div id="auditSamples"></div>
+          </details>
+        </div>
+
+        <!-- LOG GỌN (THU GỌN KHI KHÔNG CHẠY) -->
+        <details class="card log-details" id="logDetails">
+          <summary>Nhật ký chạy chi tiết (Log)</summary>
+          <pre id="logBox" class="logbox"></pre>
+        </details>
+      </div>
+    </section>
+
+    <!-- MÀN HÌNH 3: KHO PHIM / HÀNG ĐỢI -->
+    <section id="viewList" class="view" style="display:none;">
+      <div class="card">
+        <div class="card-head">
+          <h2>Danh sách phim trong hệ thống</h2>
+          <button type="button" class="btn primary sm" id="btnListAdd">+ Thêm phim mới</button>
+        </div>
+        <div id="jobList"></div>
+      </div>
+    </section>
+
+    <!-- MÀN HÌNH 4: VAST.AI GPU NHANH NHẤT (SET UP 1 LẦN) -->
+    <section id="viewVast" class="view" style="display:none;">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <h2>Tìm & Thuê GPU Vast.ai (tự lọc cấu hình chạy nhanh nhất)</h2>
+            <div class="muted" id="vastRuleNote">Chuẩn: VRAM &ge; 24GB · Mạng &ge; 1000 Mbps · RAM &ge; 24GB · CPU &ge; 6c · Disk BW &ge; 400 MB/s · Reliability &ge; 98.5% · Tránh CN/RU/IR/BY/KP</div>
+          </div>
+          <span id="vastKeyBadge" class="badge b-wait">Kiểm tra key...</span>
+        </div>
+
+        <div class="vast-filters">
+          <select id="vastGpu" class="select-sm">
+            <option value="ANY">Tất cả GPU >= 24GB</option>
+            <option value="RTX 3090">RTX 3090 (24GB)</option>
+            <option value="RTX 4090">RTX 4090 (24GB)</option>
+            <option value="RTX A5000">RTX A5000 (24GB)</option>
+            <option value="RTX 3090 Ti">RTX 3090 Ti (24GB)</option>
+          </select>
+          <select id="vastSort" class="select-sm">
+            <option value="price">Giá rẻ nhất đạt chuẩn ($/h)</option>
+            <option value="score">Hiệu năng / Giá tốt nhất</option>
+          </select>
+          <input type="number" id="vastMinInet" class="input-sm" value="1000" min="300" step="100" title="Tốc độ mạng tối thiểu (Mbps)" />
+          <input type="number" id="vastMaxDph" class="input-sm" value="0.65" min="0.1" step="0.05" title="Giá tối đa ($/giờ)" />
+          <input type="text" id="vastImage" class="input-sm wide" value="ghcr.io/clevinilu-droid/mt-reel-studio:v2" placeholder="Docker Image / Template Hash (vd: ghcr.io/clevinilu-droid/mt-reel-studio:v2)" />
+          <button type="button" class="btn primary sm" id="btnSearchVast">🔍 Tìm GPU</button>
+        </div>
+
+        <div id="vastOffersWrap" class="table-wrap">
+          <div class="muted">Bấm "🔍 Tìm GPU" để quét các máy Vast.ai đạt chuẩn tốc độ cao.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Máy Vast.ai đang thuê</h2>
+          <button type="button" class="btn ghost sm" id="btnRefreshInstances">🔄 Làm mới</button>
+        </div>
+        <div id="vastInstancesWrap" class="table-wrap">
+          <div class="muted">Chưa kiểm tra máy đang thuê.</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js?v=7"></script>
+</body>
+</html>
