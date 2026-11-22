@@ -27,7 +27,7 @@ import av
 import numpy as np
 
 from _engine.core.checkpoint import atomic_write_json, read_json_safe
-from _engine.core.vram_guard import emit_progress
+from _engine.core.vram_guard import emit_progress, patch_onnx_threads
 
 CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
 
@@ -317,9 +317,10 @@ def run_step3(target_dir: Path, force: bool = False) -> dict[str, Any]:
     rescued_ocr = 0
     fallback_asr = 0
     if need_rescue_indices and cfr_mp4.exists():
+        patch_onnx_threads(4)
         from rapidocr_onnxruntime import RapidOCR
 
-        ocr_engine = RapidOCR(use_angle_cls=False)
+        ocr_engine = RapidOCR(use_angle_cls=False, det_use_cuda=False, rec_use_cuda=False)
         for ri, ci in enumerate(need_rescue_indices, start=1):
             c = candidates[ci]
             if ri % 5 == 1 or ri == len(need_rescue_indices):

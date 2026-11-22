@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 
 from _engine.core.checkpoint import atomic_write_json, read_json_safe
-from _engine.core.vram_guard import emit_progress, load_pipeline_config, release_vram
+from _engine.core.vram_guard import emit_progress, load_pipeline_config, patch_onnx_threads, release_vram
 
 CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
 
@@ -140,6 +140,7 @@ def _try_run_funasr(wav_16k: Path, jsonl_path: Path, total_dur: float, chunk_sec
 
 def _run_faster_whisper(wav_16k: Path, jsonl_path: Path, total_dur: float, chunk_sec: float, cfg: dict) -> list[dict[str, Any]]:
     """Chạy Faster-Whisper (BatchedInferencePipeline trên CUDA, int8 trên CPU) có lọc Silero VAD."""
+    patch_onnx_threads(4)
     from faster_whisper import WhisperModel
 
     try:
@@ -184,10 +185,11 @@ def _run_faster_whisper(wav_16k: Path, jsonl_path: Path, total_dur: float, chunk
 
         emit_progress(10.0 + (ci / n_chunks) * 85.0, f"Whisper VAD+ASR chunk {ci+1}/{n_chunks} ({c_start:.0f}s)...")
         audio = read_wav_chunk_f32(wav_16k, c_start, c_dur)
+        vad_opts = {"threshold": 0.25, "min_speech_duration_ms": 120, "min_silence_duration_ms": 300}
         if batched is not None:
-            segs_iter, _ = batched.transcribe(audio, language="zh", batch_size=16, vad_filter=True, word_timestamps=True)
+            segs_iter, _ = batched.transcribe(audio, language="zh", batch_size=16, vad_filter=True, vad_parameters=vad_opts, word_timestamps=True)
         else:
-            segs_iter, _ = base_model.transcribe(audio, language="zh", beam_size=2, vad_filter=True, word_timestamps=True)
+            segs_iter, _ = base_model.transcribe(audio, language="zh", beam_size=2, vad_filter=True, vad_parameters=vad_opts, word_timestamps=True)
 
         chunk_segs: list[dict[str, Any]] = []
         for s in segs_iter:
@@ -244,18 +246,21 @@ def run_step2a(target_dir: Path, force: bool = False, chunk_sec: float = 300.0) 
     if not wav_16k.exists():
         raise FileNotFoundError(f"Thiếu file audio Bước 1: {wav_16k}")
 
+    total_dur = read_wav_duration(wav_16k)
     if not force:
         existing = read_json_safe(out_json)
-        if existing and existing.get("segments"):
-            emit_progress(100.0, f"Tái sử dụng checkpoint 2A ({len(existing['segments'])} câu)")
-            print(f"[S2A] Tái sử dụng {out_json.name} ({len(existing['segments'])} câu).", flush=True)
+        segs_old = (existing or {}).get("segments") or []
+        if existing and (len(segs_old) > 5 or total_dur < 120):
+            emit_progress(100.0, f"Tái sử dụng checkpoint 2A ({len(segs_old)} câu)")
+            print(f"[S2A] Tái sử dụng {out_json.name} ({len(segs_old)} câu).", flush=True)
             return existing
+        if existing and len(segs_old) <= 5:
+            jsonl_path.unlink(missing_ok=True)
     else:
         jsonl_path.unlink(missing_ok=True)
 
     t0 = time.perf_counter()
     cfg = load_pipeline_config()
-    total_dur = read_wav_duration(wav_16k)
     engine_pref = cfg.get("models", {}).get("asr_engine", "auto")
 
     segs = None

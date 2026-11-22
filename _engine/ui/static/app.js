@@ -236,13 +236,23 @@
     $("wBadge").textContent = statusText(job.status);
     $("wBadge").className = `badge ${badgeClass(job.status)}`;
 
+    const fmtDur = (sec) => {
+      const s = Number(sec || 0);
+      if (s <= 0) return "";
+      if (s < 60) return `${s.toFixed(1)}s`;
+      const m = Math.floor(s / 60);
+      const r = Math.round(s % 60);
+      return m >= 60 ? `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m` : `${m}m${String(r).padStart(2, "0")}s`;
+    };
+
     // 1. Stepper ngang 1 hàng siêu gọn
     $("stepper").innerHTML = STEP_SHORT.map(([k, code, name]) => {
       const st = (job.steps && job.steps[k]) || { status: "pending" };
       const icon = st.status === "done" ? "✓" : st.status === "running" ? "▶" : st.status === "error" ? "!" : "○";
+      const tStr = st.status === "done" && st.elapsed_s > 0 ? ` · ${fmtDur(st.elapsed_s)}` : "";
       return `
         <div class="st-chip ${esc(st.status)}">
-          <div class="st-num">${icon} ${code}</div>
+          <div class="st-num">${icon} ${code}${esc(tStr)}</div>
           <div>${name}</div>
         </div>
       `;
@@ -291,15 +301,21 @@
       liveBox.innerHTML = "";
     }
 
-    // 2B. Hộp Đã Hoàn Tất: tách riêng những bước & task Drive đã xong (không lẫn vào thanh live)
+    // 2B. Hộp Đã Hoàn Tất: tách riêng những bước & task Drive đã xong (kèm thời gian từng bước + tổng)
     const doneRows = [];
+    let totalElapsedS = 0;
     for (const [k, code, name] of STEP_SHORT) {
       const st = (job.steps && job.steps[k]) || {};
+      if (st.status === "done") totalElapsedS += Number(st.elapsed_s || 0);
       if (st.status === "done" && st.detail) {
-        doneRows.push(`<div class="done-item"><strong>✓ ${code} — ${esc(name)}</strong><span>${esc(st.detail)}</span></div>`);
+        const tBadge = st.elapsed_s > 0 ? ` (${fmtDur(st.elapsed_s)})` : "";
+        doneRows.push(`<div class="done-item"><strong>✓ ${code} — ${esc(name)}${esc(tBadge)}</strong><span>${esc(st.detail)}</span></div>`);
       } else if (st.status === "error") {
         doneRows.push(`<div class="done-item"><strong style="color:#fca5a5;">! ${code} — Lỗi</strong><span>${esc(st.detail || "")}</span></div>`);
       }
+    }
+    if (totalElapsedS > 0) {
+      doneRows.push(`<div class="done-item" style="border-top:1px solid var(--border);padding-top:6px;margin-top:4px;"><strong>⏱ Tổng thời gian các bước đã xong</strong><span><strong>${esc(fmtDur(totalElapsedS))}</strong> (${totalElapsedS.toFixed(1)}s)</span></div>`);
     }
     if (ds.status === "done") {
       doneRows.push(`<div class="done-item"><strong>☁️ Google Drive (Đã đồng bộ)</strong><span>${esc(ds.remote || ds.detail || "")}</span></div>`);

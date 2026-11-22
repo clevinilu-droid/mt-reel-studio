@@ -21,6 +21,7 @@ from typing import Any, Callable
 import numpy as np
 
 from _engine.core.checkpoint import atomic_write_json, step1_artifacts_valid
+from _engine.core.vram_guard import patch_onnx_threads
 
 CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
 FF_TIME_RE = re.compile(r"out_time_us=(\d+)")
@@ -340,6 +341,7 @@ def _run_spotcheck(
     if prog_cb:
         prog_cb(82.0, "Đang nạp Whisper + RapidOCR cho Spot-Check...")
     t_load0 = time.perf_counter()
+    patch_onnx_threads(4)
     # Dùng Whisper small CPU int8 + RapidOCR CPU cho 3 đoạn 20s để tránh xung đột/treo cuDNN trong container
     whisper = WhisperModel("small", device="cpu", compute_type="int8")
     ocr = RapidOCR()

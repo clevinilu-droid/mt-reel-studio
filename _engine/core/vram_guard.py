@@ -63,6 +63,37 @@ def emit_progress(pct: float, detail: str):
     print(f"[PROG] {max(0.0, min(100.0, pct)):.1f} | {detail}", flush=True)
 
 
+def patch_onnx_threads(threads: int = 4):
+    """Giới hạn số luồng ONNX Runtime CPU (tránh spinlock 128 threads trên container giới hạn cgroup EPYC)."""
+    for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(k, str(threads))
+    try:
+        import onnxruntime as ort
+
+        _orig = getattr(ort, "_MT_ORIG_SO", ort.SessionOptions)
+        ort._MT_ORIG_SO = _orig
+
+        class _SafeSessionOptions(_orig):
+            def __init__(self):
+                super().__init__()
+                self.intra_op_num_threads = threads
+                self.inter_op_num_threads = 1
+                try:
+                    self.add_session_config_entry("session.intra_op.allow_spinning", "0")
+                except Exception:
+                    pass
+
+        ort.SessionOptions = _SafeSessionOptions
+        try:
+            import rapidocr_onnxruntime.utils as ru
+
+            ru.SessionOptions = _SafeSessionOptions
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def run_isolated_step(
     module_name: str,
     args: list[str],
@@ -78,6 +109,9 @@ def run_isolated_step(
     existing_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{ROOT_DIR}{os.pathsep}{existing_pp}" if existing_pp else str(ROOT_DIR)
     env["PYTHONUTF8"] = "1"
+    env.setdefault("OMP_NUM_THREADS", "4")
+    env.setdefault("OPENBLAS_NUM_THREADS", "4")
+    env.setdefault("MKL_NUM_THREADS", "4")
 
     if log_cb:
         log_cb(f"[EXEC:{venv_key}] {Path(py_exe).name} -m {module_name} {' '.join(args)}")
