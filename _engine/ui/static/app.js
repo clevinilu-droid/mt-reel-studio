@@ -347,7 +347,7 @@
         slot.innerHTML = `<button type="button" class="btn green lg" id="dynPrimary">🚀 Chạy Full (6 bước)</button>`;
         $("dynPrimary").onclick = () => postJobAction("start", { mode: "full", force_step1: false, target_stage: "all" });
       } else {
-        const label = job.status === "paused" ? "▶ Chạy tiếp Test 5 phút (6 bước)" : "🧪 Chạy Test 5 phút (6 bước)";
+        const label = job.status === "paused" ? "▶ Chạy tiếp Test 2 phút (6 bước)" : "🧪 Chạy Test 2 phút (6 bước)";
         slot.innerHTML = `<button type="button" class="btn primary lg" id="dynPrimary">${label}</button>`;
         $("dynPrimary").onclick = () => postJobAction("start", { mode: "test_5min", force_step1: false, target_stage: "all" });
       }
@@ -359,7 +359,7 @@
       slot.innerHTML = `<button type="button" class="btn primary lg" id="dynPrimary">🚀 Chạy Full Bước 1</button>`;
       $("dynPrimary").onclick = () => postJobAction("start", { mode: "full", force_step1: false, target_stage: "s1" });
     } else {
-      slot.innerHTML = `<button type="button" class="btn primary lg" id="dynPrimary">🧪 Chạy Test 5 phút</button>`;
+      slot.innerHTML = `<button type="button" class="btn primary lg" id="dynPrimary">🧪 Chạy Test 2 phút</button>`;
       $("dynPrimary").onclick = () => postJobAction("start", { mode: "test_5min", force_step1: false, target_stage: "s1" });
     }
 
@@ -367,7 +367,7 @@
     const audit = job.audit_full || job.audit_test;
     if (audit) {
       $("auditCard").style.display = "block";
-      $("auditModeLabel").textContent = job.audit_full ? "Bản Full phim" : "Bản Test 5 phút";
+      $("auditModeLabel").textContent = job.audit_full ? "Bản Full phim" : "Bản Test 2 phút";
       const sp = audit.source_probe || {};
       const np = audit.normalized_probe || {};
       const tm = audit.timings_s || {};
