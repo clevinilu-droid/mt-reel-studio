@@ -339,15 +339,16 @@
       slot.innerHTML = `<button type="button" class="btn amber lg" id="dynPrimary">⏸ Tạm dừng</button>`;
       $("dynPrimary").onclick = () => postJobAction("pause");
     } else if (hasCuda) {
-      if (job.status === "done") {
+      if (job.status === "done" && job.mode === "full") {
         const driveDisabled = !state.drive_ready || isDriveLive;
         slot.innerHTML = `<button type="button" class="btn green lg" id="dynPrimary" ${driveDisabled ? "disabled" : ""}>📦 Upload Output lên Drive</button>`;
         $("dynPrimary").onclick = () => postJobAction("push-output");
-      } else if (job.step1_test_ready && job.mode === "test_5min" && job.status !== "error") {
+      } else if (job.step1_test_ready && job.mode === "test_5min" && (job.status === "done" || job.steps?.s6?.status === "done")) {
         slot.innerHTML = `<button type="button" class="btn green lg" id="dynPrimary">🚀 Chạy Full (6 bước)</button>`;
         $("dynPrimary").onclick = () => postJobAction("start", { mode: "full", force_step1: false, target_stage: "all" });
       } else {
-        slot.innerHTML = `<button type="button" class="btn primary lg" id="dynPrimary">🧪 Chạy Test 5 phút (6 bước)</button>`;
+        const label = job.status === "paused" ? "▶ Chạy tiếp Test 5 phút (6 bước)" : "🧪 Chạy Test 5 phút (6 bước)";
+        slot.innerHTML = `<button type="button" class="btn primary lg" id="dynPrimary">${label}</button>`;
         $("dynPrimary").onclick = () => postJobAction("start", { mode: "test_5min", force_step1: false, target_stage: "all" });
       }
     } else if (job.step1_full_ready) {
