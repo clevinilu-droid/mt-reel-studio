@@ -66,65 +66,76 @@ def append_chunk_checkpoint(jsonl_path: Path, chunk_idx: int, segments: list[dic
 
 
 def _try_run_funasr(wav_16k: Path, jsonl_path: Path, total_dur: float, chunk_sec: float, cfg: dict) -> list[dict[str, Any]] | None:
-    """Chạy FunASR (Paraformer-zh + FSMN-VAD + CT-Punc + CAM++ tách người nói) theo chunk 5 phút."""
+    """Chạy FunASR (Paraformer-zh + FSMN-VAD + CAM++ tách người nói) theo chunk 5 phút; tự fallback sang Faster-Whisper nếu lỗi."""
     try:
         from funasr import AutoModel
-    except ImportError:
+
+        models_cfg = cfg.get("models", {})
+        emit_progress(5.0, "Đang nạp FunASR (Paraformer-zh + VAD + CAM++ tách người nói)...")
+        print("[S2A] Khởi tạo FunASR AutoModel (Paraformer-zh + CAM++)...", flush=True)
+        model = None
+        for punc_cand in (models_cfg.get("funasr_punc", "ct-punc"), "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch", None):
+            try:
+                kw: dict[str, Any] = {
+                    "model": models_cfg.get("funasr_model", "paraformer-zh"),
+                    "vad_model": models_cfg.get("funasr_vad", "fsmn-vad"),
+                    "spk_model": models_cfg.get("funasr_spk", "cam++"),
+                    "disable_update": True,
+                }
+                if punc_cand:
+                    kw["punc_model"] = punc_cand
+                model = AutoModel(**kw)
+                break
+            except Exception as exc:
+                print(f"[S2A WARN] FunASR punc={punc_cand} lỗi ({exc}), thử cấu hình dự phòng...", flush=True)
+        if model is None:
+            return None
+
+        done_chunks = load_chunk_checkpoints(jsonl_path)
+        n_chunks = max(1, int(np.ceil(total_dur / chunk_sec)))
+        all_segs: list[dict[str, Any]] = []
+
+        for ci in range(n_chunks):
+            c_start = ci * chunk_sec
+            c_dur = min(chunk_sec, total_dur - c_start)
+            if ci in done_chunks:
+                all_segs.extend(done_chunks[ci])
+                emit_progress(10.0 + ((ci + 1) / n_chunks) * 85.0, f"Bỏ qua chunk {ci+1}/{n_chunks} (đã lưu checkpoint)")
+                continue
+
+            emit_progress(10.0 + (ci / n_chunks) * 85.0, f"FunASR nghe & tách người nói chunk {ci+1}/{n_chunks} ({c_start:.0f}s)...")
+            audio = read_wav_chunk_f32(wav_16k, c_start, c_dur)
+            res = model.generate(input=audio, batch_size_s=180, sentence_timestamp=True)
+            chunk_segs: list[dict[str, Any]] = []
+            if res and isinstance(res, list):
+                for item in res:
+                    sent_info = item.get("sentence_info") or []
+                    for s in sent_info:
+                        txt = str(s.get("text", "")).strip()
+                        if not has_cjk(txt):
+                            continue
+                        st = round(c_start + float(s.get("start", 0)) / 1000.0, 3)
+                        en = round(c_start + float(s.get("end", 0)) / 1000.0, 3)
+                        spk_raw = s.get("spk", 0)
+                        chunk_segs.append(
+                            {
+                                "start": st,
+                                "end": max(st + 0.15, en),
+                                "text": txt,
+                                "spk_id": f"SPK_{int(spk_raw):02d}" if str(spk_raw).isdigit() else str(spk_raw),
+                                "no_speech_prob": 0.05,
+                            }
+                        )
+            append_chunk_checkpoint(jsonl_path, ci, chunk_segs)
+            all_segs.extend(chunk_segs)
+            print(f"[S2A] FunASR chunk {ci+1}/{n_chunks}: {len(chunk_segs)} câu thoại.", flush=True)
+
+        del model
+        release_vram()
+        return all_segs
+    except Exception as exc:
+        print(f"[S2A WARN] FunASR không khả dụng ({exc}) -> tự chuyển sang Faster-Whisper Batched GPU!", flush=True)
         return None
-
-    models_cfg = cfg.get("models", {})
-    emit_progress(5.0, "Đang nạp FunASR (Paraformer-zh + VAD + CAM++ tách người nói)...")
-    print("[S2A] Khởi tạo FunASR AutoModel (Paraformer-zh + CAM++)...", flush=True)
-    model = AutoModel(
-        model=models_cfg.get("funasr_model", "paraformer-zh"),
-        vad_model=models_cfg.get("funasr_vad", "fsmn-vad"),
-        punc_model=models_cfg.get("funasr_punc", "ct-punc"),
-        spk_model=models_cfg.get("funasr_spk", "cam++"),
-        disable_update=True,
-    )
-
-    done_chunks = load_chunk_checkpoints(jsonl_path)
-    n_chunks = max(1, int(np.ceil(total_dur / chunk_sec)))
-    all_segs: list[dict[str, Any]] = []
-
-    for ci in range(n_chunks):
-        c_start = ci * chunk_sec
-        c_dur = min(chunk_sec, total_dur - c_start)
-        if ci in done_chunks:
-            all_segs.extend(done_chunks[ci])
-            emit_progress(10.0 + ((ci + 1) / n_chunks) * 85.0, f"Bỏ qua chunk {ci+1}/{n_chunks} (đã lưu checkpoint)")
-            continue
-
-        emit_progress(10.0 + (ci / n_chunks) * 85.0, f"FunASR nghe & tách người nói chunk {ci+1}/{n_chunks} ({c_start:.0f}s)...")
-        audio = read_wav_chunk_f32(wav_16k, c_start, c_dur)
-        res = model.generate(input=audio, batch_size_s=180, sentence_timestamp=True)
-        chunk_segs: list[dict[str, Any]] = []
-        if res and isinstance(res, list):
-            for item in res:
-                sent_info = item.get("sentence_info") or []
-                for s in sent_info:
-                    txt = str(s.get("text", "")).strip()
-                    if not has_cjk(txt):
-                        continue
-                    st = round(c_start + float(s.get("start", 0)) / 1000.0, 3)
-                    en = round(c_start + float(s.get("end", 0)) / 1000.0, 3)
-                    spk_raw = s.get("spk", 0)
-                    chunk_segs.append(
-                        {
-                            "start": st,
-                            "end": max(st + 0.15, en),
-                            "text": txt,
-                            "spk_id": f"SPK_{int(spk_raw):02d}" if str(spk_raw).isdigit() else str(spk_raw),
-                            "no_speech_prob": 0.05,
-                        }
-                    )
-        append_chunk_checkpoint(jsonl_path, ci, chunk_segs)
-        all_segs.extend(chunk_segs)
-        print(f"[S2A] FunASR chunk {ci+1}/{n_chunks}: {len(chunk_segs)} câu thoại.", flush=True)
-
-    del model
-    release_vram()
-    return all_segs
 
 
 def _run_faster_whisper(wav_16k: Path, jsonl_path: Path, total_dur: float, chunk_sec: float, cfg: dict) -> list[dict[str, Any]]:

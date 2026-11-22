@@ -327,7 +327,7 @@
         const driveDisabled = !state.drive_ready || isDriveLive;
         slot.innerHTML = `<button type="button" class="btn green lg" id="dynPrimary" ${driveDisabled ? "disabled" : ""}>📦 Upload Output lên Drive</button>`;
         $("dynPrimary").onclick = () => postJobAction("push-output");
-      } else if (job.step1_test_ready && job.mode === "test_5min") {
+      } else if (job.step1_test_ready && job.mode === "test_5min" && job.status !== "error") {
         slot.innerHTML = `<button type="button" class="btn green lg" id="dynPrimary">🚀 Chạy Full (6 bước)</button>`;
         $("dynPrimary").onclick = () => postJobAction("start", { mode: "full", force_step1: false, target_stage: "all" });
       } else {
