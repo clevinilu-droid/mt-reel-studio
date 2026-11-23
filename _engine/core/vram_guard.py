@@ -63,6 +63,27 @@ def emit_progress(pct: float, detail: str):
     print(f"[PROG] {max(0.0, min(100.0, pct)):.1f} | {detail}", flush=True)
 
 
+def find_venv_cudnn_preload(py_exe_or_prefix: str | Path) -> str:
+    """Tìm đường dẫn tuyệt đối tới `libcudnn.so.9` trong venv mục tiêu để gán LD_PRELOAD,
+    ép Linux ld.so nạp cuDNN 9.5/9.8+ của venv trước `/usr/lib/x86_64-linux-gnu/libcudnn.so.9` (9.1.0 của base image).
+    """
+    import glob
+
+    p = Path(py_exe_or_prefix)
+    try:
+        p_res = p.resolve()
+    except Exception:
+        p_res = p
+    if p.name.startswith("python") or p_res.name.startswith("python"):
+        venv_root = p.parent.parent if (p.parent.name == "bin" and p.parent.parent.exists()) else p_res.parent.parent
+    else:
+        venv_root = p if p.exists() else p_res
+
+    pat = str(venv_root / "lib" / "python*" / "site-packages" / "nvidia" / "cudnn" / "lib" / "libcudnn.so.9")
+    matches = sorted(glob.glob(pat))
+    return matches[0] if matches else ""
+
+
 def build_venv_ld_library_path(py_exe_or_prefix: str | Path, base_ld: str | None = None) -> str:
     """Tạo LD_LIBRARY_PATH cô lập cho ĐÚNG 1 venv mục tiêu, loại bỏ mọi đường dẫn /opt/venvs/* khác để tránh xung đột cuDNN 9.1 vs 9.8."""
     import glob

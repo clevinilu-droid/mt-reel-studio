@@ -30,6 +30,7 @@ from _engine.core.vram_guard import (
     build_venv_ld_library_path,
     emit_progress,
     ensure_onnx_cuda_libs,
+    find_venv_cudnn_preload,
     load_pipeline_config,
     patch_onnx_threads,
     release_vram,
@@ -278,26 +279,38 @@ def _merge_ocr_lines(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return segs
 
 
-def _probe_rapidocr_cuda_candidates() -> tuple[str, str, bool] | None:
-    """Thử chạy RapidOCR CUDA trong tiến trình con tách biệt để tránh crash C++ SIGABRT (-6) khi lệch cuDNN.
+def _probe_rapidocr_cuda_candidates() -> tuple[str, str, str, str, bool] | None:
+    """Thử chạy RapidOCR CUDA trong tiến trình con tách biệt (kèm LD_PRELOAD libcudnn.so.9 của venv)
+    và kiểm tra stderr để chắc chắn 100% ONNX Runtime thực sự chạy trên GPU (không bị EP_FAIL fallback về CPU).
 
-    Trả về `(label, py_exe, ld_library_path, skip_preload)` của cấu hình GPU đầu tiên chạy thành công conv2d,
-    hoặc `None` nếu mọi cấu hình GPU đều lỗi (khi đó tiến trình chính sẽ fallback sang CPU an toàn 100%).
+    Trả về `(label, py_exe, ld_library_path, ld_preload, skip_preload)` của cấu hình GPU thật đầu tiên.
     """
-    candidates: list[tuple[str, str, str, bool]] = []
-    cur_ld = build_venv_ld_library_path(sys.prefix)
-    candidates.append(("venv_isolated", sys.executable, cur_ld, False))
-
+    candidates: list[tuple[str, str, str, str, bool]] = []
     if sys.platform.startswith("linux"):
+        # Ưu tiên các venv có cuDNN 9.5/9.8+ (tts_ui, vlm_llm, asr_sep) kèm LD_PRELOAD libcudnn.so.9 để đè cuDNN 9.1.0 của base image
+        for venv_dir in ("/opt/venvs/tts_ui", "/opt/venvs/vlm_llm", "/opt/venvs/asr_sep", sys.prefix):
+            vpath = Path(venv_dir)
+            py_exe = vpath / "bin" / "python"
+            if not py_exe.exists():
+                continue
+            ld_path = build_venv_ld_library_path(vpath)
+            preload_so = find_venv_cudnn_preload(vpath)
+            tag = vpath.name
+            if preload_so:
+                candidates.append((f"{tag}_preload_cudnn", str(py_exe), ld_path, preload_so, False))
+            candidates.append((f"{tag}_isolated", str(py_exe), ld_path, "", False))
         sys_cuda_ld = "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
-        candidates.append(("system_cuda_cudnn", sys.executable, sys_cuda_ld, True))
-        for alt_venv in ("/opt/venvs/asr_sep", "/opt/venvs/vlm_llm", "/opt/venvs/tts_ui"):
-            alt_py = Path(alt_venv) / "bin" / "python"
-            if alt_py.exists() and str(alt_py) != sys.executable:
-                candidates.append((f"{Path(alt_venv).name}_isolated", str(alt_py), build_venv_ld_library_path(alt_venv), False))
-                candidates.append((f"{Path(alt_venv).name}_syscuda", str(alt_py), sys_cuda_ld, True))
+        candidates.append(("system_cuda_cudnn", sys.executable, sys_cuda_ld, "", True))
+    else:
+        candidates.append(("venv_isolated", sys.executable, build_venv_ld_library_path(sys.prefix), "", False))
 
-    for label, py_exe, ld_path, skip_preload in candidates:
+    seen: set[tuple[str, str, str]] = set()
+    for label, py_exe, ld_path, ld_preload, skip_preload in candidates:
+        key = (py_exe, ld_path, ld_preload)
+        if key in seen:
+            continue
+        seen.add(key)
+
         preload_stmt = "" if skip_preload else "from _engine.core.vram_guard import ensure_onnx_cuda_libs; ensure_onnx_cuda_libs(); "
         code = (
             "import numpy as np; "
@@ -306,7 +319,7 @@ def _probe_rapidocr_cuda_candidates() -> tuple[str, str, bool] | None:
             "assert 'CUDAExecutionProvider' in ort.get_available_providers(), 'NO_CUDA_EP'; "
             "from rapidocr_onnxruntime import RapidOCR; "
             "ocr = RapidOCR(use_angle_cls=False, det_use_cuda=True, rec_use_cuda=True); "
-            "ocr(np.zeros((64, 160, 3), dtype=np.uint8)); "
+            "ocr(np.zeros((96, 320, 3), dtype=np.uint8)); "
             "print('RAPIDOCR_CUDA_PROBE_OK', flush=True)"
         )
         env = os.environ.copy()
@@ -314,6 +327,10 @@ def _probe_rapidocr_cuda_candidates() -> tuple[str, str, bool] | None:
         env["PYTHONPATH"] = f"{ROOT_DIR}{os.pathsep}{existing_pp}" if existing_pp else str(ROOT_DIR)
         if sys.platform.startswith("linux"):
             env["LD_LIBRARY_PATH"] = ld_path
+            if ld_preload:
+                env["LD_PRELOAD"] = ld_preload
+            else:
+                env.pop("LD_PRELOAD", None)
         try:
             proc = subprocess.run(
                 [py_exe, "-c", code],
@@ -323,11 +340,18 @@ def _probe_rapidocr_cuda_candidates() -> tuple[str, str, bool] | None:
                 text=True,
                 timeout=45,
             )
-            if proc.returncode == 0 and "RAPIDOCR_CUDA_PROBE_OK" in (proc.stdout or ""):
-                print(f"[S2B CUDA PROBE] Thành công với cấu hình '{label}' ({py_exe})", flush=True)
-                return label, py_exe, ld_path, skip_preload
-            err_tail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-240:]
-            print(f"[S2B CUDA PROBE] '{label}' thất bại (rc={proc.returncode}): {err_tail}", flush=True)
+            combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            has_ep_fallback = (
+                "Falling back to ['CPUExecutionProvider']" in combined
+                or "CUDNN_FE failure" in combined
+                or "EP_FAIL" in combined
+                or "CUDNN_STATUS_NOT_INITIALIZED" in combined
+            )
+            if proc.returncode == 0 and "RAPIDOCR_CUDA_PROBE_OK" in (proc.stdout or "") and not has_ep_fallback:
+                print(f"[S2B CUDA PROBE] GPU CUDA thật chạy sạch 100% với '{label}' ({py_exe})", flush=True)
+                return label, py_exe, ld_path, ld_preload, skip_preload
+            err_tail = combined[-260:]
+            print(f"[S2B CUDA PROBE] '{label}' bỏ qua (rc={proc.returncode}, ep_fallback={has_ep_fallback}): {err_tail}", flush=True)
         except Exception as exc:
             print(f"[S2B CUDA PROBE] '{label}' ngoại lệ: {exc}", flush=True)
     return None
@@ -377,11 +401,16 @@ def run_step2b(target_dir: Path, force: bool = False, batch_size: int = 16) -> d
         if not verified_label:
             win = _probe_rapidocr_cuda_candidates()
             if win is not None:
-                label, win_py, win_ld, win_skip = win
+                label, win_py, win_ld, win_preload, win_skip = win
                 cur_ld = os.environ.get("LD_LIBRARY_PATH", "")
-                if sys.platform.startswith("linux") and (win_py != sys.executable or cur_ld != win_ld):
+                cur_pre = os.environ.get("LD_PRELOAD", "")
+                if sys.platform.startswith("linux") and (win_py != sys.executable or cur_ld != win_ld or cur_pre != win_preload):
                     print(f"[S2B CUDA] Re-exec sang môi trường GPU đã kiểm chứng '{label}'...", flush=True)
                     os.environ["LD_LIBRARY_PATH"] = win_ld
+                    if win_preload:
+                        os.environ["LD_PRELOAD"] = win_preload
+                    else:
+                        os.environ.pop("LD_PRELOAD", None)
                     os.environ["MT_S2B_CUDA_VERIFIED"] = label
                     os.environ["MT_S2B_SKIP_PRELOAD"] = "1" if win_skip else "0"
                     os.execv(win_py, [win_py, "-u", "-m", "_engine.pipeline.s2b_ocr", *sys.argv[1:]])
