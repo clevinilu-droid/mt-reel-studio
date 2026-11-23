@@ -240,7 +240,11 @@ class JobManager:
             use_mode = mode or m.get("mode", "test_5min")
             work_dir = Path(m["work_dir"])
             target_dir = (work_dir / "_test_5min") if use_mode == "test_5min" else work_dir
-            if from_step == "s5":
+            if from_step == "s6_render":
+                pats = ()
+                dirs = ()
+                step_keys = ("s6",)
+            elif from_step == "s5":
                 pats = ("05*", "glossary.json", "relationship_bible.json")
                 dirs = ("tracks", "tts_cache")
                 step_keys = ("s5", "s6")

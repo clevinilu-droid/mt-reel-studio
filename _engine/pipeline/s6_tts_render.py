@@ -349,12 +349,8 @@ def _mix_track_streaming(turns: list[dict[str, Any]], turn_files: list[Path], cl
 
 
 def _detect_sub_blur_rect(cfr_mp4: Path, turns: list[dict[str, Any]] | None = None) -> tuple[int, int, int, int]:
-    """Tự đo khung phụ đề Trung thực tế trên video để làm mờ chiều ngang & dọc vừa khít.
-
-    Lấy mẫu tối đa 16 khung hình ưu tiên các câu thoại dài nhất (để phủ đủ câu rộng nhất),
-    căn giữa đối xứng theo chiều ngang + chừa viền gọn (26px ngang, 14px dọc).
-    """
-    default_rect = (120, 1440, 840, 120)
+    """Đo vị trí dọc thực tế của phụ đề Trung trên video, mở rộng chiều ngang gần hết khung (~94%) để không bao giờ hở chữ dài."""
+    default_rect = (32, 1434, 1016, 124)
     try:
         from _engine.core.vram_guard import patch_onnx_threads
 
@@ -377,11 +373,9 @@ def _detect_sub_blur_rect(cfr_mp4: Path, turns: list[dict[str, Any]] | None = No
                 seen.add(mid)
                 sample_ts.append(mid)
     if not sample_ts:
-        sample_ts = [10.0, 25.0, 40.0, 55.0, 70.0, 90.0, 110.0]
+        sample_ts = [5.0, 25.0, 40.0, 49.0, 70.0, 90.0, 110.0]
 
     ocr = RapidOCR()
-    xs0: list[float] = []
-    xs1: list[float] = []
     ys0: list[float] = []
     ys1: list[float] = []
     W, H = 1080, 1920
@@ -391,13 +385,16 @@ def _detect_sub_blur_rect(cfr_mp4: Path, turns: list[dict[str, Any]] | None = No
 
         with av.open(str(cfr_mp4)) as cont:
             st = cont.streams.video[0]
+            tb = float(st.time_base)
             W, H = int(st.width or 1080), int(st.height or 1920)
             y_top, y_bot = int(H * 0.56), int(H * 0.94)
             max_line_h = int(H * 0.08)
             for sec in sample_ts:
                 try:
-                    cont.seek(max(0, int(sec / float(st.time_base))), stream=st, backward=True)
-                    for frame in cont.decode(st):
+                    cont.seek(max(0, int(sec / tb)), stream=st, backward=True)
+                    for step_f, frame in enumerate(cont.decode(st)):
+                        if frame.pts is not None and float(frame.pts * tb) < sec - 0.15 and step_f < 60:
+                            continue
                         arr = frame.to_ndarray(format="bgr24")
                         res, _ = ocr(arr[y_top:y_bot, :])
                         if res:
@@ -406,12 +403,8 @@ def _detect_sub_blur_rect(cfr_mp4: Path, turns: list[dict[str, Any]] | None = No
                                     continue
                                 by0 = min(p[1] for p in box) + y_top
                                 by1 = max(p[1] for p in box) + y_top
-                                bx0 = min(p[0] for p in box)
-                                bx1 = max(p[0] for p in box)
                                 if (by1 - by0) > max_line_h:
                                     continue
-                                xs0.append(bx0)
-                                xs1.append(bx1)
                                 ys0.append(by0)
                                 ys1.append(by1)
                         break
@@ -420,33 +413,24 @@ def _detect_sub_blur_rect(cfr_mp4: Path, turns: list[dict[str, Any]] | None = No
     except Exception:
         return default_rect
 
-    if not xs0:
-        return default_rect
+    bx = max(0, int(round(W * 0.03))) & ~1
+    bw = min(W - bx, W - 2 * bx) & ~1
+    if not ys0:
+        return bx, max(0, int(round(H * 0.74))) & ~1, bw, 124
 
-    if len(xs0) >= 6:
-        raw_x0 = float(np.percentile(xs0, 2))
-        raw_x1 = float(np.percentile(xs1, 98))
+    if len(ys0) >= 6:
         raw_y0 = float(np.percentile(ys0, 2))
         raw_y1 = float(np.percentile(ys1, 98))
     else:
-        raw_x0, raw_x1 = min(xs0), max(xs1)
         raw_y0, raw_y1 = min(ys0), max(ys1)
 
-    pad_x, pad_y = 26, 14
-    x0 = max(20.0, raw_x0 - pad_x)
-    x1 = min(W - 20.0, raw_x1 + pad_x)
+    pad_y = 20
     y0 = max(int(H * 0.50), int(raw_y0 - pad_y))
-    y1 = min(H - 20, int(raw_y1 + pad_y))
-
-    # Căn giữa đối xứng ngang để dải mờ cân đối, khống chế bề rộng tối thiểu/tối đa vừa đẹp
-    half_w = max(W / 2.0 - x0, x1 - W / 2.0, W * 0.28)
-    half_w = min(half_w, (W - 40) / 2.0)
-    bx = max(0, int(round(W / 2.0 - half_w))) & ~1
-    bw = min(W - bx, int(round(half_w * 2.0))) & ~1
-    bh = max(84, min(220, y1 - y0))
+    y1 = min(H - 16, int(raw_y1 + pad_y))
+    bh = max(100, min(240, y1 - y0))
     by = max(0, min(H - bh, int(round((y0 + y1) / 2.0 - bh / 2.0)))) & ~1
     bh = min(H - by, bh) & ~1
-    print(f"[S6 SUB-BLUR] Tự đo từ {len(xs0)} dòng sub Trung -> ({bx}, {by}, {bw}x{bh})", flush=True)
+    print(f"[S6 SUB-BLUR] Chiều ngang gần hết ({bw}px) + đo dọc từ {len(ys0)} dòng sub Trung -> ({bx}, {by}, {bw}x{bh})", flush=True)
     return bx, by, bw, bh
 
 
