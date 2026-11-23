@@ -97,7 +97,7 @@ class FromPathReq(BaseModel):
     work_rel: str | None = None
     mode: str = "test_5min"
     langs: list[str] = ["vi", "en", "ja", "ko", "es"]
-    voice_mode: str = "single_male"
+    voice_mode: str = "single_female"
     auto_sync_drive: bool = False
     auto_start: bool = True
     force_step1: bool = False
@@ -107,7 +107,7 @@ class FromDriveReq(BaseModel):
     work_rel: str
     mode: str = "full"
     langs: list[str] = ["vi", "en", "ja", "ko", "es"]
-    voice_mode: str = "single_male"
+    voice_mode: str = "single_female"
     auto_start: bool = True
 
 
@@ -136,7 +136,7 @@ class UploadFinishReq(BaseModel):
     work_rel: str | None = None
     mode: str = "test_5min"
     langs: list[str] = ["vi", "en", "ja", "ko", "es"]
-    voice_mode: str = "single_male"
+    voice_mode: str = "single_female"
     auto_sync_drive: bool = False
     auto_start: bool = True
     force_step1: bool = False

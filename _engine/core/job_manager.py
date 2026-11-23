@@ -157,7 +157,7 @@ class JobManager:
         work_rel: str,
         mode: str = "full",
         langs: list[str] | None = None,
-        voice_mode: str = "clone_2",
+        voice_mode: str = "single_female",
         auto_start: bool = True,
     ) -> dict[str, Any]:
         """Kéo gói Cách B từ `gdrive:MT-Video/<work_rel>/` về `_engine/work/` (dùng trên Vast.ai) rồi nạp vào hàng đợi."""
@@ -275,7 +275,7 @@ class JobManager:
         work_rel: str | None = None,
         mode: str = "test_5min",
         langs: list[str] | None = None,
-        voice_mode: str = "single_male",
+        voice_mode: str = "single_female",
         auto_sync_drive: bool = False,
         auto_start: bool = True,
         force_step1: bool = False,
@@ -441,7 +441,7 @@ class JobManager:
             work_rel = m["work_rel"]
             mode = m.get("mode", "test_5min")
             langs = m.get("langs") or ["vi", "en", "ja", "ko", "es"]
-            voice_mode = m.get("voice_mode", "clone_2")
+            voice_mode = m.get("voice_mode", "single_female")
             auto_sync = bool(m.get("auto_sync_drive", False))
 
         target_dir = (work_dir / "_test_5min") if mode == "test_5min" else work_dir

@@ -61,6 +61,13 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends xz-util
     chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe && \
     rm -rf /tmp/ffmpeg*
 
+# 6. Venv 4: VoxCPM2 (giọng ngoại ngữ tự nhiên 48kHz, tách biệt dependency khỏi tts_ui)
+RUN uv venv /opt/venvs/voxcpm --python python3.11 && \
+    uv pip install --python /opt/venvs/voxcpm/bin/python \
+      torch torchaudio --index-url https://download.pytorch.org/whl/cu124 && \
+    uv pip install --python /opt/venvs/voxcpm/bin/python \
+      voxcpm soundfile hf-transfer
+
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
 WORKDIR /workspace/mt_video

@@ -233,12 +233,12 @@
 
     $("wTitle").textContent = job.work_rel;
     const voiceNames = {
-      single_male: "1 giọng Nam kể chuyện",
-      single_female: "1 giọng Nữ kể chuyện",
+      single_female: "1 giọng Nữ không clone (VieNeu + VoxCPM2)",
+      single_male: "1 giọng Nam không clone",
       clone_2: "Clone 1 Nam + 1 Nữ",
-      voice_design: "Voice Design",
+      voice_design: "Voice Design 2 giới",
     };
-    $("wSubtitle").textContent = `Ngôn ngữ: ${(job.langs || []).join(", ").toUpperCase()}  ·  Giọng đọc: ${voiceNames[job.voice_mode] || job.voice_mode || "1 giọng Nam"}`;
+    $("wSubtitle").textContent = `Ngôn ngữ: ${(job.langs || []).join(", ").toUpperCase()}  ·  Giọng đọc: ${voiceNames[job.voice_mode] || job.voice_mode || "1 giọng Nữ"}`;
     $("wBadge").textContent = statusText(job.status);
     $("wBadge").className = `badge ${badgeClass(job.status)}`;
 
@@ -440,7 +440,7 @@
   }
 
   function readAddOptions(mode) {
-    const voice_mode = document.querySelector('input[name="voiceMode"]:checked')?.value || "single_male";
+    const voice_mode = document.querySelector('input[name="voiceMode"]:checked')?.value || "single_female";
     const langs = [...document.querySelectorAll(".langCk:checked")].map((el) => el.value);
     const work_rel = $("workRelInput").value.trim() || null;
     const auto_sync_drive = $("autoDriveCk").checked;

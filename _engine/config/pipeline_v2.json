@@ -2,7 +2,8 @@
   "venvs": {
     "asr_sep": "/opt/venvs/asr_sep/bin/python",
     "vlm_llm": "/opt/venvs/vlm_llm/bin/python",
-    "tts_ui": "/opt/venvs/tts_ui/bin/python"
+    "tts_ui": "/opt/venvs/tts_ui/bin/python",
+    "voxcpm": "/opt/venvs/voxcpm/bin/python"
   },
   "models": {
     "asr_engine": "auto",
@@ -19,6 +20,8 @@
     "separator_model": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
     "separator_fallback": "UVR-MDX-NET-Inst_HQ_3.onnx",
     "tts_vi_engine": "vieneu",
+    "tts_foreign_engine": "voxcpm2",
+    "tts_foreign_voxcpm_model": "openbmb/VoxCPM2",
     "tts_foreign_clone_model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
     "tts_foreign_design_model": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
   },

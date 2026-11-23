@@ -140,7 +140,7 @@ def load_or_create_manifest(
     source_path: Path | None = None,
     mode: str = "test_5min",
     langs: list[str] | None = None,
-    voice_mode: str = "single_male",
+    voice_mode: str = "single_female",
     auto_sync_drive: bool = False,
 ) -> dict[str, Any]:
     """Đọc `manifest.json` nếu có, hoặc khởi tạo mới và tự động phát hiện checkpoint Bước 1 sẵn có."""

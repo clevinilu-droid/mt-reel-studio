@@ -1,21 +1,24 @@
-"""Bước 6 (s6_tts_render): Lồng tiếng VieNeu (VI) + Qwen3-TTS-1.7B (EN/JA/KO/ES Clone 1 Nam/1 Nữ) + Mix & Render NVENC.
+"""Bước 6 (s6_tts_render): Lồng tiếng VieNeu (VI) + VoxCPM2 / Qwen3-TTS-1.7B (EN/JA/KO/ES) + Mix & Render NVENC.
 
 Đặc điểm chuẩn studio:
-  - Tiếng Việt (`vi`): dùng `VieNeu TTS` 4 giọng stock map theo giới tính + độ tuổi từ Bước 5A.
-  - Ngoại ngữ (`en, ja, ko, es`): bỏ hoàn toàn `edge-tts`, dùng `Qwen3-TTS-1.7B` chạy thẳng GPU 3090:
-      * Chế độ `clone_2`: clone trực tiếp từ 2 mẫu vàng `04_ref_male.wav` & `04_ref_female.wav` (6–10s).
-      * Chế độ `voice_design`: sinh giọng bản xứ chuẩn theo mô tả giới tính + cảm xúc nếu không muốn accent Trung.
+  - Tiếng Việt (`vi`): dùng `VieNeu TTS` v3turbo (`single_female` -> Trúc Ly, hoặc map theo vai).
+  - Ngoại ngữ (`en, ja, ko, es`): ưu tiên `OpenBMB/VoxCPM2` (48kHz, Voice Design không clone giọng gốc + khóa timbre đồng nhất theo ngôn ngữ),
+    tự động fallback sang `Qwen3-TTS-1.7B-VoiceDesign` nếu cần.
   - Cache từng câu `tts_cache/<lang>/turn_XXXX.wav` (resume-safe 100%).
   - Trộn lên `04_clean_bed.wav` (giữ nguyên 100% SFX/tiếng reo hò gốc ngoài thoại) -> xuất `audio/audio_<lang>.m4a`.
-  - Render HQ bằng `h264_nvenc` (hoặc `h264_qsv` / `libx264`), gắn watermark + soft sub, không dùng `setpts` gây lỗi cắt phim.
+  - Render HQ bằng `h264_nvenc` (hoặc `h264_qsv` / `libx264`), làm mờ sub Trung 94% chiều ngang + watermark 10% + soft sub;
+    ở chế độ Test xuất luôn MP4 riêng cho từng ngôn ngữ bằng `-c:v copy`.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
+import re
 import shutil
 import subprocess
+import sys
 import time
 import wave
 from pathlib import Path
@@ -28,6 +31,7 @@ from _engine.core.vram_guard import emit_progress, load_pipeline_config, release
 from _engine.pipeline.s1_prepare import detect_gpu_encoder
 
 SR = 48000
+LANG_ISO3 = {"vi": "vie", "en": "eng", "ja": "jpn", "ko": "kor", "es": "spa", "zh": "zho"}
 QWEN_LANG_MAP = {"en": "English", "ja": "Japanese", "ko": "Korean", "es": "Spanish", "zh": "Chinese"}
 EMOTION_INSTRUCT = {
     "NEUTRAL": "natural clear cinematic dubbing tone",
@@ -159,6 +163,171 @@ def _synth_vieneu_vi(
     return turn_paths
 
 
+def _resolve_foreign_voice_plan(
+    target_dir: Path,
+    lang: str,
+    turns: list[dict[str, Any]],
+    txt_map: dict[int, str],
+    roles_map: dict[int, dict[str, Any]],
+    voice_mode: str,
+    engine_tag: str,
+) -> tuple[bool, list[Path], list[tuple[int, str, dict[str, Any], Path]]]:
+    """Lập danh sách WAV đích + phần còn thiếu theo chế độ giọng (chỉ `clone_2` mới clone phim gốc)."""
+    cache_dir = target_dir / "tts_cache" / lang
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    ref_male = target_dir / "04_ref_male.wav"
+    ref_female = target_dir / "04_ref_female.wav"
+    use_clone = (voice_mode == "clone_2") and ref_male.exists() and ref_female.exists()
+
+    turn_paths: list[Path] = []
+    todo: list[tuple[int, str, dict[str, Any], Path]] = []
+    for t in turns:
+        tid = int(t["id"])
+        txt = (txt_map.get(tid) or "").strip()
+        r = roles_map.get(tid, {})
+        if voice_mode == "single_male":
+            g_eff = "MALE"
+        elif voice_mode == "single_female":
+            g_eff = "FEMALE"
+        else:
+            g_eff = str(r.get("gender", "FEMALE")).upper()
+        sig = f"{engine_tag}|{voice_mode}|{'clone' if use_clone else 'nonclone'}|{g_eff}|{r.get('emotion','NEUTRAL')}|{txt}"
+        h = hashlib.sha1(sig.encode("utf-8")).hexdigest()[:8]
+        wp = cache_dir / f"turn_{tid:04d}_{h}.wav"
+        turn_paths.append(wp)
+        if txt and (not wp.exists() or wp.stat().st_size <= 2000):
+            todo.append((tid, txt, r, wp))
+    return use_clone, turn_paths, todo
+
+
+def _ensure_voxcpm_python(cfg: dict[str, Any], prog_base: float) -> Path:
+    """Đảm bảo venv `/opt/venvs/voxcpm` sẵn sàng (tự cài 1 lần duy nhất nếu image `:v2` chưa có sẵn)."""
+    voxcpm_py = Path(cfg.get("venvs", {}).get("voxcpm", "/opt/venvs/voxcpm/bin/python"))
+    if voxcpm_py.exists():
+        chk = subprocess.run([str(voxcpm_py), "-c", "import voxcpm, soundfile"], capture_output=True)
+        if chk.returncode == 0:
+            return voxcpm_py
+
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError(f"Không tìm thấy VoxCPM venv tại {voxcpm_py}")
+
+    venv_dir = voxcpm_py.parent.parent
+    emit_progress(prog_base, "Đang cài đặt VoxCPM2 vào venv riêng (/opt/venvs/voxcpm, 1 lần duy nhất)...")
+    uv_bin = shutil.which("uv")
+    if uv_bin:
+        subprocess.run([uv_bin, "venv", str(venv_dir), "--python", "python3.11"], check=True)
+        subprocess.run(
+            [uv_bin, "pip", "install", "--python", str(voxcpm_py), "torch", "torchaudio", "--index-url", "https://download.pytorch.org/whl/cu124"],
+            check=True,
+        )
+        subprocess.run(
+            [uv_bin, "pip", "install", "--python", str(voxcpm_py), "voxcpm", "soundfile", "hf-transfer"],
+            check=True,
+        )
+    else:
+        subprocess.run(["python3.11", "-m", "venv", str(venv_dir)], check=True)
+        subprocess.run(
+            [str(voxcpm_py), "-m", "pip", "install", "--no-cache-dir", "torch", "torchaudio", "--index-url", "https://download.pytorch.org/whl/cu124"],
+            check=True,
+        )
+        subprocess.run([str(voxcpm_py), "-m", "pip", "install", "--no-cache-dir", "voxcpm", "soundfile", "hf-transfer"], check=True)
+
+    return voxcpm_py
+
+
+def _synth_voxcpm_foreign(
+    target_dir: Path,
+    lang: str,
+    turns: list[dict[str, Any]],
+    txt_map: dict[int, str],
+    roles_map: dict[int, dict[str, Any]],
+    voice_mode: str,
+    cfg: dict[str, Any],
+    prog_base: float,
+    prog_span: float,
+) -> list[Path]:
+    """Tạo giọng đọc EN / JA / KO / ES bằng OpenBMB/VoxCPM2 (48kHz, không clone giọng gốc)."""
+    use_clone, turn_paths, todo = _resolve_foreign_voice_plan(
+        target_dir, lang, turns, txt_map, roles_map, voice_mode, engine_tag="voxcpm2"
+    )
+    if not todo:
+        emit_progress(prog_base + prog_span, f"Tái sử dụng cache VoxCPM2 {lang.upper()} ({len(turns)} câu)")
+        return turn_paths
+
+    voxcpm_py = _ensure_voxcpm_python(cfg, prog_base)
+    cache_dir = target_dir / "tts_cache" / lang
+    model_id = cfg.get("models", {}).get("tts_foreign_voxcpm_model", "openbmb/VoxCPM2")
+    worker_py = ENGINE_DIR / "pipeline" / "voxcpm_worker.py"
+
+    tasks_payload = []
+    for tid, txt, r, wp in todo:
+        if voice_mode == "single_male":
+            g = "MALE"
+        elif voice_mode == "single_female":
+            g = "FEMALE"
+        else:
+            g = str(r.get("gender", "FEMALE")).upper()
+        tasks_payload.append(
+            {
+                "tid": tid,
+                "text": txt,
+                "gender": g,
+                "emotion": str(r.get("emotion", "NEUTRAL")).upper(),
+                "out_wav": str(wp),
+            }
+        )
+
+    manifest_path = cache_dir / "_voxcpm_manifest.json"
+    atomic_write_json(
+        manifest_path,
+        {
+            "model_id": model_id,
+            "lang": lang,
+            "voice_mode": voice_mode,
+            "use_clone": use_clone,
+            "anchor_paths": {
+                "FEMALE": str(cache_dir / "synth_anchor_female.wav"),
+                "MALE": str(cache_dir / "synth_anchor_male.wav"),
+            },
+            "ref_paths": {
+                "FEMALE": str(target_dir / "04_ref_female.wav"),
+                "MALE": str(target_dir / "04_ref_male.wav"),
+            },
+            "tasks": tasks_payload,
+        },
+    )
+
+    emit_progress(prog_base, f"VoxCPM2 {lang.upper()} ({'Giọng Nữ nhân tạo' if voice_mode == 'single_female' else voice_mode}, {len(todo)} câu)...")
+    env = dict(os.environ)
+    env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    proc = subprocess.Popen(
+        [str(voxcpm_py), "-u", str(worker_py), "--manifest", str(manifest_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    assert proc.stdout is not None
+    for raw_line in proc.stdout:
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = re.match(r"\[VOXCPM_PROGRESS\]\s*(\d+)/(\d+)", line)
+        if m:
+            cur, tot = int(m.group(1)), max(1, int(m.group(2)))
+            if cur % 3 == 0 or cur == tot:
+                emit_progress(prog_base + (cur / tot) * prog_span, f"VoxCPM2 {lang.upper()}: {cur}/{tot} câu")
+        else:
+            print(line, flush=True)
+
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"voxcpm_worker thoát với mã lỗi {rc} cho ngôn ngữ {lang.upper()}")
+    return turn_paths
+
+
 def _synth_qwen3_tts_foreign(
     target_dir: Path,
     lang: str,
@@ -171,31 +340,12 @@ def _synth_qwen3_tts_foreign(
     prog_span: float,
     model_holder: dict[str, Any] | None = None,
 ) -> list[Path]:
-    """Tạo giọng đọc EN / JA / KO / ES bằng Qwen3-TTS-1.7B (Clone 1 Nam + 1 Nữ hoặc Voice Design)."""
-    cache_dir = target_dir / "tts_cache" / lang
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    """Dự phòng tạo giọng EN / JA / KO / ES bằng Qwen3-TTS-1.7B (chỉ clone khi chọn `clone_2`)."""
+    use_clone, turn_paths, todo = _resolve_foreign_voice_plan(
+        target_dir, lang, turns, txt_map, roles_map, voice_mode, engine_tag="qwen3"
+    )
     ref_male = target_dir / "04_ref_male.wav"
     ref_female = target_dir / "04_ref_female.wav"
-    if voice_mode == "single_male":
-        use_clone = ref_male.exists()
-    elif voice_mode == "single_female":
-        use_clone = ref_female.exists()
-    else:
-        use_clone = voice_mode == "clone_2" and ref_male.exists() and ref_female.exists()
-
-    turn_paths: list[Path] = []
-    todo: list[tuple[int, str, dict[str, Any], Path]] = []
-    for t in turns:
-        tid = int(t["id"])
-        txt = (txt_map.get(tid) or "").strip()
-        r = roles_map.get(tid, {})
-        g_eff = "MALE" if voice_mode == "single_male" else ("FEMALE" if voice_mode == "single_female" else str(r.get("gender", "MALE")).upper())
-        sig = f"{voice_mode}|{'clone' if use_clone else 'design'}|{g_eff}|{r.get('emotion','NEUTRAL')}|{txt}"
-        h = hashlib.sha1(sig.encode("utf-8")).hexdigest()[:8]
-        wp = cache_dir / f"turn_{tid:04d}_{h}.wav"
-        turn_paths.append(wp)
-        if txt and (not wp.exists() or wp.stat().st_size <= 2000):
-            todo.append((tid, txt, r, wp))
 
     if not todo:
         emit_progress(prog_base + prog_span, f"Tái sử dụng cache Qwen3-TTS {lang.upper()} ({len(turns)} câu)")
@@ -231,7 +381,7 @@ def _synth_qwen3_tts_foreign(
         elif voice_mode == "single_female":
             gender = "FEMALE"
         else:
-            gender = str(r.get("gender", "MALE")).upper()
+            gender = str(r.get("gender", "FEMALE")).upper()
         emo = EMOTION_INSTRUCT.get(str(r.get("emotion", "NEUTRAL")).upper(), EMOTION_INSTRUCT["NEUTRAL"])
         if use_clone:
             ref_p = str(ref_female if gender == "FEMALE" else ref_male)
@@ -251,6 +401,28 @@ def _synth_qwen3_tts_foreign(
         del model
         release_vram()
     return turn_paths
+
+
+def _synth_foreign_tts(
+    target_dir: Path,
+    lang: str,
+    turns: list[dict[str, Any]],
+    txt_map: dict[int, str],
+    roles_map: dict[int, dict[str, Any]],
+    voice_mode: str,
+    cfg: dict[str, Any],
+    prog_base: float,
+    prog_span: float,
+    qwen_holder: dict[str, Any] | None = None,
+) -> list[Path]:
+    """Ưu tiên VoxCPM2 cho ngoại ngữ; tự động dự phòng bằng Qwen3-TTS nếu VoxCPM2 không sẵn sàng."""
+    engine = str(cfg.get("models", {}).get("tts_foreign_engine", "voxcpm2")).lower()
+    if engine == "voxcpm2":
+        try:
+            return _synth_voxcpm_foreign(target_dir, lang, turns, txt_map, roles_map, voice_mode, cfg, prog_base, prog_span)
+        except Exception as exc:
+            print(f"[S6 VOXCPM WARN] VoxCPM2 lỗi ({exc}) -> chuyển dự phòng sang Qwen3-TTS-VoiceDesign.", flush=True)
+    return _synth_qwen3_tts_foreign(target_dir, lang, turns, txt_map, roles_map, voice_mode, cfg, prog_base, prog_span, model_holder=qwen_holder)
 
 
 def _prepare_slot_pcm(wav_path: Path, slot_dur: float) -> np.ndarray:
@@ -454,11 +626,13 @@ def _render_master_mp4(
     master_srt: Path | None,
     out_mp4: Path,
     turns: list[dict[str, Any]] | None = None,
+    primary_lang: str = "vi",
 ):
-    """Render MP4 9:16 chuẩn chất lượng cao: làm mờ sub Trung vừa khít + watermark mờ 5% đè lên dải mờ + soft sub."""
+    """Render MP4 9:16 chuẩn chất lượng cao: làm mờ sub Trung + watermark 10% đè lên dải mờ + soft sub."""
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
     enc_name, hw_args, enc_args = detect_gpu_encoder()
     wm_png = ROOT_DIR / "branding" / "MT_Reel_Strip_Watermark.png"
+    iso3 = LANG_ISO3.get(primary_lang, "und")
 
     bx, by, bw, bh = _detect_sub_blur_rect(cfr_mp4, turns)
     lr = max(6, min(32, min(bw, bh) // 2 - 2))
@@ -498,9 +672,9 @@ def _render_master_mp4(
             fc = f"{blur_chain}[fgraw][subblur]overlay={bx}:{by},format=yuv420p[vout]"
 
         v_enc = enc_args if use_hw else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
-        cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "1:a:0", *v_enc, "-c:a", "copy", "-movflags", "+faststart"]
+        cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "1:a:0", *v_enc, "-c:a", "copy", "-metadata:s:a:0", f"language={iso3}", "-movflags", "+faststart"]
         if sub_idx is not None:
-            cmd += ["-map", f"{sub_idx}:0", "-c:s", "mov_text", "-metadata:s:s:0", "language=vie"]
+            cmd += ["-map", f"{sub_idx}:0", "-c:s", "mov_text", "-metadata:s:s:0", f"language={iso3}"]
         cmd.append(str(out_mp4))
         return cmd
 
@@ -514,7 +688,34 @@ def _render_master_mp4(
         raise subprocess.CalledProcessError(res.returncode, cmd)
 
 
-def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str = "single_male", is_test_5min: bool = False) -> dict[str, Any]:
+def _mux_streamcopy_lang_mp4(
+    blurred_mp4: Path,
+    audio_m4a: Path,
+    srt_path: Path | None,
+    lang: str,
+    out_mp4: Path,
+):
+    """Nhân bản nhanh (<1s) video đã làm mờ + watermark sang từng ngôn ngữ bằng `-c:v copy -c:a copy`."""
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+    iso3 = LANG_ISO3.get(lang, "und")
+    cmd = ["ffmpeg", "-y", "-v", "warning", "-i", str(blurred_mp4), "-i", str(audio_m4a)]
+    has_sub = bool(srt_path and srt_path.exists())
+    if has_sub:
+        cmd += ["-i", str(srt_path)]
+    cmd += [
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-metadata:s:a:0", f"language={iso3}",
+    ]
+    if has_sub:
+        cmd += ["-map", "2:0", "-c:s", "mov_text", "-metadata:s:s:0", f"language={iso3}"]
+    cmd += ["-movflags", "+faststart", str(out_mp4)]
+    subprocess.run(cmd, check=True)
+
+
+def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str = "single_female", is_test_5min: bool = False) -> dict[str, Any]:
     master = read_json_safe(target_dir / "03_aligned_master.json")
     clean_bed = target_dir / "04_clean_bed.wav"
     cfr_mp4 = target_dir / "01_cfr_raw.mp4"
@@ -543,7 +744,7 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
         if (target_dir / "tracks" / "vi.srt").exists():
             shutil.copy2(target_dir / "tracks" / "vi.srt", sub_out_dir / "vi.srt")
 
-    # 6B. Ngoại ngữ (Qwen3-TTS-1.7B — nạp 1 lần dùng chung cho cả EN/JA/KO/ES)
+    # 6B. Ngoại ngữ (VoxCPM2 mặc định hoặc Qwen3-TTS fallback)
     foreign_langs = [x for x in langs if x != "vi"]
     if foreign_langs:
         span = 45.0 / len(foreign_langs)
@@ -551,8 +752,8 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
         try:
             for idx, lang in enumerate(foreign_langs):
                 tmap = {k: v["text"] for k, v in _load_jsonl_map(target_dir / f"05c_sub_{lang}.jsonl").items()}
-                wavs = _synth_qwen3_tts_foreign(
-                    target_dir, lang, turns, tmap, roles_map, voice_mode, cfg, 38.0 + idx * span, span * 0.85, model_holder=qwen_holder
+                wavs = _synth_foreign_tts(
+                    target_dir, lang, turns, tmap, roles_map, voice_mode, cfg, 38.0 + idx * span, span * 0.85, qwen_holder=qwen_holder
                 )
                 _mix_track_streaming(turns, wavs, clean_bed, audio_out_dir / f"audio_{lang}.m4a")
                 if (target_dir / "tracks" / f"{lang}.srt").exists():
@@ -572,14 +773,28 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
         if rp.exists():
             shutil.copy2(rp, info_out_dir / ref_name)
 
-    # 6C. Render MP4 thành phẩm
+    # 6C. Render MP4 thành phẩm (+ xuất MP4 riêng từng ngôn ngữ ở chế độ Test để nghe kiểm tra ngay)
     emit_progress(86.0, "Đang render MP4 thành phẩm bằng GPU (NVENC/QSV)...")
     primary_lang = "vi" if "vi" in langs else langs[0]
     master_audio = audio_out_dir / f"audio_{primary_lang}.m4a"
     master_srt = sub_out_dir / f"{primary_lang}.srt"
-    mp4_name = f"preview_5min_{primary_lang}.mp4" if is_test_5min else f"final_{primary_lang}.mp4"
+    prefix = "preview_5min" if is_test_5min else "final"
+    mp4_name = f"{prefix}_{primary_lang}.mp4"
     out_mp4 = out_base / mp4_name
-    _render_master_mp4(cfr_mp4, master_audio, master_srt, out_mp4, turns=turns)
+    _render_master_mp4(cfr_mp4, master_audio, master_srt, out_mp4, turns=turns, primary_lang=primary_lang)
+
+    exported_mp4s = [str(out_mp4)]
+    if is_test_5min:
+        for extra_lang in langs:
+            if extra_lang == primary_lang:
+                continue
+            extra_audio = audio_out_dir / f"audio_{extra_lang}.m4a"
+            extra_srt = sub_out_dir / f"{extra_lang}.srt"
+            if extra_audio.exists():
+                extra_mp4 = out_base / f"{prefix}_{extra_lang}.mp4"
+                emit_progress(95.0, f"Đang xuất MP4 test {extra_lang.upper()} (-c:v copy)...")
+                _mux_streamcopy_lang_mp4(out_mp4, extra_audio, extra_srt, extra_lang, extra_mp4)
+                exported_mp4s.append(str(extra_mp4))
 
     elapsed = round(time.perf_counter() - t0, 2)
     meta = {
@@ -588,19 +803,20 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
         "langs": langs,
         "voice_mode": voice_mode,
         "output_mp4": str(out_mp4),
+        "output_mp4s": exported_mp4s,
     }
     atomic_write_json(info_out_dir / "render_meta.json", meta)
-    emit_progress(100.0, f"Hoàn tất xuất phim ({mp4_name}, {elapsed}s)")
-    print(f"[S6 DONE] {out_mp4} trong {elapsed}s", flush=True)
+    emit_progress(100.0, f"Hoàn tất xuất phim ({len(exported_mp4s)} file MP4, {elapsed}s)")
+    print(f"[S6 DONE] {out_mp4} (+{len(exported_mp4s)-1} bản ngôn ngữ khác) trong {elapsed}s", flush=True)
     return meta
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Bước 6: VieNeu (VI) + Qwen3-TTS-1.7B (EN/JA/KO/ES) + Mix + Render GPU.")
+    parser = argparse.ArgumentParser(description="Bước 6: VieNeu (VI) + VoxCPM2 (EN/JA/KO/ES) + Mix + Render GPU.")
     parser.add_argument("target_dir", type=Path, help="Thư mục work mục tiêu")
     parser.add_argument("--work-rel", required=True, help="Đường dẫn tương đối <Series>/<Part>")
     parser.add_argument("--langs", default="vi,en,ja,ko,es", help="Ngôn ngữ xuất")
-    parser.add_argument("--voice-mode", default="single_male", choices=["single_male", "single_female", "clone_2", "voice_design"])
+    parser.add_argument("--voice-mode", default="single_female", choices=["single_male", "single_female", "clone_2", "voice_design"])
     parser.add_argument("--test-5min", action="store_true", help="Xuất vào thư mục preview_5min")
     args = parser.parse_args()
     langs = [x.strip().lower() for x in args.langs.split(",") if x.strip()]
