@@ -38,6 +38,48 @@ LANG_NAMES = {
 }
 
 
+def _safe_int(val: Any) -> int | None:
+    """Chuyển `id` từ LLM/JSON sang int an toàn; trả None nếu là chuỗi non-numeric như 'SPK_UNK'."""
+    if isinstance(val, bool) or val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        return int(val)
+    if isinstance(val, str):
+        s = val.strip()
+        m = re.fullmatch(r"#?(-?\d+)", s)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+@contextmanager
+def _managed_vllm_with_fallback(primary_model: str, fallback_models: list[str], cfg: dict[str, Any], phase_label: str):
+    """Khởi chạy vLLM theo danh sách ưu tiên, tự lùi sang model dự phòng nếu EngineCore lỗi."""
+    cands = list(dict.fromkeys([m for m in [primary_model, *fallback_models] if m]))
+    vllm_ctx = None
+    last_exc = None
+    for idx, cand_m in enumerate(cands):
+        try:
+            emit_progress(6.0 if "5A" in phase_label else 35.0, f"{phase_label}: Khởi chạy {cand_m}...")
+            ctx = managed_vllm_server(cand_m, cfg)
+            conn_pair = ctx.__enter__()
+            vllm_ctx = (ctx, conn_pair)
+            break
+        except Exception as exc:
+            last_exc = exc
+            if idx + 1 < len(cands):
+                print(f"[{phase_label} WARN] {cand_m} lỗi -> thử model dự phòng ({exc})", flush=True)
+    if vllm_ctx is None:
+        raise RuntimeError(f"Tất cả model {phase_label} đều lỗi: {last_exc}")
+    ctx_mgr, conn_pair = vllm_ctx
+    try:
+        yield conn_pair
+    finally:
+        ctx_mgr.__exit__(None, None, None)
+
+
 def _http_json(url: str, payload: dict[str, Any] | None = None, timeout: int = 180) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(
@@ -300,12 +342,10 @@ def _phase5a_qwen_analyze(
 
     model_id = cfg.get("models", {}).get("zh_analyst_model", "mattbucci/Qwen3.8-27B-AWQ")
     fallback_models = [
-        model_id,
+        cfg.get("models", {}).get("zh_analyst_model", "philbert440/Qwen3.8-27B-W4A16-AWQ"),
         "philbert440/Qwen3.8-27B-W4A16-AWQ",
         cfg.get("models", {}).get("vi_translate_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit"),
     ]
-    # Loại trùng giữ nguyên thứ tự
-    cand_models = list(dict.fromkeys(fallback_models))
     emit_progress(5.0, f"Pha 5A: Nạp {model_id} phân tích tiếng Trung & phân vai...")
 
     sys_prompt = (
@@ -313,23 +353,7 @@ def _phase5a_qwen_analyze(
         "Trả về DUY NHẤT JSON hợp lệ, không giải thích thêm."
     )
     batch_size = 15
-    vllm_ctx = None
-    last_exc = None
-    for cand_m in cand_models:
-        try:
-            emit_progress(6.0, f"Pha 5A: Khởi chạy {cand_m}...")
-            ctx = managed_vllm_server(cand_m, cfg)
-            conn_pair = ctx.__enter__()
-            vllm_ctx = (ctx, conn_pair)
-            break
-        except Exception as exc:
-            last_exc = exc
-            print(f"[S5A WARN] {cand_m} lỗi -> thử model dự phòng ({exc})", flush=True)
-    if vllm_ctx is None:
-        raise RuntimeError(f"Tất cả model Pha 5A đều lỗi: {last_exc}")
-
-    ctx_mgr, (base_url, mid) = vllm_ctx
-    try:
+    with _managed_vllm_with_fallback(model_id, fallback_models, cfg, "Pha 5A") as (base_url, mid):
         for i in range(0, len(todo_turns), batch_size):
             batch = todo_turns[i : i + batch_size]
             packed = []
@@ -337,7 +361,7 @@ def _phase5a_qwen_analyze(
                 ac = acoustics_map.get(int(t["id"]), {})
                 packed.append(
                     {
-                        "id": t["id"],
+                        "id": int(t["id"]),
                         "spk_id": t.get("spk_id", "SPK_UNK"),
                         "f0_hz": ac.get("f0_hz"),
                         "gender_hint": ac.get("gender_hint", "UNKNOWN"),
@@ -349,7 +373,7 @@ def _phase5a_qwen_analyze(
                 "Dựa vào lời thoại tiếng Trung, nhãn người nói `spk_id` và tần số giọng `f0_hz` "
                 "(Nam thường <175Hz, Nữ >=175Hz; ưu tiên ngữ cảnh khi F0 nhiễu), hãy xuất JSON gồm:\n"
                 "1) `glossary_add`: dict {tên_tiếng_Trung: tên_Hán_Việt_chuẩn}\n"
-                "2) `roles`: list cho từng id với các trường: "
+                "2) `roles`: list cho từng câu theo ĐÚNG số nguyên `id` (vd 1, 2, 3..., KHÔNG dùng `spk_id` làm `id`) với các trường: "
                 "`id`, `gender` ('MALE'|'FEMALE'), `age_tone` ('YOUNG'|'MATURE'), "
                 "`emotion` ('NEUTRAL'|'ANGRY'|'HAPPY'|'SAD'|'WHISPER'|'URGENT'), "
                 "`addressing` (gợi ý cặp xưng hô tiếng Việt ngắn gọn, vd 'tôi - cô', 'anh - em', 'tao - mày').\n\n"
@@ -359,27 +383,55 @@ def _phase5a_qwen_analyze(
             res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.1)
             if isinstance(res, list):
                 res = {"glossary_add": {}, "roles": res}
-            for k, v in (res.get("glossary_add") or {}).items():
-                if k and v and k not in glossary:
-                    glossary[k] = v
+            elif not isinstance(res, dict):
+                res = {}
+
+            raw_gloss = res.get("glossary_add")
+            if isinstance(raw_gloss, dict):
+                for k, v in raw_gloss.items():
+                    if k and isinstance(v, str) and v.strip() and k not in glossary:
+                        glossary[str(k)] = v.strip()
             atomic_write_json(glossary_path, glossary)
 
-            role_items = []
             raw_roles = res.get("roles") or res.get("items") or []
-            res_map = {int(r["id"]): r for r in raw_roles if isinstance(r, dict) and "id" in r}
+            if isinstance(raw_roles, dict):
+                raw_roles = [
+                    ({"id": rk, **rv} if isinstance(rv, dict) else {"id": rk})
+                    for rk, rv in raw_roles.items()
+                ]
+            res_map: dict[int, dict[str, Any]] = {}
+            spk_map: dict[str, dict[str, Any]] = {}
+            for r in raw_roles:
+                if not isinstance(r, dict):
+                    continue
+                rid = _safe_int(r.get("id"))
+                if rid is not None:
+                    res_map[rid] = r
+                else:
+                    sk = str(r.get("spk_id") or r.get("id") or "").strip()
+                    if sk:
+                        spk_map[sk] = r
+
+            role_items = []
             for t in batch:
                 tid = int(t["id"])
                 ac = acoustics_map.get(tid, {})
-                r = res_map.get(tid, {})
-                g = str(r.get("gender", ac.get("gender_hint", "MALE"))).upper()
+                r = res_map.get(tid) or spk_map.get(str(t.get("spk_id") or "")) or {}
+                g = str(r.get("gender") or ac.get("gender_hint") or "MALE").upper()
                 if g not in ("MALE", "FEMALE"):
                     g = "FEMALE" if ac.get("gender_hint") == "FEMALE" else "MALE"
+                age_t = str(r.get("age_tone") or "YOUNG").upper()
+                if age_t not in ("YOUNG", "MATURE"):
+                    age_t = "YOUNG"
+                emo = str(r.get("emotion") or "NEUTRAL").upper()
+                if emo not in ("NEUTRAL", "ANGRY", "HAPPY", "SAD", "WHISPER", "URGENT"):
+                    emo = "NEUTRAL"
                 item = {
                     "id": tid,
                     "gender": g,
-                    "age_tone": str(r.get("age_tone", "YOUNG")).upper(),
-                    "emotion": str(r.get("emotion", "NEUTRAL")).upper(),
-                    "addressing": str(r.get("addressing", "tôi - anh/cô")),
+                    "age_tone": age_t,
+                    "emotion": emo,
+                    "addressing": str(r.get("addressing") or "tôi - anh/cô"),
                 }
                 role_items.append(item)
                 done_roles[tid] = item
@@ -387,8 +439,6 @@ def _phase5a_qwen_analyze(
 
             pct = 8.0 + (len(done_roles) / max(1, len(turns))) * 25.0
             emit_progress(pct, f"Pha 5A Qwen: đã phân vai {len(done_roles)}/{len(turns)} câu")
-    finally:
-        ctx_mgr.__exit__(None, None, None)
 
     atomic_write_json(glossary_path, glossary)
     atomic_write_json(bible_path, bible)
@@ -422,7 +472,8 @@ def _phase5b_gemma4_vi(
         "độ dài câu khớp thời lượng giây cho phép. Chỉ trả JSON hợp lệ."
     )
     batch_size = 15
-    ctx = nullcontext(conn) if conn else managed_vllm_server(model_id, cfg)
+    zh_fb = cfg.get("models", {}).get("zh_analyst_model", "philbert440/Qwen3.8-27B-W4A16-AWQ")
+    ctx = nullcontext(conn) if conn else _managed_vllm_with_fallback(model_id, [zh_fb], cfg, "Pha 5B")
     with ctx as (base_url, mid):
         for i in range(0, len(todo_turns), batch_size):
             batch = todo_turns[i : i + batch_size]
@@ -449,8 +500,16 @@ def _phase5b_gemma4_vi(
                 f"{json.dumps(packed, ensure_ascii=False)}"
             )
             res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.25)
-            raw_items = res if isinstance(res, list) else (res.get("items") or [])
-            rmap = {int(x["id"]): str(x.get("vi") or x.get("text") or "").strip() for x in raw_items if isinstance(x, dict) and "id" in x}
+            raw_items = res if isinstance(res, list) else (res.get("items") or res.get("roles") or [])
+            if isinstance(raw_items, dict):
+                raw_items = [{"id": k, "vi": v} if not isinstance(v, dict) else {"id": k, **v} for k, v in raw_items.items()]
+            rmap: dict[int, str] = {}
+            for x in raw_items:
+                if not isinstance(x, dict):
+                    continue
+                xid = _safe_int(x.get("id"))
+                if xid is not None:
+                    rmap[xid] = str(x.get("vi") or x.get("text") or x.get("translation") or "").strip()
             out_items = []
             for t in batch:
                 tid = int(t["id"])
@@ -501,7 +560,8 @@ def _phase5c_translategemma_foreign(
     emit_progress(67.0, f"Pha 5C: Nạp {model_id} dịch {', '.join(foreign_langs).upper()}...")
 
     batch_size = 15
-    ctx = nullcontext(conn) if conn else managed_vllm_server(model_id, cfg)
+    zh_fb = cfg.get("models", {}).get("zh_analyst_model", "philbert440/Qwen3.8-27B-W4A16-AWQ")
+    ctx = nullcontext(conn) if conn else _managed_vllm_with_fallback(model_id, [zh_fb], cfg, "Pha 5C")
     with ctx as (base_url, mid):
         for l_idx, lang in enumerate(foreign_langs):
             lname = LANG_NAMES.get(lang, lang)
@@ -513,7 +573,7 @@ def _phase5c_translategemma_foreign(
                 batch = todo[i : i + batch_size]
                 packed = [
                     {
-                        "id": t["id"],
+                        "id": int(t["id"]),
                         "dur_s": round(max(0.4, float(t["end"]) - float(t["start"])), 2),
                         "emotion": roles_map.get(int(t["id"]), {}).get("emotion", "NEUTRAL"),
                         "zh": t["text"],
@@ -528,7 +588,15 @@ def _phase5c_translategemma_foreign(
                 )
                 res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.15)
                 raw_items = res if isinstance(res, list) else (res.get("items") or [])
-                rmap = {int(x["id"]): str(x.get("text") or "").strip() for x in raw_items if isinstance(x, dict) and "id" in x}
+                if isinstance(raw_items, dict):
+                    raw_items = [{"id": k, "text": v} if not isinstance(v, dict) else {"id": k, **v} for k, v in raw_items.items()]
+                rmap: dict[int, str] = {}
+                for x in raw_items:
+                    if not isinstance(x, dict):
+                        continue
+                    xid = _safe_int(x.get("id"))
+                    if xid is not None:
+                        rmap[xid] = str(x.get("text") or x.get("translation") or "").strip()
                 out_items = []
                 for t in batch:
                     tid = int(t["id"])
@@ -551,7 +619,11 @@ def run_step5(target_dir: Path, langs: list[str], glossary_in: Path | None = Non
     t0 = time.perf_counter()
     cfg = load_pipeline_config()
     turns = master["turns"]
-    acoustics_map = {int(a["id"]): a for a in ac_data.get("acoustics", [])}
+    acoustics_map = {
+        k: a
+        for a in ac_data.get("acoustics", [])
+        if isinstance(a, dict) and (k := _safe_int(a.get("id"))) is not None
+    }
     base_glossary = read_json_safe(glossary_in) if glossary_in else {}
     base_glossary = base_glossary or {}
 
@@ -564,9 +636,10 @@ def run_step5(target_dir: Path, langs: list[str], glossary_in: Path | None = Non
     need_fg = any(x != "vi" for x in langs)
 
     if need_vi and need_fg and vi_model == fg_model:
-        # Tái sử dụng 1 lần nạp Gemma 4 cho cả VI và EN/JA/KO/ES (tiết kiệm ~50s reload)
+        # Tái sử dụng 1 lần nạp Gemma 4 cho cả VI và EN/JA/KO/ES (tiết kiệm ~50s reload), tự lùi Qwen3.8 nếu lỗi nạp
+        zh_fb = models_cfg.get("zh_analyst_model", "philbert440/Qwen3.8-27B-W4A16-AWQ")
         emit_progress(35.0, f"Nạp {vi_model} dùng chung Pha 5B + 5C...")
-        with managed_vllm_server(vi_model, cfg) as conn:
+        with _managed_vllm_with_fallback(vi_model, [zh_fb], cfg, "Pha 5B+5C") as conn:
             _phase5b_gemma4_vi(target_dir, turns, glossary, roles_map, cfg, force=force, conn=conn)
             _phase5c_translategemma_foreign(target_dir, turns, langs, glossary, roles_map, cfg, force=force, conn=conn)
     else:
