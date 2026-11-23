@@ -248,6 +248,8 @@ def run_step4(target_dir: Path, force: bool = False) -> dict[str, Any]:
                 shutil.move(str(inst_src), str(sep_dir / f"blk_{b['id']:04d}_inst.wav"))
                 shutil.move(str(voc_src), str(sep_dir / f"blk_{b['id']:04d}_voc.wav"))
                 in_wav.unlink(missing_ok=True)
+                if idx % 20 == 0:
+                    release_vram()
 
         shutil.rmtree(tmp_sep, ignore_errors=True)
         del separator

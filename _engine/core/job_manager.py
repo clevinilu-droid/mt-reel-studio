@@ -419,14 +419,28 @@ class JobManager:
             save_manifest(self.jobs[job_id])
         self._update_step(job_id, step_key, status="running", progress_pct=1.0, detail=f"Đang khởi chạy {step_key.upper()}...")
         t0 = time.perf_counter()
-        run_isolated_step(
-            module_name=mod,
-            args=args,
-            venv_key=venv_key,
-            log_cb=lambda msg: self.append_log(job_id, msg),
-            prog_cb=lambda pct, det: self._update_step(job_id, step_key, status="running", progress_pct=pct, detail=det),
-            cancel_event=cancel_ev,
-        )
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                run_isolated_step(
+                    module_name=mod,
+                    args=args,
+                    venv_key=venv_key,
+                    log_cb=lambda msg: self.append_log(job_id, msg),
+                    prog_cb=lambda pct, det: self._update_step(job_id, step_key, status="running", progress_pct=pct, detail=det),
+                    cancel_event=cancel_ev,
+                )
+                break
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                if cancel_ev.is_set() or attempt >= max_attempts:
+                    raise
+                self.append_log(
+                    job_id,
+                    f"[AUTO-RESUME] {step_key.upper()} ngắt giữa chừng ({exc}) -> tự chạy tiếp lần {attempt + 1}/{max_attempts} từ checkpoint...",
+                )
+                time.sleep(2.0)
         elapsed = round(time.perf_counter() - t0, 2)
         self._update_step(job_id, step_key, status="done", progress_pct=100.0, elapsed_s=elapsed)
 
