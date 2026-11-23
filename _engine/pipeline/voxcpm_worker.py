@@ -26,7 +26,6 @@ ANCHOR_TEXTS = {
 
 VOICE_DESIGN_PERSONAS = {
     "FEMALE": "(A young adult woman in her mid-20s with an expressive, warm, clear, natural storytelling voice, lively conversational cadence, crisp native diction, studio recording)",
-    "MALE": "(A confident adult man in his early 30s with an expressive, warm, clear baritone storytelling voice, crisp native diction, studio recording)",
 }
 
 EMOTION_CTRL = {
@@ -107,30 +106,19 @@ def main() -> int:
         if not tasks:
             continue
         anchor_paths = dict(job.get("anchor_paths", {}))
-        ref_paths = dict(job.get("ref_paths", {}))
-
-        needed_genders = sorted({str(t.get("gender", "FEMALE")).upper() for t in tasks})
         active_refs: dict[str, str] = {}
 
-        if use_clone:
-            for g in needed_genders:
-                rp = ref_paths.get(g)
-                if rp and Path(rp).exists():
-                    active_refs[g] = rp
-
-        # Với non-clone, tạo 1 anchor nhân tạo bằng Voice Design rồi khóa timbre qua reference_wav_path
+        # Chỉ dùng 1 giọng Nữ không clone: tạo 1 anchor nhân tạo bằng Voice Design rồi khóa timbre qua reference_wav_path
         anchor_text = ANCHOR_TEXTS.get(lang, ANCHOR_TEXTS["en"])
-        for g in needed_genders:
-            if g in active_refs:
-                continue
+        for g in ("FEMALE",):
             ap_str = anchor_paths.get(g)
             if not ap_str:
                 continue
             ap = Path(ap_str)
             if not ap.exists() or ap.stat().st_size <= 4000:
                 ap.parent.mkdir(parents=True, exist_ok=True)
-                persona = VOICE_DESIGN_PERSONAS.get(g, VOICE_DESIGN_PERSONAS["FEMALE"])
-                print(f"[VOXCPM] Tạo giọng mẫu nhân tạo {lang.upper()} ({g}) bằng Voice Design...", flush=True)
+                persona = VOICE_DESIGN_PERSONAS["FEMALE"]
+                print(f"[VOXCPM] Tạo giọng Nữ mẫu nhân tạo {lang.upper()} bằng Voice Design...", flush=True)
                 wav_anchor = _call_generate(
                     text=f"{persona}{anchor_text}",
                     cfg_value=2.0,
@@ -154,7 +142,7 @@ def main() -> int:
                 continue
 
             out_wav.parent.mkdir(parents=True, exist_ok=True)
-            g = str(t.get("gender", "FEMALE")).upper()
+            g = "FEMALE"
             emo = str(t.get("emotion", "NEUTRAL")).upper()
             ctrl = EMOTION_CTRL.get(emo, EMOTION_CTRL["NEUTRAL"])
             clean_txt = _clean_dialogue_text(str(t.get("text", "")))

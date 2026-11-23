@@ -26,7 +26,7 @@ PIPELINE_STEPS = [
     ("s2a", "Bước 2A — Nghe thoại & Gom người nói (FunASR)"),
     ("s2b", "Bước 2B — Lọc Keyframe & Đọc sub (PyAV + Qwen)"),
     ("s3", "Bước 3 — Đối chiếu Pinyin & Cứu hộ câu sót"),
-    ("s4", "Bước 4 — Tách giọng vùng thoại (RoFormer) & 2 mẫu Clone"),
+    ("s4", "Bước 4 — Tách giọng vùng thoại (BS-RoFormer) giữ trọn SFX gốc"),
     ("s5", "Bước 5 — Phân vai (Qwen) & Dịch Việt/Ngoại ngữ (Gemma 4)"),
     ("s6", "Bước 6 — Lồng tiếng (VieNeu + Qwen3-TTS) & Render"),
 ]

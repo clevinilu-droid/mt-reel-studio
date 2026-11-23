@@ -84,25 +84,21 @@ def _synth_vieneu_vi(
     turns: list[dict[str, Any]],
     vi_map: dict[int, str],
     roles_map: dict[int, dict[str, Any]],
-    voice_mode: str = "single_male",
+    voice_mode: str = "single_female",
 ) -> list[Path]:
-    """Tạo giọng đọc Tiếng Việt theo batch bằng VieNeu TTS v3turbo (PyTorch GPU / ONNX CPU) + cache từng câu."""
+    """Tạo giọng đọc Tiếng Việt (1 giọng Nữ chuẩn Trúc Ly, không clone) theo batch bằng VieNeu TTS v3turbo."""
     cache_dir = target_dir / "tts_cache" / "vi"
     cache_dir.mkdir(parents=True, exist_ok=True)
     stock_cfg = read_json_safe(ENGINE_DIR / "config" / "vieneu_stock_cast.json") or {}
 
-    fixed_voice = None
-    if voice_mode == "single_male":
-        fixed_voice = _pick_vieneu_voice({"gender": "MALE", "age_tone": "YOUNG"}, stock_cfg)
-    elif voice_mode == "single_female":
-        fixed_voice = _pick_vieneu_voice({"gender": "FEMALE", "age_tone": "YOUNG"}, stock_cfg)
+    fixed_voice = _pick_vieneu_voice({"gender": "FEMALE", "age_tone": "YOUNG"}, stock_cfg)
 
     turn_paths: list[Path] = []
     todo: list[tuple[int, str, str, Path]] = []
     for t in turns:
         tid = int(t["id"])
         txt = (vi_map.get(tid) or "").strip()
-        voice_id = fixed_voice or _pick_vieneu_voice(roles_map.get(tid, {}), stock_cfg)
+        voice_id = fixed_voice
         h = hashlib.sha1(f"{voice_id}|{txt}".encode("utf-8")).hexdigest()[:8]
         wav_p = cache_dir / f"turn_{tid:04d}_{h}.wav"
         turn_paths.append(wav_p)
@@ -172,12 +168,10 @@ def _resolve_foreign_voice_plan(
     voice_mode: str,
     engine_tag: str,
 ) -> tuple[bool, list[Path], list[tuple[int, str, dict[str, Any], Path]]]:
-    """Lập danh sách WAV đích + phần còn thiếu theo chế độ giọng (chỉ `clone_2` mới clone phim gốc)."""
+    """Lập danh sách WAV đích + phần còn thiếu (chỉ dùng 1 giọng Nữ không clone)."""
     cache_dir = target_dir / "tts_cache" / lang
     cache_dir.mkdir(parents=True, exist_ok=True)
-    ref_male = target_dir / "04_ref_male.wav"
-    ref_female = target_dir / "04_ref_female.wav"
-    use_clone = (voice_mode == "clone_2") and ref_male.exists() and ref_female.exists()
+    use_clone = False
 
     turn_paths: list[Path] = []
     todo: list[tuple[int, str, dict[str, Any], Path]] = []
@@ -185,13 +179,8 @@ def _resolve_foreign_voice_plan(
         tid = int(t["id"])
         txt = (txt_map.get(tid) or "").strip()
         r = roles_map.get(tid, {})
-        if voice_mode == "single_male":
-            g_eff = "MALE"
-        elif voice_mode == "single_female":
-            g_eff = "FEMALE"
-        else:
-            g_eff = str(r.get("gender", "FEMALE")).upper()
-        sig = f"{engine_tag}|{voice_mode}|{'clone' if use_clone else 'nonclone'}|{g_eff}|{r.get('emotion','NEUTRAL')}|{txt}"
+        g_eff = "FEMALE"
+        sig = f"{engine_tag}|single_female|nonclone|{g_eff}|{r.get('emotion','NEUTRAL')}|{txt}"
         h = hashlib.sha1(sig.encode("utf-8")).hexdigest()[:8]
         wp = cache_dir / f"turn_{tid:04d}_{h}.wav"
         turn_paths.append(wp)
@@ -261,17 +250,11 @@ def _synth_voxcpm_foreign(
 
     tasks_payload = []
     for tid, txt, r, wp in todo:
-        if voice_mode == "single_male":
-            g = "MALE"
-        elif voice_mode == "single_female":
-            g = "FEMALE"
-        else:
-            g = str(r.get("gender", "FEMALE")).upper()
         tasks_payload.append(
             {
                 "tid": tid,
                 "text": txt,
-                "gender": g,
+                "gender": "FEMALE",
                 "emotion": str(r.get("emotion", "NEUTRAL")).upper(),
                 "out_wav": str(wp),
             }
@@ -283,21 +266,17 @@ def _synth_voxcpm_foreign(
         {
             "model_id": model_id,
             "lang": lang,
-            "voice_mode": voice_mode,
-            "use_clone": use_clone,
+            "voice_mode": "single_female",
+            "use_clone": False,
             "anchor_paths": {
                 "FEMALE": str(cache_dir / "synth_anchor_female.wav"),
-                "MALE": str(cache_dir / "synth_anchor_male.wav"),
             },
-            "ref_paths": {
-                "FEMALE": str(target_dir / "04_ref_female.wav"),
-                "MALE": str(target_dir / "04_ref_male.wav"),
-            },
+            "ref_paths": {},
             "tasks": tasks_payload,
         },
     )
 
-    emit_progress(prog_base, f"VoxCPM2 {lang.upper()} ({'Giọng Nữ nhân tạo' if voice_mode == 'single_female' else voice_mode}, {len(todo)} câu)...")
+    emit_progress(prog_base, f"VoxCPM2 {lang.upper()} (Giọng Nữ nhân tạo, {len(todo)} câu)...")
     env = dict(os.environ)
     env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
     proc = subprocess.Popen(
@@ -346,21 +325,19 @@ def _synth_voxcpm_batch_foreign(
     total_todo = 0
 
     for lang in foreign_langs:
-        use_clone, turn_paths, todo = _resolve_foreign_voice_plan(
-            target_dir, lang, turns, lang_tmaps[lang], roles_map, voice_mode, engine_tag="voxcpm2"
+        _, turn_paths, todo = _resolve_foreign_voice_plan(
+            target_dir, lang, turns, lang_tmaps[lang], roles_map, "single_female", engine_tag="voxcpm2"
         )
         results[lang] = turn_paths
-        use_clone_global = use_clone_global or use_clone
         if todo:
             cache_dir = target_dir / "tts_cache" / lang
             tasks_payload = []
             for tid, txt, r, wp in todo:
-                g = "MALE" if voice_mode == "single_male" else ("FEMALE" if voice_mode == "single_female" else str(r.get("gender", "FEMALE")).upper())
                 tasks_payload.append(
                     {
                         "tid": tid,
                         "text": txt,
-                        "gender": g,
+                        "gender": "FEMALE",
                         "emotion": str(r.get("emotion", "NEUTRAL")).upper(),
                         "out_wav": str(wp),
                     }
@@ -371,12 +348,8 @@ def _synth_voxcpm_batch_foreign(
                     "lang": lang,
                     "anchor_paths": {
                         "FEMALE": str(cache_dir / "synth_anchor_female.wav"),
-                        "MALE": str(cache_dir / "synth_anchor_male.wav"),
                     },
-                    "ref_paths": {
-                        "FEMALE": str(target_dir / "04_ref_female.wav"),
-                        "MALE": str(target_dir / "04_ref_male.wav"),
-                    },
+                    "ref_paths": {},
                     "tasks": tasks_payload,
                 }
             )
@@ -393,8 +366,8 @@ def _synth_voxcpm_batch_foreign(
         manifest_path,
         {
             "model_id": model_id,
-            "voice_mode": voice_mode,
-            "use_clone": use_clone_global,
+            "voice_mode": "single_female",
+            "use_clone": False,
             "languages": lang_jobs,
         },
     )
@@ -443,12 +416,10 @@ def _synth_qwen3_tts_foreign(
     prog_span: float,
     model_holder: dict[str, Any] | None = None,
 ) -> list[Path]:
-    """Dự phòng tạo giọng EN / JA / KO / ES bằng Qwen3-TTS-1.7B (chỉ clone khi chọn `clone_2`)."""
-    use_clone, turn_paths, todo = _resolve_foreign_voice_plan(
-        target_dir, lang, turns, txt_map, roles_map, voice_mode, engine_tag="qwen3"
+    """Dự phòng tạo giọng Nữ EN / JA / KO / ES bằng Qwen3-TTS-1.7B-VoiceDesign (không clone)."""
+    _, turn_paths, todo = _resolve_foreign_voice_plan(
+        target_dir, lang, turns, txt_map, roles_map, "single_female", engine_tag="qwen3"
     )
-    ref_male = target_dir / "04_ref_male.wav"
-    ref_female = target_dir / "04_ref_female.wav"
 
     if not todo:
         emit_progress(prog_base + prog_span, f"Tái sử dụng cache Qwen3-TTS {lang.upper()} ({len(turns)} câu)")
@@ -459,17 +430,13 @@ def _synth_qwen3_tts_foreign(
     from qwen_tts import Qwen3TTSModel
 
     models_cfg = cfg.get("models", {})
-    model_id = (
-        models_cfg.get("tts_foreign_clone_model", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-        if use_clone
-        else models_cfg.get("tts_foreign_design_model", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
-    )
+    model_id = models_cfg.get("tts_foreign_design_model", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
     own_model = model_holder is None
     if model_holder is not None and model_holder.get("model_id") == model_id and model_holder.get("model") is not None:
         model = model_holder["model"]
         emit_progress(prog_base, f"Dùng lại Qwen3-TTS cho {lang.upper()} ({len(todo)} câu)...")
     else:
-        emit_progress(prog_base, f"Nạp Qwen3-TTS ({lang.upper()}, {'Clone 1 Nam/1 Nữ' if use_clone else 'Voice Design'})...")
+        emit_progress(prog_base, f"Nạp Qwen3-TTS ({lang.upper()}, Giọng Nữ Voice Design)...")
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
         dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         model = Qwen3TTSModel.from_pretrained(model_id, device_map=device, dtype=dtype)
@@ -479,23 +446,9 @@ def _synth_qwen3_tts_foreign(
     q_lang = QWEN_LANG_MAP.get(lang, "English")
 
     for idx, (tid, txt, r, wp) in enumerate(todo, start=1):
-        if voice_mode == "single_male":
-            gender = "MALE"
-        elif voice_mode == "single_female":
-            gender = "FEMALE"
-        else:
-            gender = str(r.get("gender", "FEMALE")).upper()
         emo = EMOTION_INSTRUCT.get(str(r.get("emotion", "NEUTRAL")).upper(), EMOTION_INSTRUCT["NEUTRAL"])
-        if use_clone:
-            ref_p = str(ref_female if gender == "FEMALE" else ref_male)
-            wavs, sr_out = model.generate_voice_clone(text=txt, language=q_lang, ref_audio=ref_p, x_vector_only_mode=True)
-        else:
-            persona = (
-                f"Confident adult female native {q_lang} speaker, {emo}"
-                if gender == "FEMALE"
-                else f"Deep resonant adult male native {q_lang} speaker, {emo}"
-            )
-            wavs, sr_out = model.generate_voice_design(text=txt, language=q_lang, instruct=persona)
+        persona = f"Confident adult female native {q_lang} speaker, {emo}"
+        wavs, sr_out = model.generate_voice_design(text=txt, language=q_lang, instruct=persona)
         sf.write(str(wp), wavs[0], sr_out)
         if idx % 5 == 0 or idx == len(todo):
             emit_progress(prog_base + (idx / len(todo)) * prog_span, f"Qwen3-TTS {lang.upper()}: {idx}/{len(todo)} câu")
@@ -885,8 +838,8 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
     if qa_html.exists():
         shutil.copy2(qa_html, sub_out_dir / "kiem_tra_dich.html")
 
-    # Gom 2 mẫu clone + glossary vào thư mục phụ _info/ để thư mục thành phẩm gọn sạch
-    for ref_name in ("04_ref_male.wav", "04_ref_female.wav", "glossary.json"):
+    # Gom glossary & relationship_bible vào thư mục phụ _info/ để thư mục thành phẩm gọn sạch
+    for ref_name in ("glossary.json", "relationship_bible.json"):
         rp = target_dir / ref_name
         if rp.exists():
             shutil.copy2(rp, info_out_dir / ref_name)
@@ -934,7 +887,7 @@ def main():
     parser.add_argument("target_dir", type=Path, help="Thư mục work mục tiêu")
     parser.add_argument("--work-rel", required=True, help="Đường dẫn tương đối <Series>/<Part>")
     parser.add_argument("--langs", default="vi,en,ja,ko,es", help="Ngôn ngữ xuất")
-    parser.add_argument("--voice-mode", default="single_female", choices=["single_male", "single_female", "clone_2", "voice_design"])
+    parser.add_argument("--voice-mode", default="single_female", help="Chỉ dùng 1 giọng Nữ không clone (single_female)")
     parser.add_argument("--test-5min", action="store_true", help="Xuất vào thư mục preview_5min")
     args = parser.parse_args()
     langs = [x.strip().lower() for x in args.langs.split(",") if x.strip()]

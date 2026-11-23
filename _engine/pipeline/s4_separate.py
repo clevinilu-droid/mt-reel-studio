@@ -1,4 +1,4 @@
-"""Bước 4 (s4_separate): Tách giọng CÓ CHỌN LỌC chỉ tại các block có thoại + Cắt 2 mẫu Clone vàng (1 Nam + 1 Nữ, 6–10s).
+"""Bước 4 (s4_separate): Tách giọng CÓ CHỌN LỌC chỉ tại các block có thoại để tạo nền sạch `04_clean_bed.wav`.
 
 Đột phá so với cách cũ:
   - KHÔNG tách mù toàn bộ 2.5 tiếng phim! Chỉ chạy BS-RoFormer / MelBand-RoFormer (fallback MDX-Net)
@@ -6,9 +6,7 @@
   - Ngoài block thoại: chép thẳng 100% `01_orig_48k_stereo.wav` nguyên bản (giữ nguyên tiếng reo hò,
     va chạm, không gian phim không bị méo kiểu MDX!).
   - Trong block thoại: đắp `instrumental` vừa tách với crossfade mượt 120ms ở 2 mép.
-  - Đo F0 (cao độ giọng nam/nữ) + SNR từng câu, rồi tự chọn ghép 2–4 câu sạch nhất thành đúng 2 mẫu:
-      * `04_ref_male.wav`   (6–10 giây giọng Nam chuẩn nhất)
-      * `04_ref_female.wav` (6–10 giây giọng Nữ chuẩn nhất)
+  - Đã bỏ hoàn toàn phần cắt mẫu clone & giọng nam (hệ thống chỉ dùng 1 giọng nữ chuẩn không clone).
 """
 from __future__ import annotations
 
@@ -119,48 +117,14 @@ def _measure_pitch_and_snr(voc_mono: np.ndarray, inst_mono: np.ndarray, sr: int 
     return {"f0_hz": med_f0, "rms": round(v_rms, 4), "snr_db": snr_db}
 
 
-def _build_golden_clone_ref(
-    selected_clips: list[np.ndarray],
-    out_wav: Path,
-    min_sec: float = 5.0,
-    max_sec: float = 10.0,
-    pause_sec: float = 0.2,
-) -> float:
-    """Ghép các câu sạch nhất thành clip mẫu clone chuẩn 6–10 giây."""
-    if not selected_clips:
-        return 0.0
-    pause = np.zeros(int(pause_sec * SR), dtype=np.float32)
-    parts: list[np.ndarray] = []
-    acc_len = 0
-    max_samples = int(max_sec * SR)
-    for clip in selected_clips:
-        if acc_len + len(clip) > max_samples and acc_len >= int(min_sec * SR):
-            break
-        if parts:
-            parts.append(pause)
-            acc_len += len(pause)
-        take = clip[: max(0, max_samples - acc_len)]
-        if len(take) > 0:
-            parts.append(take)
-            acc_len += len(take)
-        if acc_len >= int(8.0 * SR):
-            break
-    if not parts:
-        return 0.0
-    merged = np.concatenate(parts)
-    pk = float(np.max(np.abs(merged))) + 1e-8
-    if pk > 0.92:
-        merged = merged * (0.92 / pk)
-    _write_mono_wav(out_wav, merged, sr=SR)
-    return round(len(merged) / float(SR), 2)
-
-
 def run_step4(target_dir: Path, force: bool = False) -> dict[str, Any]:
     clean_bed_wav = target_dir / "04_clean_bed.wav"
     meta_json = target_dir / "04_f0_speakers.json"
-    ref_male_wav = target_dir / "04_ref_male.wav"
-    ref_female_wav = target_dir / "04_ref_female.wav"
     sep_dir = target_dir / "sep_blocks"
+
+    # Dọn file clone cũ nếu có từ phiên trước
+    for old_ref in ("04_ref_male.wav", "04_ref_female.wav"):
+        (target_dir / old_ref).unlink(missing_ok=True)
 
     orig_wav = target_dir / "01_orig_48k_stereo.wav"
     master_json = target_dir / "03_aligned_master.json"
@@ -170,7 +134,7 @@ def run_step4(target_dir: Path, force: bool = False) -> dict[str, Any]:
     if not force and clean_bed_wav.exists() and meta_json.exists() and clean_bed_wav.stat().st_size > 100_000:
         existing = read_json_safe(meta_json)
         if existing:
-            emit_progress(100.0, "Tái sử dụng checkpoint Bước 4 (clean_bed + 2 mẫu Clone vàng)")
+            emit_progress(100.0, "Tái sử dụng checkpoint Bước 4 (04_clean_bed.wav)")
             return existing
 
     t0 = time.perf_counter()
@@ -194,9 +158,9 @@ def run_step4(target_dir: Path, force: bool = False) -> dict[str, Any]:
     model_dir = ENGINE_DIR / "models" / "separator"
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    # Kiểm tra xem có block nào chưa tách xong trong cache không
+    # Chỉ cần lưu file instrumental của từng block thoại để ghép 04_clean_bed.wav
     pending_blocks = [
-        b for b in blocks if not (sep_dir / f"blk_{b['id']:04d}_inst.wav").exists() or not (sep_dir / f"blk_{b['id']:04d}_voc.wav").exists() or force
+        b for b in blocks if not (sep_dir / f"blk_{b['id']:04d}_inst.wav").exists() or force
     ]
 
     model_used = model_primary
@@ -235,7 +199,7 @@ def run_step4(target_dir: Path, force: bool = False) -> dict[str, Any]:
 
         with wave.open(str(orig_wav), "rb") as wf_orig:
             for idx, b in enumerate(pending_blocks, start=1):
-                pct = 8.0 + (idx / len(pending_blocks)) * 65.0
+                pct = 8.0 + (idx / len(pending_blocks)) * 75.0
                 emit_progress(pct, f"Tách giọng block {idx}/{len(pending_blocks)} [{b['start']:.1f}s–{b['end']:.1f}s]...")
                 i0 = int(round(b["start"] * sr))
                 i1 = int(round(b["end"] * sr))
@@ -246,7 +210,7 @@ def run_step4(target_dir: Path, force: bool = False) -> dict[str, Any]:
                 outs = separator.separate(str(in_wav))
                 inst_src, voc_src = _match_sep_outputs(outs, tmp_sep)
                 shutil.move(str(inst_src), str(sep_dir / f"blk_{b['id']:04d}_inst.wav"))
-                shutil.move(str(voc_src), str(sep_dir / f"blk_{b['id']:04d}_voc.wav"))
+                voc_src.unlink(missing_ok=True)
                 in_wav.unlink(missing_ok=True)
                 if idx % 20 == 0:
                     release_vram()
@@ -256,12 +220,8 @@ def run_step4(target_dir: Path, force: bool = False) -> dict[str, Any]:
         release_vram()
 
     # Pha 2: Ghép 04_clean_bed.wav (100% gốc ngoài block thoại + instrumental crossfade 120ms trong block thoại)
-    emit_progress(76.0, "Đang ghép 04_clean_bed.wav (giữ 100% SFX/reo hò gốc ngoài thoại)...")
+    emit_progress(86.0, "Đang ghép 04_clean_bed.wav (giữ 100% SFX/reo hò gốc ngoài thoại)...")
     xfade = int(CROSSFADE_S * sr)
-    blk_by_turn: dict[int, dict[str, Any]] = {}
-    for b in blocks:
-        for tid in b["turn_ids"]:
-            blk_by_turn[tid] = b
 
     with wave.open(str(orig_wav), "rb") as wf_orig, wave.open(str(clean_bed_wav), "wb") as wf_out:
         wf_out.setnchannels(2)
@@ -306,64 +266,6 @@ def run_step4(target_dir: Path, force: bool = False) -> dict[str, Any]:
             wf_out.writeframes(np.clip(raw * 32767.0, -32768, 32767).astype(np.int16).tobytes())
             cursor += step
 
-    # Pha 3: Đo F0 + SNR từng câu & cắt ghép 2 mẫu Clone vàng (1 Nam + 1 Nữ, 6–10s)
-    emit_progress(88.0, "Đang đo F0 nam/nữ & lọc ghép 2 mẫu Clone vàng (6–10s)...")
-    turn_acoustics: list[dict[str, Any]] = []
-    male_cands: list[tuple[float, np.ndarray]] = []
-    female_cands: list[tuple[float, np.ndarray]] = []
-
-    for t in turns:
-        b = blk_by_turn[t["id"]]
-        rel_s = max(0.0, float(t["start"]) - b["start"])
-        rel_e = max(rel_s + 0.1, float(t["end"]) - b["start"])
-        s0, cnt = int(round(rel_s * sr)), int(round((rel_e - rel_s) * sr))
-
-        with wave.open(str(sep_dir / f"blk_{b['id']:04d}_voc.wav"), "rb") as wfv:
-            v_arr = _read_stereo_f32(wfv, s0, cnt).mean(axis=1)
-        with wave.open(str(sep_dir / f"blk_{b['id']:04d}_inst.wav"), "rb") as wfi:
-            i_arr = _read_stereo_f32(wfi, s0, cnt).mean(axis=1)
-
-        m = _measure_pitch_and_snr(v_arr, i_arr, sr=sr)
-        f0 = m["f0_hz"]
-        gender_hint = "FEMALE" if (f0 is not None and f0 >= 175.0) else ("MALE" if f0 is not None else "UNKNOWN")
-        dur_t = rel_e - rel_s
-        turn_acoustics.append(
-            {
-                "id": t["id"],
-                "spk_id": t.get("spk_id", "SPK_UNK"),
-                "f0_hz": f0,
-                "rms": m["rms"],
-                "snr_db": m["snr_db"],
-                "gender_hint": gender_hint,
-            }
-        )
-        # Tuyển câu sạch cho mẫu Clone: dài >=0.75s, không rè/clipping, SNR tốt (ưu tiên câu dài & SNR cao)
-        peak = float(np.max(np.abs(v_arr))) if len(v_arr) else 0.0
-        if 0.75 <= dur_t <= 5.5 and 0.03 <= m["rms"] <= 0.45 and peak < 0.98 and m["snr_db"] >= 2.0:
-            score = m["snr_db"] + min(4.0, dur_t * 1.5)
-            if gender_hint == "MALE":
-                male_cands.append((score, v_arr))
-            elif gender_hint == "FEMALE":
-                female_cands.append((score, v_arr))
-
-    ref_cfg = cfg.get("clone_ref", {})
-    male_cands.sort(key=lambda x: x[0], reverse=True)
-    female_cands.sort(key=lambda x: x[0], reverse=True)
-    male_dur = _build_golden_clone_ref(
-        [c for _, c in male_cands],
-        ref_male_wav,
-        min_sec=float(ref_cfg.get("min_sec", 5.0)),
-        max_sec=float(ref_cfg.get("max_sec", 10.0)),
-        pause_sec=float(ref_cfg.get("pause_sec", 0.2)),
-    )
-    female_dur = _build_golden_clone_ref(
-        [c for _, c in female_cands],
-        ref_female_wav,
-        min_sec=float(ref_cfg.get("min_sec", 5.0)),
-        max_sec=float(ref_cfg.get("max_sec", 10.0)),
-        pause_sec=float(ref_cfg.get("pause_sec", 0.2)),
-    )
-
     elapsed = round(time.perf_counter() - t0, 2)
     payload = {
         "model_used": model_used,
@@ -371,21 +273,19 @@ def run_step4(target_dir: Path, force: bool = False) -> dict[str, Any]:
         "blocks_count": len(blocks),
         "dialogue_sec": round(dialogue_sec, 1),
         "kept_orig_sec": round(kept_orig_sec, 1),
-        "ref_male": {"path": str(ref_male_wav), "duration_s": male_dur, "valid": male_dur >= 5.0},
-        "ref_female": {"path": str(ref_female_wav), "duration_s": female_dur, "valid": female_dur >= 5.0},
-        "acoustics": turn_acoustics,
+        "acoustics": [],
     }
     atomic_write_json(meta_json, payload)
     emit_progress(
         100.0,
-        f"Xong Bước 4 ({elapsed}s): giữ nguyên {kept_orig_sec:.0f}s gốc | Mẫu Clone Nam {male_dur}s, Nữ {female_dur}s",
+        f"Xong Bước 4 ({elapsed}s): đã tạo 04_clean_bed.wav (giữ nguyên {kept_orig_sec:.0f}s SFX gốc)",
     )
-    print(f"[S4 DONE] {elapsed}s | Ref Nam={male_dur}s, Ref Nữ={female_dur}s -> {clean_bed_wav.name}", flush=True)
+    print(f"[S4 DONE] {elapsed}s -> {clean_bed_wav.name}", flush=True)
     return payload
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Bước 4: Tách giọng chọn lọc vùng thoại + Cắt 2 mẫu Clone vàng (6–10s).")
+    parser = argparse.ArgumentParser(description="Bước 4: Tách giọng chọn lọc vùng thoại giữ nguyên SFX gốc.")
     parser.add_argument("target_dir", type=Path, help="Thư mục work mục tiêu")
     parser.add_argument("--force", action="store_true", help="Chạy lại toàn bộ các block")
     args = parser.parse_args()

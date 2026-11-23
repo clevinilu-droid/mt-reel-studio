@@ -232,13 +232,7 @@
     $("workContent").style.display = "block";
 
     $("wTitle").textContent = job.work_rel;
-    const voiceNames = {
-      single_female: "1 giọng Nữ không clone (VieNeu + VoxCPM2)",
-      single_male: "1 giọng Nam không clone",
-      clone_2: "Clone 1 Nam + 1 Nữ",
-      voice_design: "Voice Design 2 giới",
-    };
-    $("wSubtitle").textContent = `Ngôn ngữ: ${(job.langs || []).join(", ").toUpperCase()}  ·  Giọng đọc: ${voiceNames[job.voice_mode] || job.voice_mode || "1 giọng Nữ"}`;
+    $("wSubtitle").textContent = `Ngôn ngữ: ${(job.langs || []).join(", ").toUpperCase()}  ·  Giọng đọc: 1 giọng Nữ không clone (VieNeu + VoxCPM2)`;
     $("wBadge").textContent = statusText(job.status);
     $("wBadge").className = `badge ${badgeClass(job.status)}`;
 
