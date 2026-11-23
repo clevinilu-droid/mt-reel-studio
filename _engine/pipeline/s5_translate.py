@@ -372,7 +372,8 @@ def _phase5a_qwen_analyze(
             user_prompt = (
                 "Dựa vào lời thoại tiếng Trung, nhãn người nói `spk_id` và tần số giọng `f0_hz` "
                 "(Nam thường <175Hz, Nữ >=175Hz; ưu tiên ngữ cảnh khi F0 nhiễu), hãy xuất JSON gồm:\n"
-                "1) `glossary_add`: dict {tên_tiếng_Trung: tên_Hán_Việt_chuẩn}\n"
+                "1) `glossary_add`: CHỈ chứa TÊN RIÊNG thực sự (họ tên nhân vật, tên công ty/tập đoàn, địa danh, bang phái) -> dict {tên_Trung: tên_Hán_Việt}. "
+                "TUYỆT ĐỐI KHÔNG cho danh từ chung, động từ, thành ngữ, khẩu ngữ hay chữ số (vd 外国佬, 小帅哥, 现金, 叠被子, 送命, 地下黑拳, 干死) vào `glossary_add`!\n"
                 "2) `roles`: list cho từng câu theo ĐÚNG số nguyên `id` (vd 1, 2, 3..., KHÔNG dùng `spk_id` làm `id`) với các trường: "
                 "`id`, `gender` ('MALE'|'FEMALE'), `age_tone` ('YOUNG'|'MATURE'), "
                 "`emotion` ('NEUTRAL'|'ANGRY'|'HAPPY'|'SAD'|'WHISPER'|'URGENT'), "
@@ -468,8 +469,12 @@ def _phase5b_gemma4_vi(
     emit_progress(35.0, f"Pha 5B: Nạp {model_id} dịch thoại Tiếng Việt...")
     sys_prompt = (
         "Bạn là biên kịch lồng tiếng phim ngắn Tiếng Việt hàng đầu. "
-        "Dịch tiếng Trung sang văn nói Tiếng Việt tự nhiên, sắc sảo, không dịch sượng Hán Việt, "
-        "độ dài câu khớp thời lượng giây cho phép. Chỉ trả JSON hợp lệ."
+        "Dịch tiếng Trung sang khẩu ngữ Tiếng Việt tự nhiên, đời thường, sắc sảo; "
+        "TUYỆT ĐỐI KHÔNG dịch sượng Hán-Việt các từ thông thường (vd dùng 'thằng Tây' chứ không dùng 'ngoại quốc lão', "
+        "'trai đẹp/cậu em' chứ không dùng 'tiểu tuấn hán', 'đánh quyền ngầm' chứ không dùng 'địa hạ hắc quyền', "
+        "'tiền mặt' chứ không dùng 'hiện kim', 'nộp mạng' chứ không dùng 'tống mệnh', 'gấp chăn' chứ không dùng 'điệp bị tử'). "
+        "Nếu chữ Trung gốc có lỗi OCR nhìn nhầm nét rõ ràng trong ngữ cảnh (vd '千死' trong cảnh đòi đánh -> hiểu đúng là '干死' = đánh chết), hãy dịch đúng theo ngữ cảnh. "
+        "Độ dài câu khớp thời lượng giây cho phép. Chỉ trả JSON hợp lệ."
     )
     batch_size = 15
     zh_fb = cfg.get("models", {}).get("zh_analyst_model", "philbert440/Qwen3.8-27B-W4A16-AWQ")

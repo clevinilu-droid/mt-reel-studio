@@ -245,6 +245,34 @@ def run_step3(target_dir: Path, force: bool = False) -> dict[str, Any]:
         a_txt = str(a["text"]).strip()
         a_ck = clean_cjk(a_txt)
 
+        # Chống đoạn ASR bị gom nhiều câu (vd: 15 câu dồn vào 0.7s): tách theo các dòng OCR đã chứa trong đoạn ASR đó
+        if len(a_ck) >= 20:
+            a_py = to_pinyin_plain(a_txt)
+            covered_ocr = []
+            for o in ocr_segs:
+                o_ck = clean_cjk(o["text"])
+                o_py = to_pinyin_plain(o["text"])
+                if not o_ck:
+                    continue
+                if o_ck in a_ck or (len(o_py) >= 6 and o_py in a_py):
+                    covered_ocr.append(o)
+            if len(covered_ocr) >= 2:
+                for o in covered_ocr:
+                    used_ocr_ids.add(int(o["id"]))
+                    candidates.append(
+                        {
+                            "start": round(float(o["start"]), 3),
+                            "end": round(float(o["end"]), 3),
+                            "text": str(o["text"]).strip(),
+                            "asr_text": str(o["text"]).strip(),
+                            "ocr_text": str(o["text"]).strip(),
+                            "spk_id": a.get("spk_id", "SPK_UNK"),
+                            "audit_status": "MATCHED",
+                            "pinyin_sim": 0.95,
+                        }
+                    )
+                continue
+
         # Lấy tất cả OCR quanh [a_s - 1.3s, a_e + 1.3s]
         nearby = [o for o in ocr_segs if float(o["end"]) >= a_s - 1.3 and float(o["start"]) <= a_e + 1.3]
         best_ocr = None

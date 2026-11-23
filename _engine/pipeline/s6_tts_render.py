@@ -427,8 +427,8 @@ def _detect_sub_blur_rect(cfr_mp4: Path, turns: list[dict[str, Any]] | None = No
     return bx, by, bw, bh
 
 
-def _compute_wm_alpha_scale(wm_png: Path, target_opacity: float = 0.05) -> float:
-    """Tính hệ số `aa` cho colorchannelmixer sao cho độ đục cuối của watermark đạt đúng ~5%."""
+def _compute_wm_alpha_scale(wm_png: Path, target_opacity: float = 0.10) -> float:
+    """Tính hệ số `aa` cho colorchannelmixer sao cho độ đục cuối của watermark đạt đúng ~10%."""
     try:
         from PIL import Image
 
@@ -458,7 +458,7 @@ def _render_master_mp4(
     cr = max(4, min(18, min(bw, bh) // 4 - 2))
 
     has_wm = wm_png.exists()
-    wm_aa = _compute_wm_alpha_scale(wm_png, target_opacity=0.05) if has_wm else 0.05
+    wm_aa = _compute_wm_alpha_scale(wm_png, target_opacity=0.10) if has_wm else 0.10
 
     def _build_cmd(use_hw: bool) -> list[str]:
         cmd = ["ffmpeg", "-y", "-v", "warning"]

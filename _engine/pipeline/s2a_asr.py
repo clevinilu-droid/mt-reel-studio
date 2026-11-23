@@ -185,9 +185,11 @@ def _run_faster_whisper(wav_16k: Path, jsonl_path: Path, total_dur: float, chunk
 
         emit_progress(10.0 + (ci / n_chunks) * 85.0, f"Whisper VAD+ASR chunk {ci+1}/{n_chunks} ({c_start:.0f}s)...")
         audio = read_wav_chunk_f32(wav_16k, c_start, c_dur)
-        vad_opts = {"threshold": 0.25, "min_speech_duration_ms": 120, "min_silence_duration_ms": 300}
+        vad_opts = {"threshold": 0.25, "min_speech_duration_ms": 120, "min_silence_duration_ms": 280, "max_speech_duration_s": 8.0}
         if batched is not None:
-            segs_iter, _ = batched.transcribe(audio, language="zh", batch_size=16, vad_filter=True, vad_parameters=vad_opts, word_timestamps=True)
+            segs_iter, _ = batched.transcribe(
+                audio, language="zh", batch_size=16, chunk_length=8, vad_filter=True, vad_parameters=vad_opts, word_timestamps=True
+            )
         else:
             segs_iter, _ = base_model.transcribe(audio, language="zh", beam_size=2, vad_filter=True, vad_parameters=vad_opts, word_timestamps=True)
 
@@ -202,23 +204,34 @@ def _run_faster_whisper(wav_16k: Path, jsonl_path: Path, total_dur: float, chunk
                 for w in s.words:
                     words.append({"s": round(c_start + w.start, 3), "e": round(c_start + w.end, 3), "w": w.word})
 
-            seg_start = round(c_start + s.start, 3)
-            seg_end = round(c_start + s.end, 3)
-            # Cắt bỏ từ đơn bị Whisper kéo dãn vượt qua khoảng lặng >1.2s ở đầu/cuối câu
+            # Tách segment dài thành từng cụm câu nếu có khoảng ngắt >=0.85s, đồng thời dựng lại text đúng từng cụm
             if len(words) >= 2:
-                best_cluster = [words[0]]
-                clusters: list[list[dict[str, Any]]] = [best_cluster]
+                clusters: list[list[dict[str, Any]]] = [[words[0]]]
                 for w in words[1:]:
-                    if w["s"] - clusters[-1][-1]["e"] >= 1.2:
+                    if w["s"] - clusters[-1][-1]["e"] >= 0.85:
                         clusters.append([w])
                     else:
                         clusters[-1].append(w)
-                # Chọn cụm có nhiều chữ nhất (ưu tiên cụm chính thực sự nói)
-                main_cl = max(clusters, key=lambda cl: (len("".join(x["w"] for x in cl)), cl[-1]["e"] - cl[0]["s"]))
-                seg_start = main_cl[0]["s"]
-                seg_end = max(seg_start + 0.15, main_cl[-1]["e"])
-                words = main_cl
+                for cl in clusters:
+                    cl_txt = "".join(str(x.get("w", "")) for x in cl).strip() if len(clusters) > 1 else txt
+                    if not has_cjk(cl_txt):
+                        continue
+                    seg_start = cl[0]["s"]
+                    seg_end = max(seg_start + 0.15, cl[-1]["e"])
+                    chunk_segs.append(
+                        {
+                            "start": seg_start,
+                            "end": seg_end,
+                            "text": cl_txt,
+                            "spk_id": "SPK_UNK",
+                            "no_speech_prob": round(nsp, 3),
+                            "words": cl,
+                        }
+                    )
+                continue
 
+            seg_start = round(c_start + s.start, 3)
+            seg_end = round(c_start + s.end, 3)
             chunk_segs.append(
                 {
                     "start": seg_start,
