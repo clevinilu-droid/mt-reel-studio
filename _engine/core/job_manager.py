@@ -494,7 +494,7 @@ class JobManager:
 
             # 2A -> 2B -> 3 (Nghe + Đọc + Đối chiếu Pinyin & Cứu hộ)
             self._run_stage_subprocess(job_id, "s2a", "_engine.pipeline.s2a_asr", [str(target_dir)], "asr_sep", cancel_ev)
-            self._run_stage_subprocess(job_id, "s2b", "_engine.pipeline.s2b_ocr", [str(target_dir)], "vlm_llm", cancel_ev)
+            self._run_stage_subprocess(job_id, "s2b", "_engine.pipeline.s2b_ocr", [str(target_dir)], "asr_sep", cancel_ev)
             self._run_stage_subprocess(job_id, "s3", "_engine.pipeline.s3_audit", [str(target_dir)], "asr_sep", cancel_ev)
 
             if target_stage == "s3":

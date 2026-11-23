@@ -63,49 +63,112 @@ def emit_progress(pct: float, detail: str):
     print(f"[PROG] {max(0.0, min(100.0, pct)):.1f} | {detail}", flush=True)
 
 
-def ensure_onnx_cuda_libs() -> list[str]:
-    """Nạp sẵn CUDA/cuDNN shared libs từ venv hiện tại để ONNX Runtime bật được CUDAExecutionProvider."""
-    loaded: list[str] = []
+def build_venv_ld_library_path(py_exe_or_prefix: str | Path, base_ld: str | None = None) -> str:
+    """Tạo LD_LIBRARY_PATH cô lập cho ĐÚNG 1 venv mục tiêu, loại bỏ mọi đường dẫn /opt/venvs/* khác để tránh xung đột cuDNN 9.1 vs 9.8."""
+    import glob
+
+    p = Path(py_exe_or_prefix)
     try:
-        import onnxruntime as ort
-
-        if hasattr(ort, "preload_dlls"):
-            ort.preload_dlls()
-            loaded.append("ort.preload_dlls")
+        p_res = p.resolve()
     except Exception:
-        pass
+        p_res = p
+    if p.name.startswith("python") or p_res.name.startswith("python"):
+        venv_root = p.parent.parent if (p.parent.name == "bin" and p.parent.parent.exists()) else p_res.parent.parent
+    else:
+        venv_root = p if p.exists() else p_res
 
+    lib_dirs: list[str] = []
+    for pat in (
+        str(venv_root / "lib" / "python*" / "site-packages" / "nvidia" / "*" / "lib"),
+        str(venv_root / "lib" / "python*" / "site-packages" / "torch" / "lib"),
+    ):
+        for d in sorted(glob.glob(pat)):
+            if d not in lib_dirs and Path(d).is_dir():
+                lib_dirs.append(d)
+
+    raw_ld = os.environ.get("LD_LIBRARY_PATH", "") if base_ld is None else base_ld
+    kept_ld = [
+        seg
+        for seg in raw_ld.split(":")
+        if seg and not seg.startswith("/opt/venvs/")
+    ]
+    return ":".join(dict.fromkeys([*lib_dirs, *kept_ld]))
+
+
+def ensure_onnx_cuda_libs() -> list[str]:
+    """Nạp sẵn CUDA/cuDNN shared libs từ CHỈ venv hiện tại (sys.prefix) để tránh xung đột symbol giữa các venv."""
+    loaded: list[str] = []
     if not sys.platform.startswith("linux"):
+        try:
+            import onnxruntime as ort
+
+            if hasattr(ort, "preload_dlls"):
+                ort.preload_dlls()
+                loaded.append("ort.preload_dlls")
+        except Exception:
+            pass
         return loaded
 
     try:
         import ctypes
         import glob
 
-        lib_dirs = []
-        for base in (Path(sys.prefix), Path("/opt/venvs/asr_sep"), Path("/opt/venvs/vlm_llm")):
-            for pat in (
-                str(base / "lib" / "python*" / "site-packages" / "nvidia" / "*" / "lib"),
-                str(base / "lib" / "python*" / "site-packages" / "torch" / "lib"),
-            ):
-                for d in glob.glob(pat):
-                    if d not in lib_dirs and Path(d).is_dir():
-                        lib_dirs.append(d)
-        if lib_dirs:
-            cur_ld = os.environ.get("LD_LIBRARY_PATH", "")
-            parts = [p for p in [*lib_dirs, *cur_ld.split(":")] if p]
-            os.environ["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(parts))
-            # Nạp trước các thư viện cốt lõi bằng RTLD_GLOBAL để dlopen của onnxruntime tìm thấy ngay
-            for d in lib_dirs:
-                for so in sorted(Path(d).glob("lib*.so*")):
-                    if any(k in so.name for k in ("libcudnn", "libcublas", "libcudart", "libnvrtc", "libcufft")):
-                        try:
-                            ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
+        os.environ["LD_LIBRARY_PATH"] = build_venv_ld_library_path(sys.prefix)
+        base = Path(sys.prefix)
+        lib_dirs: list[str] = []
+        for pat in (
+            str(base / "lib" / "python*" / "site-packages" / "nvidia" / "*" / "lib"),
+            str(base / "lib" / "python*" / "site-packages" / "torch" / "lib"),
+        ):
+            for d in sorted(glob.glob(pat)):
+                if d not in lib_dirs and Path(d).is_dir():
+                    lib_dirs.append(d)
+
+        # Thứ tự ưu tiên nạp: runtime/math trước, sau đó libcudnn.so.9 gốc rồi mới tới các mô-đun libcudnn_*.so.9 cùng thư mục
+        priority_prefixes = (
+            "libcudart.so",
+            "libnvrtc-builtins.so",
+            "libnvrtc.so",
+            "libcublasLt.so",
+            "libcublas.so",
+            "libcufft.so",
+            "libcurand.so",
+            "libcusolver.so",
+            "libcusparse.so",
+            "libcudnn.so.9",
+            "libcudnn_ops.so",
+            "libcudnn_cnn.so",
+            "libcudnn_adv.so",
+            "libcudnn_graph.so",
+            "libcudnn_heuristic.so",
+            "libcudnn_engines_precompiled.so",
+            "libcudnn_engines_runtime_compiled.so",
+        )
+        candidates: list[Path] = []
+        for d in lib_dirs:
+            candidates.extend(sorted(Path(d).glob("lib*.so*")))
+
+        for pref in priority_prefixes:
+            for so in candidates:
+                if so.name == pref or so.name.startswith(pref):
+                    try:
+                        ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
+                        if so.name not in loaded:
                             loaded.append(so.name)
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
     except Exception:
         pass
+
+    if not any(x.startswith("libcudnn") for x in loaded):
+        try:
+            import onnxruntime as ort
+
+            if hasattr(ort, "preload_dlls"):
+                ort.preload_dlls()
+                loaded.append("ort.preload_dlls")
+        except Exception:
+            pass
     return loaded
 
 
@@ -154,6 +217,8 @@ def run_isolated_step(
     env = os.environ.copy()
     existing_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{ROOT_DIR}{os.pathsep}{existing_pp}" if existing_pp else str(ROOT_DIR)
+    if sys.platform.startswith("linux"):
+        env["LD_LIBRARY_PATH"] = build_venv_ld_library_path(py_exe, env.get("LD_LIBRARY_PATH", ""))
     env["PYTHONUTF8"] = "1"
     env.setdefault("OMP_NUM_THREADS", "4")
     env.setdefault("OPENBLAS_NUM_THREADS", "4")

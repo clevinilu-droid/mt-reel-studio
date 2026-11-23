@@ -15,6 +15,8 @@ import io
 import json
 import os
 import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -23,8 +25,15 @@ import av
 import numpy as np
 from PIL import Image
 
-from _engine.core.checkpoint import atomic_write_json, read_json_safe
-from _engine.core.vram_guard import emit_progress, ensure_onnx_cuda_libs, load_pipeline_config, patch_onnx_threads, release_vram
+from _engine.core.checkpoint import ROOT_DIR, atomic_write_json, read_json_safe
+from _engine.core.vram_guard import (
+    build_venv_ld_library_path,
+    emit_progress,
+    ensure_onnx_cuda_libs,
+    load_pipeline_config,
+    patch_onnx_threads,
+    release_vram,
+)
 
 CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
 
@@ -269,6 +278,61 @@ def _merge_ocr_lines(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return segs
 
 
+def _probe_rapidocr_cuda_candidates() -> tuple[str, str, bool] | None:
+    """Thử chạy RapidOCR CUDA trong tiến trình con tách biệt để tránh crash C++ SIGABRT (-6) khi lệch cuDNN.
+
+    Trả về `(label, py_exe, ld_library_path, skip_preload)` của cấu hình GPU đầu tiên chạy thành công conv2d,
+    hoặc `None` nếu mọi cấu hình GPU đều lỗi (khi đó tiến trình chính sẽ fallback sang CPU an toàn 100%).
+    """
+    candidates: list[tuple[str, str, str, bool]] = []
+    cur_ld = build_venv_ld_library_path(sys.prefix)
+    candidates.append(("venv_isolated", sys.executable, cur_ld, False))
+
+    if sys.platform.startswith("linux"):
+        sys_cuda_ld = "/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu"
+        candidates.append(("system_cuda_cudnn", sys.executable, sys_cuda_ld, True))
+        for alt_venv in ("/opt/venvs/asr_sep", "/opt/venvs/vlm_llm", "/opt/venvs/tts_ui"):
+            alt_py = Path(alt_venv) / "bin" / "python"
+            if alt_py.exists() and str(alt_py) != sys.executable:
+                candidates.append((f"{Path(alt_venv).name}_isolated", str(alt_py), build_venv_ld_library_path(alt_venv), False))
+                candidates.append((f"{Path(alt_venv).name}_syscuda", str(alt_py), sys_cuda_ld, True))
+
+    for label, py_exe, ld_path, skip_preload in candidates:
+        preload_stmt = "" if skip_preload else "from _engine.core.vram_guard import ensure_onnx_cuda_libs; ensure_onnx_cuda_libs(); "
+        code = (
+            "import numpy as np; "
+            f"{preload_stmt}"
+            "import onnxruntime as ort; "
+            "assert 'CUDAExecutionProvider' in ort.get_available_providers(), 'NO_CUDA_EP'; "
+            "from rapidocr_onnxruntime import RapidOCR; "
+            "ocr = RapidOCR(use_angle_cls=False, det_use_cuda=True, rec_use_cuda=True); "
+            "ocr(np.zeros((64, 160, 3), dtype=np.uint8)); "
+            "print('RAPIDOCR_CUDA_PROBE_OK', flush=True)"
+        )
+        env = os.environ.copy()
+        existing_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{ROOT_DIR}{os.pathsep}{existing_pp}" if existing_pp else str(ROOT_DIR)
+        if sys.platform.startswith("linux"):
+            env["LD_LIBRARY_PATH"] = ld_path
+        try:
+            proc = subprocess.run(
+                [py_exe, "-c", code],
+                cwd=str(ROOT_DIR),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+            if proc.returncode == 0 and "RAPIDOCR_CUDA_PROBE_OK" in (proc.stdout or ""):
+                print(f"[S2B CUDA PROBE] Thành công với cấu hình '{label}' ({py_exe})", flush=True)
+                return label, py_exe, ld_path, skip_preload
+            err_tail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-240:]
+            print(f"[S2B CUDA PROBE] '{label}' thất bại (rc={proc.returncode}): {err_tail}", flush=True)
+        except Exception as exc:
+            print(f"[S2B CUDA PROBE] '{label}' ngoại lệ: {exc}", flush=True)
+    return None
+
+
 def run_step2b(target_dir: Path, force: bool = False, batch_size: int = 16) -> dict[str, Any]:
     out_json = target_dir / "02b_ocr_raw.json"
     jsonl_path = target_dir / "02b_ocr_raw.jsonl"
@@ -306,14 +370,30 @@ def run_step2b(target_dir: Path, force: bool = False, batch_size: int = 16) -> d
 
     ocr_engine = None
     if not vlm_url:
-        emit_progress(48.5, "Đang nạp RapidOCR (kiểm tra GPU CUDA)...")
-        ensure_onnx_cuda_libs()
-        patch_onnx_threads(4)
-        import onnxruntime as ort
+        emit_progress(48.5, "Đang nạp RapidOCR (kiểm tra GPU CUDA an toàn)...")
+        verified_label = os.environ.get("MT_S2B_CUDA_VERIFIED", "").strip()
+        skip_preload = os.environ.get("MT_S2B_SKIP_PRELOAD", "0") == "1"
+
+        if not verified_label:
+            win = _probe_rapidocr_cuda_candidates()
+            if win is not None:
+                label, win_py, win_ld, win_skip = win
+                cur_ld = os.environ.get("LD_LIBRARY_PATH", "")
+                if sys.platform.startswith("linux") and (win_py != sys.executable or cur_ld != win_ld):
+                    print(f"[S2B CUDA] Re-exec sang môi trường GPU đã kiểm chứng '{label}'...", flush=True)
+                    os.environ["LD_LIBRARY_PATH"] = win_ld
+                    os.environ["MT_S2B_CUDA_VERIFIED"] = label
+                    os.environ["MT_S2B_SKIP_PRELOAD"] = "1" if win_skip else "0"
+                    os.execv(win_py, [win_py, "-u", "-m", "_engine.pipeline.s2b_ocr", *sys.argv[1:]])
+                verified_label = label
+                skip_preload = win_skip
+
         from rapidocr_onnxruntime import RapidOCR
 
-        has_cuda_ep = "CUDAExecutionProvider" in ort.get_available_providers()
-        if has_cuda_ep:
+        if verified_label:
+            if not skip_preload:
+                ensure_onnx_cuda_libs()
+            patch_onnx_threads(4)
             try:
                 gpu_ocr = RapidOCR(
                     use_angle_cls=False,
@@ -322,7 +402,6 @@ def run_step2b(target_dir: Path, force: bool = False, batch_size: int = 16) -> d
                     rec_use_cuda=True,
                     rec_model_path=None,
                 )
-                # Thử 1 ảnh nhỏ để xác nhận cuDNN/CUDA ExecutionProvider chạy thật trước khi quét batch
                 gpu_ocr(np.zeros((64, 160, 3), dtype=np.uint8))
                 ocr_engine = gpu_ocr
                 engine_used = "rapidocr_cuda"
@@ -331,6 +410,9 @@ def run_step2b(target_dir: Path, force: bool = False, batch_size: int = 16) -> d
                 print(f"[S2B CUDA WARN] RapidOCR CUDA lỗi ({exc}) -> fallback rapidocr_cpu", flush=True)
 
         if ocr_engine is None:
+            cpu_threads = min(16, max(4, (os.cpu_count() or 8)))
+            patch_onnx_threads(cpu_threads)
+            print(f"[S2B CPU FALLBACK] Chạy RapidOCR CPU với {cpu_threads} luồng...", flush=True)
             ocr_engine = RapidOCR(
                 use_angle_cls=False,
                 det_use_cuda=False,
