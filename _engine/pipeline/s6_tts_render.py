@@ -75,18 +75,30 @@ def _pick_vieneu_voice(role: dict[str, Any], stock_cfg: dict[str, Any]) -> str:
     return "Hải Đăng"
 
 
-def _synth_vieneu_vi(target_dir: Path, turns: list[dict[str, Any]], vi_map: dict[int, str], roles_map: dict[int, dict[str, Any]]) -> list[Path]:
+def _synth_vieneu_vi(
+    target_dir: Path,
+    turns: list[dict[str, Any]],
+    vi_map: dict[int, str],
+    roles_map: dict[int, dict[str, Any]],
+    voice_mode: str = "single_male",
+) -> list[Path]:
     """Tạo giọng đọc Tiếng Việt theo batch bằng VieNeu TTS v3turbo (PyTorch GPU / ONNX CPU) + cache từng câu."""
     cache_dir = target_dir / "tts_cache" / "vi"
     cache_dir.mkdir(parents=True, exist_ok=True)
     stock_cfg = read_json_safe(ENGINE_DIR / "config" / "vieneu_stock_cast.json") or {}
+
+    fixed_voice = None
+    if voice_mode == "single_male":
+        fixed_voice = _pick_vieneu_voice({"gender": "MALE", "age_tone": "YOUNG"}, stock_cfg)
+    elif voice_mode == "single_female":
+        fixed_voice = _pick_vieneu_voice({"gender": "FEMALE", "age_tone": "YOUNG"}, stock_cfg)
 
     turn_paths: list[Path] = []
     todo: list[tuple[int, str, str, Path]] = []
     for t in turns:
         tid = int(t["id"])
         txt = (vi_map.get(tid) or "").strip()
-        voice_id = _pick_vieneu_voice(roles_map.get(tid, {}), stock_cfg)
+        voice_id = fixed_voice or _pick_vieneu_voice(roles_map.get(tid, {}), stock_cfg)
         h = hashlib.sha1(f"{voice_id}|{txt}".encode("utf-8")).hexdigest()[:8]
         wav_p = cache_dir / f"turn_{tid:04d}_{h}.wav"
         turn_paths.append(wav_p)
@@ -164,7 +176,12 @@ def _synth_qwen3_tts_foreign(
     cache_dir.mkdir(parents=True, exist_ok=True)
     ref_male = target_dir / "04_ref_male.wav"
     ref_female = target_dir / "04_ref_female.wav"
-    use_clone = voice_mode == "clone_2" and ref_male.exists() and ref_female.exists()
+    if voice_mode == "single_male":
+        use_clone = ref_male.exists()
+    elif voice_mode == "single_female":
+        use_clone = ref_female.exists()
+    else:
+        use_clone = voice_mode == "clone_2" and ref_male.exists() and ref_female.exists()
 
     turn_paths: list[Path] = []
     todo: list[tuple[int, str, dict[str, Any], Path]] = []
@@ -172,7 +189,8 @@ def _synth_qwen3_tts_foreign(
         tid = int(t["id"])
         txt = (txt_map.get(tid) or "").strip()
         r = roles_map.get(tid, {})
-        sig = f"{'clone' if use_clone else 'design'}|{r.get('gender','MALE')}|{r.get('emotion','NEUTRAL')}|{txt}"
+        g_eff = "MALE" if voice_mode == "single_male" else ("FEMALE" if voice_mode == "single_female" else str(r.get("gender", "MALE")).upper())
+        sig = f"{voice_mode}|{'clone' if use_clone else 'design'}|{g_eff}|{r.get('emotion','NEUTRAL')}|{txt}"
         h = hashlib.sha1(sig.encode("utf-8")).hexdigest()[:8]
         wp = cache_dir / f"turn_{tid:04d}_{h}.wav"
         turn_paths.append(wp)
@@ -208,7 +226,12 @@ def _synth_qwen3_tts_foreign(
     q_lang = QWEN_LANG_MAP.get(lang, "English")
 
     for idx, (tid, txt, r, wp) in enumerate(todo, start=1):
-        gender = str(r.get("gender", "MALE")).upper()
+        if voice_mode == "single_male":
+            gender = "MALE"
+        elif voice_mode == "single_female":
+            gender = "FEMALE"
+        else:
+            gender = str(r.get("gender", "MALE")).upper()
         emo = EMOTION_INSTRUCT.get(str(r.get("emotion", "NEUTRAL")).upper(), EMOTION_INSTRUCT["NEUTRAL"])
         if use_clone:
             ref_p = str(ref_female if gender == "FEMALE" else ref_male)
@@ -507,7 +530,7 @@ def _render_master_mp4(
         raise subprocess.CalledProcessError(res.returncode, cmd)
 
 
-def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str = "clone_2", is_test_5min: bool = False) -> dict[str, Any]:
+def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str = "single_male", is_test_5min: bool = False) -> dict[str, Any]:
     master = read_json_safe(target_dir / "03_aligned_master.json")
     clean_bed = target_dir / "04_clean_bed.wav"
     cfr_mp4 = target_dir / "01_cfr_raw.mp4"
@@ -522,13 +545,15 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
     out_base = OUTPUT_ROOT / work_rel / ("preview_5min" if is_test_5min else "")
     audio_out_dir = out_base / "audio"
     sub_out_dir = out_base / "subtitles"
+    info_out_dir = out_base / "_info"
     audio_out_dir.mkdir(parents=True, exist_ok=True)
     sub_out_dir.mkdir(parents=True, exist_ok=True)
+    info_out_dir.mkdir(parents=True, exist_ok=True)
 
     # 6A. Tiếng Việt (VieNeu)
     if "vi" in langs:
         vi_map = {k: v["vi"] for k, v in _load_jsonl_map(target_dir / "05b_sub_vi.jsonl").items()}
-        vi_files = _synth_vieneu_vi(target_dir, turns, vi_map, roles_map)
+        vi_files = _synth_vieneu_vi(target_dir, turns, vi_map, roles_map, voice_mode=voice_mode)
         emit_progress(35.0, "Đang trộn audio_vi.m4a lên nền sạch 04_clean_bed.wav...")
         _mix_track_streaming(turns, vi_files, clean_bed, audio_out_dir / "audio_vi.m4a")
         if (target_dir / "tracks" / "vi.srt").exists():
@@ -553,11 +578,15 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
                 qwen_holder.clear()
                 release_vram()
 
-    # Copy 2 mẫu clone vàng ra thư mục preview để cậu nghe thử dễ dàng trong bản Test 5 phút
+    qa_html = target_dir / "tracks" / "kiem_tra_dich.html"
+    if qa_html.exists():
+        shutil.copy2(qa_html, sub_out_dir / "kiem_tra_dich.html")
+
+    # Gom 2 mẫu clone + glossary vào thư mục phụ _info/ để thư mục thành phẩm gọn sạch
     for ref_name in ("04_ref_male.wav", "04_ref_female.wav", "glossary.json"):
         rp = target_dir / ref_name
         if rp.exists():
-            shutil.copy2(rp, out_base / ref_name)
+            shutil.copy2(rp, info_out_dir / ref_name)
 
     # 6C. Render MP4 thành phẩm
     emit_progress(86.0, "Đang render MP4 thành phẩm bằng GPU (NVENC/QSV)...")
@@ -576,7 +605,7 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
         "voice_mode": voice_mode,
         "output_mp4": str(out_mp4),
     }
-    atomic_write_json(out_base / "render_meta.json", meta)
+    atomic_write_json(info_out_dir / "render_meta.json", meta)
     emit_progress(100.0, f"Hoàn tất xuất phim ({mp4_name}, {elapsed}s)")
     print(f"[S6 DONE] {out_mp4} trong {elapsed}s", flush=True)
     return meta
@@ -587,7 +616,7 @@ def main():
     parser.add_argument("target_dir", type=Path, help="Thư mục work mục tiêu")
     parser.add_argument("--work-rel", required=True, help="Đường dẫn tương đối <Series>/<Part>")
     parser.add_argument("--langs", default="vi,en,ja,ko,es", help="Ngôn ngữ xuất")
-    parser.add_argument("--voice-mode", default="clone_2", choices=["clone_2", "voice_design"])
+    parser.add_argument("--voice-mode", default="single_male", choices=["single_male", "single_female", "clone_2", "voice_design"])
     parser.add_argument("--test-5min", action="store_true", help="Xuất vào thư mục preview_5min")
     args = parser.parse_args()
     langs = [x.strip().lower() for x in args.langs.split(",") if x.strip()]

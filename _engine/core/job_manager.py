@@ -227,8 +227,8 @@ class JobManager:
             with self._lock:
                 self._push_output_busy.discard(job_id)
 
-    def reset_downstream_cache(self, job_id: str, mode: str | None = None) -> dict[str, Any]:
-        """Xóa cache B2A -> B6 (giữ nguyên video/audio B1) để chạy lại test/full sạch theo bản vá mới."""
+    def reset_downstream_cache(self, job_id: str, mode: str | None = None, from_step: str = "s2a") -> dict[str, Any]:
+        """Xóa cache từ `from_step` ('s2a' hoặc 's5') -> B6 để chạy lại sạch theo bản vá mới."""
         import shutil
 
         with self._lock:
@@ -240,22 +240,30 @@ class JobManager:
             use_mode = mode or m.get("mode", "test_5min")
             work_dir = Path(m["work_dir"])
             target_dir = (work_dir / "_test_5min") if use_mode == "test_5min" else work_dir
-            for pat in ("02a*", "02b*", "03*", "04*", "05*", "glossary.json", "relationship_bible.json"):
+            if from_step == "s5":
+                pats = ("05*", "glossary.json", "relationship_bible.json")
+                dirs = ("tracks", "tts_cache")
+                step_keys = ("s5", "s6")
+            else:
+                pats = ("02a*", "02b*", "03*", "04*", "05*", "glossary.json", "relationship_bible.json")
+                dirs = ("keyframes", "tracks", "tts_cache")
+                step_keys = ("s2a", "s2b", "s3", "s4", "s5", "s6")
+            for pat in pats:
                 for p in target_dir.glob(pat):
                     if p.is_file():
                         p.unlink(missing_ok=True)
-            for dname in ("keyframes", "tracks", "tts_cache"):
+            for dname in dirs:
                 dp = target_dir / dname
                 if dp.exists():
                     shutil.rmtree(dp, ignore_errors=True)
-            for sk in ("s2a", "s2b", "s3", "s4", "s5", "s6"):
+            for sk in step_keys:
                 if sk in m.get("steps", {}):
                     m["steps"][sk].update({"status": "pending", "progress_pct": 0.0, "detail": "", "elapsed_s": 0.0})
             m["status"] = "paused"
             save_manifest(m)
-        self.append_log(job_id, f"[RESET] Đã dọn cache B2A -> B6 ({target_dir.name}), giữ nguyên B1.")
+        self.append_log(job_id, f"[RESET] Đã dọn cache từ {from_step} -> s6 ({target_dir.name}).")
         self._notify_ws()
-        return {"ok": True, "target_dir": str(target_dir)}
+        return {"ok": True, "target_dir": str(target_dir), "from_step": from_step}
 
     def add_or_attach_job(
         self,
@@ -263,7 +271,7 @@ class JobManager:
         work_rel: str | None = None,
         mode: str = "test_5min",
         langs: list[str] | None = None,
-        voice_mode: str = "clone_2",
+        voice_mode: str = "single_male",
         auto_sync_drive: bool = False,
         auto_start: bool = True,
         force_step1: bool = False,
@@ -315,7 +323,14 @@ class JobManager:
             self._notify_ws()
         return manifest
 
-    def enqueue_job(self, job_id: str, mode: str | None = None, force_step1: bool = False, target_stage: str = "auto"):
+    def enqueue_job(
+        self,
+        job_id: str,
+        mode: str | None = None,
+        force_step1: bool = False,
+        target_stage: str = "auto",
+        voice_mode: str | None = None,
+    ):
         with self._lock:
             m = self.jobs.get(job_id)
             if not m:
@@ -324,6 +339,8 @@ class JobManager:
                 return
             if mode:
                 m["mode"] = mode
+            if voice_mode:
+                m["voice_mode"] = voice_mode
             if target_stage == "auto":
                 has_cuda = self.telemetry._has_nvidia
                 target_stage = "all" if has_cuda else "s1"

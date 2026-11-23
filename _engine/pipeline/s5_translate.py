@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import html
 import json
 import os
 import re
@@ -370,22 +371,36 @@ def _phase5a_qwen_analyze(
                 )
 
             user_prompt = (
-                "Dựa vào lời thoại tiếng Trung, nhãn người nói `spk_id` và tần số giọng `f0_hz` "
-                "(Nam thường <175Hz, Nữ >=175Hz; ưu tiên ngữ cảnh khi F0 nhiễu), hãy xuất JSON gồm:\n"
-                "1) `glossary_add`: CHỈ chứa TÊN RIÊNG thực sự (họ tên nhân vật, tên công ty/tập đoàn, địa danh, bang phái) -> dict {tên_Trung: tên_Hán_Việt}. "
-                "TUYỆT ĐỐI KHÔNG cho danh từ chung, động từ, thành ngữ, khẩu ngữ hay chữ số (vd 外国佬, 小帅哥, 现金, 叠被子, 送命, 地下黑拳, 干死) vào `glossary_add`!\n"
-                "2) `roles`: list cho từng câu theo ĐÚNG số nguyên `id` (vd 1, 2, 3..., KHÔNG dùng `spk_id` làm `id`) với các trường: "
-                "`id`, `gender` ('MALE'|'FEMALE'), `age_tone` ('YOUNG'|'MATURE'), "
-                "`emotion` ('NEUTRAL'|'ANGRY'|'HAPPY'|'SAD'|'WHISPER'|'URGENT'), "
-                "`addressing` (gợi ý cặp xưng hô tiếng Việt ngắn gọn, vd 'tôi - cô', 'anh - em', 'tao - mày').\n\n"
+                "Đọc LIỀN MẠCH cả đoạn đối thoại tiếng Trung dưới đây để phân vai từng câu.\n"
+                "Lưu ý:\n"
+                "- `f0_hz` chỉ là tần số tham khảo (nữ nói trầm hoặc ồn có thể tụt xuống 155-175Hz; nam hét có thể lên >190Hz), "
+                "NÊN BẮT BUỘC ưu tiên mạch đối thoại & nội dung chữ (vd thấy '小帅哥' = nữ gọi nam trẻ; 3-4 câu liền nhau cùng ý = CÙNG 1 NGƯỜI).\n"
+                "- Xác định bối cảnh thời đại `era`: `'MODERN'` (phim hiện đại: tiền mặt/vạn tệ/công ty/xe hơi/quyền anh) hoặc `'HISTORICAL'` (cổ trang/tiên hiệp).\n"
+                "- Với phim `'MODERN'`: TUYỆT ĐỐI KHÔNG dùng đại từ cổ trang `'ta'`, `'ngươi'`, `'bổn tọa'`, `'tại hạ'`. "
+                "Hãy dùng xưng hô đời thường nhất quán suốt cả cảnh (vd Nữ chủ & khách: `'tôi'`/`'chị'` -> `'cậu'`; côn đồ tức giận: `'tao'` -> `'mày'`; đàn anh -> `'anh'`/`'cậu'`).\n\n"
+                "Xuất JSON gồm:\n"
+                "1) `era`: `'MODERN'` | `'HISTORICAL'`\n"
+                "2) `glossary_add`: CHỈ chứa TÊN RIÊNG thực sự (họ tên nhân vật, tên công ty, địa danh) -> dict {tên_Trung: tên_Hán_Việt}. KHÔNG cho danh từ/động từ thường.\n"
+                "3) `roles`: list cho từng câu theo ĐÚNG số nguyên `id` với các trường:\n"
+                "   - `id`: số nguyên\n"
+                "   - `gender`: `'MALE'` | `'FEMALE'`\n"
+                "   - `speaker_role`: vai ngắn gọn (vd `'Nữ chủ sòng'`, `'Nam chính'`, `'Đám đông'`)\n"
+                "   - `self_pronoun`: đại từ NGƯỜI NÓI tự xưng bằng Tiếng Việt (vd `'tôi'`, `'chị'`, `'anh'`, `'tao'`; CẤM `'anh'` nếu `gender='FEMALE'`!)\n"
+                "   - `other_pronoun`: đại từ NGƯỜI NÓI dùng gọi NGƯỜI NGHE (vd `'cậu'`, `'mày'`, `'em'`, `'ông'`)\n"
+                "   - `age_tone`: `'YOUNG'` | `'MATURE'`\n"
+                "   - `emotion`: `'NEUTRAL'` | `'ANGRY'` | `'HAPPY'` | `'SAD'` | `'WHISPER'` | `'URGENT'`\n\n"
                 f"Glossary hiện có: {json.dumps(glossary, ensure_ascii=False)}\n"
                 f"Danh sách câu:\n{json.dumps(packed, ensure_ascii=False)}"
             )
             res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.1)
             if isinstance(res, list):
-                res = {"glossary_add": {}, "roles": res}
+                res = {"era": "MODERN", "glossary_add": {}, "roles": res}
             elif not isinstance(res, dict):
                 res = {}
+
+            era = str(res.get("era") or "MODERN").upper()
+            if era not in ("MODERN", "HISTORICAL"):
+                era = "MODERN"
 
             raw_gloss = res.get("glossary_add")
             if isinstance(raw_gloss, dict):
@@ -427,12 +442,34 @@ def _phase5a_qwen_analyze(
                 emo = str(r.get("emotion") or "NEUTRAL").upper()
                 if emo not in ("NEUTRAL", "ANGRY", "HAPPY", "SAD", "WHISPER", "URGENT"):
                     emo = "NEUTRAL"
+
+                self_p = str(r.get("self_pronoun") or "").strip()
+                other_p = str(r.get("other_pronoun") or "").strip()
+                # Chặn cứng lỗi nữ tự xưng 'anh' hoặc phim hiện đại xưng cổ trang 'ta/ngươi'
+                if g == "FEMALE" and self_p.lower() in ("anh", "chú", "ông", "tao_male"):
+                    self_p = "chị" if age_t == "YOUNG" else "tôi"
+                if g == "MALE" and self_p.lower() in ("chị", "cô", "dì", "bà"):
+                    self_p = "tôi"
+                if era == "MODERN":
+                    if self_p.lower() in ("ta", "tại hạ", "bổn tọa", "bổn cô nương", ""):
+                        self_p = "tôi"
+                    if other_p.lower() in ("ngươi", "các hạ", "tiểu tử", ""):
+                        other_p = "cậu" if g == "FEMALE" else "mày/cậu"
+                self_p = self_p or "tôi"
+                other_p = other_p or "cậu"
+                spk_role = str(r.get("speaker_role") or ("Nhân vật nữ" if g == "FEMALE" else "Nhân vật nam")).strip()
+                addr = f"Người nói ({spk_role}, {g}) tự xưng '{self_p}', gọi người nghe là '{other_p}'"
+
                 item = {
                     "id": tid,
+                    "era": era,
                     "gender": g,
                     "age_tone": age_t,
                     "emotion": emo,
-                    "addressing": str(r.get("addressing") or "tôi - anh/cô"),
+                    "speaker_role": spk_role,
+                    "self_pronoun": self_p,
+                    "other_pronoun": other_p,
+                    "addressing": addr,
                 }
                 role_items.append(item)
                 done_roles[tid] = item
@@ -469,12 +506,11 @@ def _phase5b_gemma4_vi(
     emit_progress(35.0, f"Pha 5B: Nạp {model_id} dịch thoại Tiếng Việt...")
     sys_prompt = (
         "Bạn là biên kịch lồng tiếng phim ngắn Tiếng Việt hàng đầu. "
-        "Dịch tiếng Trung sang khẩu ngữ Tiếng Việt tự nhiên, đời thường, sắc sảo; "
-        "TUYỆT ĐỐI KHÔNG dịch sượng Hán-Việt các từ thông thường (vd dùng 'thằng Tây' chứ không dùng 'ngoại quốc lão', "
-        "'trai đẹp/cậu em' chứ không dùng 'tiểu tuấn hán', 'đánh quyền ngầm' chứ không dùng 'địa hạ hắc quyền', "
-        "'tiền mặt' chứ không dùng 'hiện kim', 'nộp mạng' chứ không dùng 'tống mệnh', 'gấp chăn' chứ không dùng 'điệp bị tử'). "
-        "Nếu chữ Trung gốc có lỗi OCR nhìn nhầm nét rõ ràng trong ngữ cảnh (vd '千死' trong cảnh đòi đánh -> hiểu đúng là '干死' = đánh chết), hãy dịch đúng theo ngữ cảnh. "
-        "Độ dài câu khớp thời lượng giây cho phép. Chỉ trả JSON hợp lệ."
+        "Dịch tiếng Trung sang khẩu ngữ Tiếng Việt HIỆN ĐẠI tự nhiên, đời thường, sắc sảo; "
+        "TUYỆT ĐỐI KHÔNG dùng đại từ cổ trang ('ta', 'ngươi', 'tại hạ', 'các hạ') khi bối cảnh là MODERN (hiện đại). "
+        "BẮT BUỘC tuân thủ đúng chiều xưng hô: người nói tự xưng theo `self_pronoun` (TUYỆT ĐỐI KHÔNG để nhân vật nữ tự xưng 'anh') và gọi người nghe theo `other_pronoun`, giữ nhất quán suốt cảnh đối thoại. "
+        "TUYỆT ĐỐI KHÔNG dịch sượng Hán-Việt các từ thông thường (dùng 'thằng Tây', 'cậu em', 'đánh quyền ngầm', 'tiền mặt', 'nộp mạng', 'gấp chăn'). "
+        "Độ dài câu khớp thời lượng `dur_s` giây. Chỉ trả JSON hợp lệ."
     )
     batch_size = 15
     zh_fb = cfg.get("models", {}).get("zh_analyst_model", "philbert440/Qwen3.8-27B-W4A16-AWQ")
@@ -482,6 +518,11 @@ def _phase5b_gemma4_vi(
     with ctx as (base_url, mid):
         for i in range(0, len(todo_turns), batch_size):
             batch = todo_turns[i : i + batch_size]
+            prev_ctx = [
+                {"id": int(pt["id"]), "speaker": roles_map.get(int(pt["id"]), {}).get("speaker_role", ""), "vi": done_map[int(pt["id"])]}
+                for pt in turns
+                if int(pt["id"]) < int(batch[0]["id"]) and int(pt["id"]) in done_map
+            ][-4:]
             packed = []
             for t in batch:
                 tid = int(t["id"])
@@ -491,16 +532,20 @@ def _phase5b_gemma4_vi(
                     {
                         "id": tid,
                         "dur_s": dur,
+                        "era": r.get("era", "MODERN"),
+                        "speaker": r.get("speaker_role", ""),
                         "gender": r.get("gender", "MALE"),
+                        "self_pronoun": r.get("self_pronoun", "tôi"),
+                        "other_pronoun": r.get("other_pronoun", "cậu"),
                         "emotion": r.get("emotion", "NEUTRAL"),
-                        "addressing": r.get("addressing", ""),
                         "zh": t["text"],
                     }
                 )
             user_prompt = (
-                f"Bảng tên nhân vật/địa danh (chỉ áp dụng đúng TÊN RIÊNG, bỏ qua nếu là danh từ/động từ thường): {json.dumps(glossary, ensure_ascii=False)}\n"
-                "Dịch từng câu sau sang Tiếng Việt ngắn gọn vừa miệng đọc trong `dur_s` giây, "
-                "tuân thủ đúng `addressing` và `emotion`. Trả JSON dạng: "
+                f"Bảng tên nhân vật/địa danh (chỉ áp dụng đúng TÊN RIÊNG): {json.dumps(glossary, ensure_ascii=False)}\n"
+                f"Ngữ cảnh 4 câu vừa dịch trước đó (để giữ mạch xưng hô liền lạc): {json.dumps(prev_ctx, ensure_ascii=False)}\n"
+                "Dịch từng câu sau sang Tiếng Việt hiện đại ngắn gọn vừa miệng đọc trong `dur_s` giây, "
+                "dùng ĐÚNG `self_pronoun` (người nói tự xưng) và `other_pronoun` (gọi đối phương). Trả JSON dạng: "
                 '`{"items": [{"id": 1, "vi": "..."}]}`.\n\n'
                 f"{json.dumps(packed, ensure_ascii=False)}"
             )
@@ -529,6 +574,81 @@ def _phase5b_gemma4_vi(
     return done_map
 
 
+def _build_qa_html_and_backtrans(
+    target_dir: Path,
+    turns: list[dict[str, Any]],
+    vi_map: dict[int, str],
+    lang_done: dict[str, dict[int, str]],
+    roles_map: dict[int, dict[str, Any]],
+    base_url: str,
+    mid: str,
+) -> Path:
+    """Dịch ngược nhanh các bản ngoại ngữ (EN/JA/KO/ES) sang Tiếng Việt để người dùng tự kiểm tra 100% độ chuẩn."""
+    foreign_langs = [lg for lg in lang_done.keys() if lang_done.get(lg)]
+    back_vi: dict[str, dict[int, str]] = {lg: {} for lg in foreign_langs}
+    sys_qa = "You are a bilingual quality reviewer. Back-translate each foreign subtitle line faithfully into concise Vietnamese so an editor can verify its meaning. Return ONLY valid JSON."
+
+    for lg in foreign_langs:
+        dmap = lang_done[lg]
+        for i in range(0, len(turns), 20):
+            chunk = turns[i : i + 20]
+            packed = [{"id": int(t["id"]), "txt": dmap.get(int(t["id"]), "")} for t in chunk if dmap.get(int(t["id"]))]
+            if not packed:
+                continue
+            try:
+                res = _chat_json(
+                    base_url,
+                    mid,
+                    sys_qa,
+                    f'Translate these {LANG_NAMES.get(lg, lg)} lines back into concise natural Vietnamese. Return JSON: {{"items": [{{"id": 1, "vi": "..."}}]}}.\n{json.dumps(packed, ensure_ascii=False)}',
+                    temp=0.05,
+                )
+                raw_items = res if isinstance(res, list) else (res.get("items") or [])
+                if isinstance(raw_items, dict):
+                    raw_items = [{"id": k, "vi": v} if not isinstance(v, dict) else {"id": k, **v} for k, v in raw_items.items()]
+                for x in raw_items:
+                    if isinstance(x, dict) and (xid := _safe_int(x.get("id"))) is not None:
+                        back_vi[lg][xid] = str(x.get("vi") or x.get("text") or "").strip()
+            except Exception as exc:
+                print(f"[S5 QA WARN] Back-translate {lg} bỏ qua ({exc})", flush=True)
+
+    cols = "".join(f"<th>{lg.upper()} &amp; Dịch ngược VI</th>" for lg in foreign_langs)
+    rows_html = []
+    for t in turns:
+        tid = int(t["id"])
+        r = roles_map.get(tid, {})
+        ts = f"{format_srt_ts(float(t['start']))[:-4]}→{format_srt_ts(float(t['end']))[:-4]}"
+        role_tag = html.escape(f"{r.get('speaker_role','')} ({r.get('self_pronoun','')}/{r.get('other_pronoun','')})")
+        fcells = []
+        for lg in foreign_langs:
+            ftxt = html.escape(lang_done[lg].get(tid, ""))
+            btxt = html.escape(back_vi[lg].get(tid, ""))
+            fcells.append(f"<td><div>{ftxt}</div><div class='bt'>↳ {btxt}</div></td>")
+        rows_html.append(
+            f"<tr><td>{tid}</td><td class='ts'>{ts}<div class='role'>{role_tag}</div></td>"
+            f"<td>{html.escape(str(t.get('text','')))}</td>"
+            f"<td class='vi'>{html.escape(vi_map.get(tid,''))}</td>{''.join(fcells)}</tr>"
+        )
+
+    doc = (
+        "<!doctype html><html lang='vi'><head><meta charset='utf-8'/>"
+        "<title>Bảng đối chiếu dịch 5 ngôn ngữ — MT Reel</title>"
+        "<style>body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:18px;margin:0}"
+        "h2{margin:0 0 12px}table{width:100%;border-collapse:collapse;font-size:13px}"
+        "th,td{border:1px solid #334155;padding:7px 9px;vertical-align:top;text-align:left}"
+        "th{background:#1e293b;position:sticky;top:0}.ts{white-space:nowrap;color:#94a3b8;font-size:12px}"
+        ".role{color:#38bdf8;font-size:11px;margin-top:2px}.vi{color:#86efac;font-weight:500}"
+        ".bt{color:#fde68a;font-size:12px;margin-top:3px}</style></head><body>"
+        f"<h2>Bảng đối chiếu &amp; kiểm tra dịch ngược ({len(turns)} câu)</h2>"
+        f"<table><thead><tr><th>#</th><th>Giờ / Vai</th><th>Trung gốc</th><th>Tiếng Việt</th>{cols}</tr></thead>"
+        f"<tbody>{''.join(rows_html)}</tbody></table></body></html>"
+    )
+    qa_path = target_dir / "tracks" / "kiem_tra_dich.html"
+    qa_path.parent.mkdir(parents=True, exist_ok=True)
+    qa_path.write_text(doc, encoding="utf-8")
+    return qa_path
+
+
 def _phase5c_translategemma_foreign(
     target_dir: Path,
     turns: list[dict[str, Any]],
@@ -538,12 +658,14 @@ def _phase5c_translategemma_foreign(
     cfg: dict[str, Any],
     force: bool = False,
     conn: tuple[str, str] | None = None,
+    vi_map: dict[int, str] | None = None,
 ):
-    """Pha 5C: Dùng Gemma 4 dịch sạch sang EN / JA / KO / ES."""
+    """Pha 5C: Dùng Gemma 4 dịch sạch sang EN / JA / KO / ES + xuất bảng dịch ngược Tiếng Việt để kiểm tra."""
     foreign_langs = [x for x in langs if x != "vi"]
     if not foreign_langs:
         return
 
+    vi_ref = vi_map or {k: v["vi"] for k, v in _load_jsonl_map(target_dir / "05b_sub_vi.jsonl").items()}
     need_any = False
     lang_done: dict[str, dict[int, str]] = {}
     for lang in foreign_langs:
@@ -555,7 +677,8 @@ def _phase5c_translategemma_foreign(
         if len(dmap) < len(turns):
             need_any = True
 
-    if not need_any:
+    qa_html = target_dir / "tracks" / "kiem_tra_dich.html"
+    if not need_any and qa_html.exists():
         for lang in foreign_langs:
             _write_srt(turns, lang_done[lang], target_dir / "tracks" / f"{lang}.srt")
         emit_progress(98.0, f"Tái sử dụng Pha 5C ({','.join(foreign_langs)})")
@@ -573,22 +696,27 @@ def _phase5c_translategemma_foreign(
             jp = target_dir / f"05c_sub_{lang}.jsonl"
             dmap = lang_done[lang]
             todo = [t for t in turns if int(t["id"]) not in dmap]
-            sys_prompt = f"You are a professional dubbing script translator. Translate Chinese dialogue into concise, natural spoken {lname}. Output ONLY valid JSON."
+            sys_prompt = (
+                f"You are a professional dubbing script translator for modern short dramas. "
+                f"Translate Chinese dialogue into concise, natural spoken {lname} matching character register (`speaker_role`, `self_pronoun`->`other_pronoun`) and `vi_ref` intent. Output ONLY valid JSON."
+            )
             for i in range(0, len(todo), batch_size):
                 batch = todo[i : i + batch_size]
                 packed = [
                     {
                         "id": int(t["id"]),
                         "dur_s": round(max(0.4, float(t["end"]) - float(t["start"])), 2),
+                        "speaker": roles_map.get(int(t["id"]), {}).get("speaker_role", ""),
                         "emotion": roles_map.get(int(t["id"]), {}).get("emotion", "NEUTRAL"),
+                        "vi_ref": vi_ref.get(int(t["id"]), ""),
                         "zh": t["text"],
                     }
                     for t in batch
                 ]
                 user_prompt = (
-                    f"Translate each Chinese line to natural spoken {lname} matching `dur_s` duration. "
+                    f"Translate each Chinese line to natural spoken {lname} matching `dur_s` duration and `vi_ref` context/politeness. "
                     f'Return JSON: {{"items": [{{"id": 1, "text": "..."}}]}}.\n'
-                    f"Glossary reference: {json.dumps(glossary, ensure_ascii=False)}\n"
+                    f"Proper-noun Glossary: {json.dumps(glossary, ensure_ascii=False)}\n"
                     f"Lines: {json.dumps(packed, ensure_ascii=False)}"
                 )
                 res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.15)
@@ -609,10 +737,13 @@ def _phase5c_translategemma_foreign(
                     dmap[tid] = txt
                     out_items.append({"id": tid, "text": txt})
                 _append_jsonl_batch(jp, out_items)
-                prog = 68.0 + ((l_idx + len(dmap) / max(1, len(turns))) / len(foreign_langs)) * 30.0
+                prog = 68.0 + ((l_idx + len(dmap) / max(1, len(turns))) / len(foreign_langs)) * 27.0
                 emit_progress(prog, f"Pha 5C ({lang.upper()}): {len(dmap)}/{len(turns)} câu")
 
             _write_srt(turns, dmap, target_dir / "tracks" / f"{lang}.srt")
+
+        emit_progress(96.0, "Đang xuất bảng dịch ngược 5 ngôn ngữ (kiem_tra_dich.html)...")
+        _build_qa_html_and_backtrans(target_dir, turns, vi_ref, lang_done, roles_map, base_url, mid)
 
 
 def run_step5(target_dir: Path, langs: list[str], glossary_in: Path | None = None, force: bool = False) -> dict[str, Any]:
@@ -645,12 +776,11 @@ def run_step5(target_dir: Path, langs: list[str], glossary_in: Path | None = Non
         zh_fb = models_cfg.get("zh_analyst_model", "philbert440/Qwen3.8-27B-W4A16-AWQ")
         emit_progress(35.0, f"Nạp {vi_model} dùng chung Pha 5B + 5C...")
         with _managed_vllm_with_fallback(vi_model, [zh_fb], cfg, "Pha 5B+5C") as conn:
-            _phase5b_gemma4_vi(target_dir, turns, glossary, roles_map, cfg, force=force, conn=conn)
-            _phase5c_translategemma_foreign(target_dir, turns, langs, glossary, roles_map, cfg, force=force, conn=conn)
+            vi_done = _phase5b_gemma4_vi(target_dir, turns, glossary, roles_map, cfg, force=force, conn=conn)
+            _phase5c_translategemma_foreign(target_dir, turns, langs, glossary, roles_map, cfg, force=force, conn=conn, vi_map=vi_done)
     else:
-        if need_vi:
-            _phase5b_gemma4_vi(target_dir, turns, glossary, roles_map, cfg, force=force)
-        _phase5c_translategemma_foreign(target_dir, turns, langs, glossary, roles_map, cfg, force=force)
+        vi_done = _phase5b_gemma4_vi(target_dir, turns, glossary, roles_map, cfg, force=force) if need_vi else None
+        _phase5c_translategemma_foreign(target_dir, turns, langs, glossary, roles_map, cfg, force=force, vi_map=vi_done)
 
     elapsed = round(time.perf_counter() - t0, 2)
     meta = {"elapsed_s": elapsed, "langs": langs, "turns": len(turns), "glossary_entries": len(glossary)}

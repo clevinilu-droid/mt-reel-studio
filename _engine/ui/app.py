@@ -97,7 +97,7 @@ class FromPathReq(BaseModel):
     work_rel: str | None = None
     mode: str = "test_5min"
     langs: list[str] = ["vi", "en", "ja", "ko", "es"]
-    voice_mode: str = "clone_2"
+    voice_mode: str = "single_male"
     auto_sync_drive: bool = False
     auto_start: bool = True
     force_step1: bool = False
@@ -107,7 +107,7 @@ class FromDriveReq(BaseModel):
     work_rel: str
     mode: str = "full"
     langs: list[str] = ["vi", "en", "ja", "ko", "es"]
-    voice_mode: str = "clone_2"
+    voice_mode: str = "single_male"
     auto_start: bool = True
 
 
@@ -123,6 +123,7 @@ class StartJobReq(BaseModel):
     mode: str | None = None
     force_step1: bool = False
     target_stage: str = "auto"
+    voice_mode: str | None = None
 
 
 class UploadInitReq(BaseModel):
@@ -135,7 +136,7 @@ class UploadFinishReq(BaseModel):
     work_rel: str | None = None
     mode: str = "test_5min"
     langs: list[str] = ["vi", "en", "ja", "ko", "es"]
-    voice_mode: str = "clone_2"
+    voice_mode: str = "single_male"
     auto_sync_drive: bool = False
     auto_start: bool = True
     force_step1: bool = False
@@ -244,7 +245,7 @@ def create_job_from_path(req: FromPathReq):
 @app.post("/api/jobs/{job_id}/start")
 def start_job(job_id: str, req: StartJobReq):
     try:
-        manager.enqueue_job(job_id, mode=req.mode, force_step1=req.force_step1, target_stage=req.target_stage)
+        manager.enqueue_job(job_id, mode=req.mode, force_step1=req.force_step1, target_stage=req.target_stage, voice_mode=req.voice_mode)
         return {"ok": True}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -257,9 +258,9 @@ def pause_job(job_id: str):
 
 
 @app.post("/api/jobs/{job_id}/reset")
-def reset_job(job_id: str, mode: str | None = None):
+def reset_job(job_id: str, mode: str | None = None, from_step: str = "s2a"):
     try:
-        return manager.reset_downstream_cache(job_id, mode=mode)
+        return manager.reset_downstream_cache(job_id, mode=mode, from_step=from_step)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:

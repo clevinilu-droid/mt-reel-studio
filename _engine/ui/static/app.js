@@ -232,7 +232,13 @@
     $("workContent").style.display = "block";
 
     $("wTitle").textContent = job.work_rel;
-    $("wSubtitle").textContent = `Ngôn ngữ: ${(job.langs || []).join(", ").toUpperCase()}  ·  Ngoại ngữ: ${job.voice_mode === "clone_2" ? "Clone 1 Nam + 1 Nữ" : "Voice Design"}`;
+    const voiceNames = {
+      single_male: "1 giọng Nam kể chuyện",
+      single_female: "1 giọng Nữ kể chuyện",
+      clone_2: "Clone 1 Nam + 1 Nữ",
+      voice_design: "Voice Design",
+    };
+    $("wSubtitle").textContent = `Ngôn ngữ: ${(job.langs || []).join(", ").toUpperCase()}  ·  Giọng đọc: ${voiceNames[job.voice_mode] || job.voice_mode || "1 giọng Nam"}`;
     $("wBadge").textContent = statusText(job.status);
     $("wBadge").className = `badge ${badgeClass(job.status)}`;
 
@@ -434,7 +440,7 @@
   }
 
   function readAddOptions(mode) {
-    const voice_mode = document.querySelector('input[name="voiceMode"]:checked')?.value || "clone_2";
+    const voice_mode = document.querySelector('input[name="voiceMode"]:checked')?.value || "single_male";
     const langs = [...document.querySelectorAll(".langCk:checked")].map((el) => el.value);
     const work_rel = $("workRelInput").value.trim() || null;
     const auto_sync_drive = $("autoDriveCk").checked;
