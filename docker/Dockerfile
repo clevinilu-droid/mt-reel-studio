@@ -52,14 +52,14 @@ RUN uv venv /opt/venvs/tts_ui --python python3.11 && \
       fastapi "uvicorn[standard]" python-multipart websockets pydantic python-dotenv \
       hf-transfer soundfile numpy
 
-# 5. FFmpeg bản mới (hỗ trợ -fps_mode & NVENC chuẩn) + bật NVIDIA video encode/decode
+# 5. FFmpeg bản Jellyfin 7.1 (hỗ trợ NVENC API 12.0 cho mọi driver >= 520 + -fps_mode chuẩn)
 # Đặt SAU 3 venv để giữ nguyên 100% cache build từ các tầng trên
-RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends xz-utils && rm -rf /var/lib/apt/lists/* && \
-    curl -fsSL https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz -o /tmp/ffmpeg.tar.xz && \
-    tar -xJf /tmp/ffmpeg.tar.xz -C /tmp && \
-    cp /tmp/ffmpeg-*/bin/ffmpeg /tmp/ffmpeg-*/bin/ffprobe /usr/local/bin/ && \
-    chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe && \
-    rm -rf /tmp/ffmpeg*
+RUN apt-get update -qq && \
+    curl -fsSL https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/v7.1.4-3/jellyfin-ffmpeg7_7.1.4-3-jammy_amd64.deb -o /tmp/jffmpeg.deb && \
+    apt-get install -y -qq --no-install-recommends /tmp/jffmpeg.deb && \
+    rm -f /tmp/jffmpeg.deb && rm -rf /var/lib/apt/lists/* && \
+    ln -sf /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg && \
+    ln -sf /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe
 
 # 6. Venv 4: VoxCPM2 (giọng ngoại ngữ tự nhiên 48kHz, tách biệt dependency khỏi tts_ui)
 RUN uv venv /opt/venvs/voxcpm --python python3.11 && \
