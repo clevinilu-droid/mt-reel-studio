@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import inspect
 import json
 import re
 import sys
@@ -74,6 +75,19 @@ def main() -> int:
         device=device,
     )
     sr = int(getattr(model.tts_model, "sample_rate", 48000))
+    gen_params = set(inspect.signature(model._generate).parameters.keys())
+
+    def _call_generate(**kwargs):
+        seed_val = kwargs.pop("seed", None)
+        if seed_val is not None:
+            if "seed" in gen_params:
+                kwargs["seed"] = seed_val
+            else:
+                torch.manual_seed(int(seed_val))
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(int(seed_val))
+        filtered = {k: v for k, v in kwargs.items() if k in gen_params}
+        return model.generate(**filtered)
 
     needed_genders = sorted({str(t.get("gender", "FEMALE")).upper() for t in tasks})
     active_refs: dict[str, str] = {}
@@ -97,7 +111,7 @@ def main() -> int:
             ap.parent.mkdir(parents=True, exist_ok=True)
             persona = VOICE_DESIGN_PERSONAS.get(g, VOICE_DESIGN_PERSONAS["FEMALE"])
             print(f"[VOXCPM] Tạo giọng mẫu nhân tạo {lang.upper()} ({g}) bằng Voice Design...", flush=True)
-            wav_anchor = model.generate(
+            wav_anchor = _call_generate(
                 text=f"{persona}{anchor_text}",
                 cfg_value=2.0,
                 inference_timesteps=12,
@@ -130,7 +144,7 @@ def main() -> int:
         ref_wav = active_refs.get(g)
         if ref_wav:
             prompt_text = f"{ctrl}{clean_txt}"
-            wav = model.generate(
+            wav = _call_generate(
                 text=prompt_text,
                 reference_wav_path=ref_wav,
                 cfg_value=2.0,
@@ -144,7 +158,7 @@ def main() -> int:
             )
         else:
             persona = VOICE_DESIGN_PERSONAS.get(g, VOICE_DESIGN_PERSONAS["FEMALE"])
-            wav = model.generate(
+            wav = _call_generate(
                 text=f"{persona}{clean_txt}",
                 cfg_value=2.0,
                 inference_timesteps=10,
