@@ -56,16 +56,27 @@ def _load_jsonl_map(path: Path) -> dict[int, dict[str, Any]]:
 
 
 def _pick_vieneu_voice(role: dict[str, Any], stock_cfg: dict[str, Any]) -> str:
-    """Ánh xạ giới tính + độ tuổi sang 1 trong 4 giọng chuẩn của VieNeu."""
+    """Ánh xạ giới tính + độ tuổi sang 1 trong 4 giọng chuẩn trong `vieneu_stock_cast.json`."""
     g = str(role.get("gender", "MALE")).upper()
     age = str(role.get("age_tone", "YOUNG")).upper()
-    arch = ("NU_TRUNG" if age == "MATURE" else "NU_TRE") if g == "FEMALE" else ("NAM_GIA" if age == "MATURE" else "NAM_TRE")
+    arch = ("NU_GIA" if age == "MATURE" else "NU_TRE") if g == "FEMALE" else ("NAM_GIA" if age == "MATURE" else "NAM_TRE")
+    roles_cfg = stock_cfg.get("roles", {})
+    if isinstance(roles_cfg, dict):
+        entry = roles_cfg.get(arch) or roles_cfg.get("NAM_TRE")
+        if isinstance(entry, dict) and entry.get("voice"):
+            return str(entry["voice"])
+        if isinstance(entry, str) and entry:
+            return entry
     archetypes = stock_cfg.get("archetypes", {})
-    return archetypes.get(arch) or archetypes.get("NAM_TRE") or "Vinh (nam miền Nam)"
+    if isinstance(archetypes, dict):
+        pick = archetypes.get(arch) or archetypes.get("NAM_TRE")
+        if pick:
+            return str(pick)
+    return "Hải Đăng"
 
 
 def _synth_vieneu_vi(target_dir: Path, turns: list[dict[str, Any]], vi_map: dict[int, str], roles_map: dict[int, dict[str, Any]]) -> list[Path]:
-    """Tạo giọng đọc Tiếng Việt theo batch bằng VieNeu TTS + cache từng câu."""
+    """Tạo giọng đọc Tiếng Việt theo batch bằng VieNeu TTS v3turbo (PyTorch GPU / ONNX CPU) + cache từng câu."""
     cache_dir = target_dir / "tts_cache" / "vi"
     cache_dir.mkdir(parents=True, exist_ok=True)
     stock_cfg = read_json_safe(ENGINE_DIR / "config" / "vieneu_stock_cast.json") or {}
@@ -86,7 +97,8 @@ def _synth_vieneu_vi(target_dir: Path, turns: list[dict[str, Any]], vi_map: dict
         emit_progress(30.0, f"Tái sử dụng cache VieNeu VI ({len(turns)} câu)")
         return turn_paths
 
-    emit_progress(5.0, f"Đang nạp VieNeu TTS ({len(todo)} câu Tiếng Việt)...")
+    mode = str(stock_cfg.get("mode") or "v3turbo").strip()
+    emit_progress(5.0, f"Đang nạp VieNeu TTS ({mode}, {len(todo)} câu Tiếng Việt)...")
     from vieneu import Vieneu
 
     try:
@@ -96,7 +108,10 @@ def _synth_vieneu_vi(target_dir: Path, turns: list[dict[str, Any]], vi_map: dict
     except Exception:
         use_cuda = False
 
-    tts = Vieneu(mode="standard", backbone_device="cuda" if use_cuda else "cpu", codec_device="cuda" if use_cuda else "cpu")
+    if mode in ("v3turbo", "v3nano"):
+        tts = Vieneu(mode=mode, device="cuda" if use_cuda else "cpu")
+    else:
+        tts = Vieneu(mode=mode, backbone_device="cuda" if use_cuda else "cpu", codec_device="cuda" if use_cuda else "cpu")
     voice_cache: dict[str, Any] = {}
 
     # Gom theo từng giọng để chạy infer_batch tốc độ cao trên RTX 3090
@@ -107,7 +122,11 @@ def _synth_vieneu_vi(target_dir: Path, turns: list[dict[str, Any]], vi_map: dict
     done = 0
     for vid, items in by_voice.items():
         if vid not in voice_cache:
-            voice_cache[vid] = tts.get_preset_voice(vid)
+            try:
+                voice_cache[vid] = tts.get_preset_voice(vid)
+            except Exception as exc:
+                print(f"[S6 VIENEU WARN] Không thấy giọng '{vid}' ({exc}) -> dùng giọng mặc định.", flush=True)
+                voice_cache[vid] = tts.get_preset_voice(None)
         v_obj = voice_cache[vid]
         bsz = 32 if use_cuda else 1
         for i in range(0, len(items), bsz):
@@ -138,6 +157,7 @@ def _synth_qwen3_tts_foreign(
     cfg: dict[str, Any],
     prog_base: float,
     prog_span: float,
+    model_holder: dict[str, Any] | None = None,
 ) -> list[Path]:
     """Tạo giọng đọc EN / JA / KO / ES bằng Qwen3-TTS-1.7B (Clone 1 Nam + 1 Nữ hoặc Voice Design)."""
     cache_dir = target_dir / "tts_cache" / lang
@@ -173,10 +193,18 @@ def _synth_qwen3_tts_foreign(
         if use_clone
         else models_cfg.get("tts_foreign_design_model", "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign")
     )
-    emit_progress(prog_base, f"Nạp Qwen3-TTS ({lang.upper()}, {'Clone 1 Nam/1 Nữ' if use_clone else 'Voice Design'})...")
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    model = Qwen3TTSModel.from_pretrained(model_id, device_map=device, dtype=dtype)
+    own_model = model_holder is None
+    if model_holder is not None and model_holder.get("model_id") == model_id and model_holder.get("model") is not None:
+        model = model_holder["model"]
+        emit_progress(prog_base, f"Dùng lại Qwen3-TTS cho {lang.upper()} ({len(todo)} câu)...")
+    else:
+        emit_progress(prog_base, f"Nạp Qwen3-TTS ({lang.upper()}, {'Clone 1 Nam/1 Nữ' if use_clone else 'Voice Design'})...")
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        model = Qwen3TTSModel.from_pretrained(model_id, device_map=device, dtype=dtype)
+        if model_holder is not None:
+            model_holder["model_id"] = model_id
+            model_holder["model"] = model
     q_lang = QWEN_LANG_MAP.get(lang, "English")
 
     for idx, (tid, txt, r, wp) in enumerate(todo, start=1):
@@ -196,8 +224,9 @@ def _synth_qwen3_tts_foreign(
         if idx % 5 == 0 or idx == len(todo):
             emit_progress(prog_base + (idx / len(todo)) * prog_span, f"Qwen3-TTS {lang.upper()}: {idx}/{len(todo)} câu")
 
-    del model
-    release_vram()
+    if own_model:
+        del model
+        release_vram()
     return turn_paths
 
 
@@ -329,7 +358,30 @@ def _render_master_mp4(cfr_mp4: Path, master_audio: Path, master_srt: Path | Non
         cmd += ["-map", f"{sub_idx}:0", "-c:s", "mov_text", "-metadata:s:s:0", "language=vie"]
     cmd.append(str(out_mp4))
     print(f"[S6 RENDER] Encoder={enc_name} -> {out_mp4}", flush=True)
-    subprocess.run(cmd, check=True)
+    res = subprocess.run(cmd)
+    if res.returncode != 0 and enc_name != "libx264":
+        print(f"[S6 RENDER WARN] {enc_name} lỗi (exit={res.returncode}) -> tự chuyển sang libx264...", flush=True)
+        fb_cmd = ["ffmpeg", "-y", "-v", "warning", "-i", str(cfr_mp4), "-i", str(master_audio)]
+        if wm_idx is not None:
+            fb_cmd += ["-i", str(wm_png)]
+        if sub_idx is not None:
+            fb_cmd += ["-i", str(master_srt)]
+        if wm_idx is not None:
+            fb_cmd += [
+                "-filter_complex",
+                f"[{wm_idx}:v]scale=iw*0.92:-1,format=rgba,colorchannelmixer=aa=0.82[wm];[0:v][wm]overlay=(W-w)/2:H*0.03[vout]",
+                "-map",
+                "[vout]",
+            ]
+        else:
+            fb_cmd += ["-map", "0:v:0"]
+        fb_cmd += ["-map", "1:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-c:a", "copy", "-movflags", "+faststart"]
+        if sub_idx is not None:
+            fb_cmd += ["-map", f"{sub_idx}:0", "-c:s", "mov_text", "-metadata:s:s:0", "language=vie"]
+        fb_cmd.append(str(out_mp4))
+        subprocess.run(fb_cmd, check=True)
+    elif res.returncode != 0:
+        raise subprocess.CalledProcessError(res.returncode, cmd)
 
 
 def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str = "clone_2", is_test_5min: bool = False) -> dict[str, Any]:
@@ -359,16 +411,24 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
         if (target_dir / "tracks" / "vi.srt").exists():
             shutil.copy2(target_dir / "tracks" / "vi.srt", sub_out_dir / "vi.srt")
 
-    # 6B. Ngoại ngữ (Qwen3-TTS-1.7B)
+    # 6B. Ngoại ngữ (Qwen3-TTS-1.7B — nạp 1 lần dùng chung cho cả EN/JA/KO/ES)
     foreign_langs = [x for x in langs if x != "vi"]
     if foreign_langs:
         span = 45.0 / len(foreign_langs)
-        for idx, lang in enumerate(foreign_langs):
-            tmap = {k: v["text"] for k, v in _load_jsonl_map(target_dir / f"05c_sub_{lang}.jsonl").items()}
-            wavs = _synth_qwen3_tts_foreign(target_dir, lang, turns, tmap, roles_map, voice_mode, cfg, 38.0 + idx * span, span * 0.85)
-            _mix_track_streaming(turns, wavs, clean_bed, audio_out_dir / f"audio_{lang}.m4a")
-            if (target_dir / "tracks" / f"{lang}.srt").exists():
-                shutil.copy2(target_dir / "tracks" / f"{lang}.srt", sub_out_dir / f"{lang}.srt")
+        qwen_holder: dict[str, Any] = {}
+        try:
+            for idx, lang in enumerate(foreign_langs):
+                tmap = {k: v["text"] for k, v in _load_jsonl_map(target_dir / f"05c_sub_{lang}.jsonl").items()}
+                wavs = _synth_qwen3_tts_foreign(
+                    target_dir, lang, turns, tmap, roles_map, voice_mode, cfg, 38.0 + idx * span, span * 0.85, model_holder=qwen_holder
+                )
+                _mix_track_streaming(turns, wavs, clean_bed, audio_out_dir / f"audio_{lang}.m4a")
+                if (target_dir / "tracks" / f"{lang}.srt").exists():
+                    shutil.copy2(target_dir / "tracks" / f"{lang}.srt", sub_out_dir / f"{lang}.srt")
+        finally:
+            if qwen_holder:
+                qwen_holder.clear()
+                release_vram()
 
     # Copy 2 mẫu clone vàng ra thư mục preview để cậu nghe thử dễ dàng trong bản Test 5 phút
     for ref_name in ("04_ref_male.wav", "04_ref_female.wav", "glossary.json"):
