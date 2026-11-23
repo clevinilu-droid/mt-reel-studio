@@ -546,7 +546,7 @@ def _phase5a_qwen_analyze(
             _append_jsonl_batch(roles_jsonl, role_items)
 
             pct = 8.0 + (len(done_roles) / max(1, len(turns))) * 25.0
-            emit_progress(pct, f"Pha 5A Qwen: đã phân vai {len(done_roles)}/{len(turns)} câu")
+            emit_progress(pct, f"Pha 5A Gemma 4: đã phân tích vai & xưng hô {len(done_roles)}/{len(turns)} câu")
 
     atomic_write_json(glossary_path, glossary)
     atomic_write_json(bible_path, bible)

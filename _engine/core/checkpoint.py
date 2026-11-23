@@ -24,11 +24,11 @@ OUTPUT_ROOT = ROOT_DIR / "output"
 PIPELINE_STEPS = [
     ("s1", "Bước 1 — Chuẩn hóa CFR GPU + WAV + Audit gốc"),
     ("s2a", "Bước 2A — Nghe thoại & Gom người nói (FunASR)"),
-    ("s2b", "Bước 2B — Lọc Keyframe & Đọc sub (PyAV + Qwen)"),
+    ("s2b", "Bước 2B — Lọc Keyframe & Đọc sub (PyAV + RapidOCR CUDA)"),
     ("s3", "Bước 3 — Đối chiếu Pinyin & Cứu hộ câu sót"),
     ("s4", "Bước 4 — Tách giọng vùng thoại (BS-RoFormer) giữ trọn SFX gốc"),
-    ("s5", "Bước 5 — Phân vai (Qwen) & Dịch Việt/Ngoại ngữ (Gemma 4)"),
-    ("s6", "Bước 6 — Lồng tiếng (VieNeu + Qwen3-TTS) & Render"),
+    ("s5", "Bước 5 — Phân tích quan hệ & Dịch thoại (Gemma 4 26B)"),
+    ("s6", "Bước 6 — Lồng tiếng Nữ (VieNeu + VoxCPM2) & Render"),
 ]
 
 
