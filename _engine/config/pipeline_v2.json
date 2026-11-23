@@ -13,7 +13,7 @@
     "whisper_cuda_model": "large-v3-turbo",
     "whisper_cpu_model": "small",
     "ocr_vlm_model": "Qwen/Qwen3.5-4B",
-    "zh_analyst_model": "philbert440/Qwen3.8-27B-W4A16-AWQ",
+    "zh_analyst_model": "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
     "vi_translate_model": "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
     "foreign_translate_model": "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
     "separator_model": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",

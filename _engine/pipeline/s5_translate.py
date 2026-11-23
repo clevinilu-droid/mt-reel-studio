@@ -324,8 +324,9 @@ def _phase5a_qwen_analyze(
     cfg: dict[str, Any],
     base_glossary: dict[str, Any],
     force: bool = False,
+    conn: tuple[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[int, dict[str, Any]]]:
-    """Pha 5A: Dùng Qwen3.5/3.8 lập Glossary tiếng Trung + phân vai giới tính/tuổi/cảm xúc/xưng hô."""
+    """Pha 5A: Dùng Gemma 4 lập Glossary tên riêng + phân vai nhân vật & xưng hô nhất quán."""
     roles_jsonl = target_dir / "05a_roles.jsonl"
     glossary_path = target_dir / "glossary.json"
     bible_path = target_dir / "relationship_bible.json"
@@ -338,25 +339,38 @@ def _phase5a_qwen_analyze(
 
     todo_turns = [t for t in turns if int(t["id"]) not in done_roles]
     if not todo_turns and glossary_path.exists():
-        emit_progress(32.0, f"Tái sử dụng Pha 5A Qwen ({len(done_roles)} câu đã phân vai)")
+        emit_progress(32.0, f"Tái sử dụng Pha 5A ({len(done_roles)} câu đã phân vai)")
         return glossary, done_roles
 
-    model_id = cfg.get("models", {}).get("zh_analyst_model", "mattbucci/Qwen3.8-27B-AWQ")
+    model_id = cfg.get("models", {}).get("zh_analyst_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit")
     fallback_models = [
-        cfg.get("models", {}).get("zh_analyst_model", "philbert440/Qwen3.8-27B-W4A16-AWQ"),
-        "philbert440/Qwen3.8-27B-W4A16-AWQ",
+        model_id,
         cfg.get("models", {}).get("vi_translate_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit"),
+        "philbert440/Qwen3.8-27B-W4A16-AWQ",
     ]
-    emit_progress(5.0, f"Pha 5A: Nạp {model_id} phân tích tiếng Trung & phân vai...")
+    emit_progress(5.0, f"Pha 5A: Nạp {model_id} phân tích ngữ cảnh & phân vai...")
 
     sys_prompt = (
         "Bạn là biên kịch kiêm đạo diễn lồng tiếng chuyên phim ngắn Trung Quốc. "
         "Trả về DUY NHẤT JSON hợp lệ, không giải thích thêm."
     )
-    batch_size = 15
-    with _managed_vllm_with_fallback(model_id, fallback_models, cfg, "Pha 5A") as (base_url, mid):
+    batch_size = 30
+    ctx = nullcontext(conn) if conn else _managed_vllm_with_fallback(model_id, fallback_models, cfg, "Pha 5A")
+    with ctx as (base_url, mid):
         for i in range(0, len(todo_turns), batch_size):
             batch = todo_turns[i : i + batch_size]
+            anchor_prev = [
+                {
+                    "id": int(pt["id"]),
+                    "speaker_role": done_roles[int(pt["id"])].get("speaker_role", ""),
+                    "gender": done_roles[int(pt["id"])].get("gender", ""),
+                    "self_pronoun": done_roles[int(pt["id"])].get("self_pronoun", ""),
+                    "other_pronoun": done_roles[int(pt["id"])].get("other_pronoun", ""),
+                    "zh": pt["text"],
+                }
+                for pt in turns
+                if int(pt["id"]) < int(batch[0]["id"]) and int(pt["id"]) in done_roles
+            ][-5:]
             packed = []
             for t in batch:
                 ac = acoustics_map.get(int(t["id"]), {})
@@ -372,12 +386,11 @@ def _phase5a_qwen_analyze(
 
             user_prompt = (
                 "Đọc LIỀN MẠCH cả đoạn đối thoại tiếng Trung dưới đây để phân vai từng câu.\n"
-                "Lưu ý:\n"
-                "- `f0_hz` chỉ là tần số tham khảo (nữ nói trầm hoặc ồn có thể tụt xuống 155-175Hz; nam hét có thể lên >190Hz), "
-                "NÊN BẮT BUỘC ưu tiên mạch đối thoại & nội dung chữ (vd thấy '小帅哥' = nữ gọi nam trẻ; 3-4 câu liền nhau cùng ý = CÙNG 1 NGƯỜI).\n"
-                "- Xác định bối cảnh thời đại `era`: `'MODERN'` (phim hiện đại: tiền mặt/vạn tệ/công ty/xe hơi/quyền anh) hoặc `'HISTORICAL'` (cổ trang/tiên hiệp).\n"
-                "- Với phim `'MODERN'`: TUYỆT ĐỐI KHÔNG dùng đại từ cổ trang `'ta'`, `'ngươi'`, `'bổn tọa'`, `'tại hạ'`. "
-                "Hãy dùng xưng hô đời thường nhất quán suốt cả cảnh (vd Nữ chủ & khách: `'tôi'`/`'chị'` -> `'cậu'`; côn đồ tức giận: `'tao'` -> `'mày'`; đàn anh -> `'anh'`/`'cậu'`).\n\n"
+                "Lưu ý QUAN TRỌNG:\n"
+                "- `f0_hz` chỉ là tham khảo thô; phải suy luận người nói theo MẠCH HỘI THOẠI liên tiếp (cùng 1 người nói liên tục 3-5 câu thì PHẢI giữ y hệt `speaker_role`, `gender`, `self_pronoun`, `other_pronoun`!).\n"
+                "- Đặc biệt nếu nhân vật đang xưng `'tôi' - 'cậu'` (hoặc `'chị' - 'cậu'`) thì KHÔNG ĐƯỢC tự dưng nhảy sang `'tao' - 'mày'` ở câu kế tiếp của chính người đó!\n"
+                "- Xác định `era`: `'MODERN'` (phim hiện đại) hoặc `'HISTORICAL'` (cổ trang). Với `'MODERN'` CẤM dùng `'ta'`, `'ngươi'`, `'tại hạ'`.\n\n"
+                f"5 câu neo ngay trước đó (giữ nguyên xưng hô liên mạch): {json.dumps(anchor_prev, ensure_ascii=False)}\n"
                 "Xuất JSON gồm:\n"
                 "1) `era`: `'MODERN'` | `'HISTORICAL'`\n"
                 "2) `glossary_add`: CHỈ chứa TÊN RIÊNG thực sự (họ tên nhân vật, tên công ty, địa danh) -> dict {tên_Trung: tên_Hán_Việt}. KHÔNG cho danh từ/động từ thường.\n"
@@ -385,8 +398,8 @@ def _phase5a_qwen_analyze(
                 "   - `id`: số nguyên\n"
                 "   - `gender`: `'MALE'` | `'FEMALE'`\n"
                 "   - `speaker_role`: vai ngắn gọn (vd `'Nữ chủ sòng'`, `'Nam chính'`, `'Đám đông'`)\n"
-                "   - `self_pronoun`: đại từ NGƯỜI NÓI tự xưng bằng Tiếng Việt (vd `'tôi'`, `'chị'`, `'anh'`, `'tao'`; CẤM `'anh'` nếu `gender='FEMALE'`!)\n"
-                "   - `other_pronoun`: đại từ NGƯỜI NÓI dùng gọi NGƯỜI NGHE (vd `'cậu'`, `'mày'`, `'em'`, `'ông'`)\n"
+                "   - `self_pronoun`: đại từ NGƯỜI NÓI tự xưng (vd `'tôi'`, `'chị'`, `'anh'`, `'tao'`; CẤM `'anh'` nếu `gender='FEMALE'`!)\n"
+                "   - `other_pronoun`: đại từ gọi NGƯỜI NGHE (vd `'cậu'`, `'mày'`, `'em'`, `'ông'`)\n"
                 "   - `age_tone`: `'YOUNG'` | `'MATURE'`\n"
                 "   - `emotion`: `'NEUTRAL'` | `'ANGRY'` | `'HAPPY'` | `'SAD'` | `'WHISPER'` | `'URGENT'`\n\n"
                 f"Glossary hiện có: {json.dumps(glossary, ensure_ascii=False)}\n"
@@ -506,15 +519,17 @@ def _phase5b_gemma4_vi(
     emit_progress(35.0, f"Pha 5B: Nạp {model_id} dịch thoại Tiếng Việt...")
     sys_prompt = (
         "Bạn là biên kịch lồng tiếng phim ngắn Tiếng Việt hàng đầu. "
-        "Dịch tiếng Trung sang khẩu ngữ Tiếng Việt HIỆN ĐẠI tự nhiên, đời thường, sắc sảo; "
-        "TUYỆT ĐỐI KHÔNG dùng đại từ cổ trang ('ta', 'ngươi', 'tại hạ', 'các hạ') khi bối cảnh là MODERN (hiện đại). "
-        "BẮT BUỘC tuân thủ đúng chiều xưng hô: người nói tự xưng theo `self_pronoun` (TUYỆT ĐỐI KHÔNG để nhân vật nữ tự xưng 'anh') và gọi người nghe theo `other_pronoun`, giữ nhất quán suốt cảnh đối thoại. "
-        "TUYỆT ĐỐI KHÔNG dịch sượng Hán-Việt các từ thông thường (dùng 'thằng Tây', 'cậu em', 'đánh quyền ngầm', 'tiền mặt', 'nộp mạng', 'gấp chăn'). "
-        "Độ dài câu khớp thời lượng `dur_s` giây. Chỉ trả JSON hợp lệ."
+        "Dịch SÁT NGHĨA và tự nhiên khẩu ngữ Tiếng Việt HIỆN ĐẠI (vd '干死/千死这个外国佬' = 'Đánh chết thằng Tây này đi!', "
+        "'小帅哥想试试' = 'Cậu em muốn thử không?', '叠被子比赛' = 'Thi gấp chăn', '送命' = 'Nộp mạng', '地下黑拳' = 'đánh quyền ngầm', '现金' = 'tiền mặt'). "
+        "TUYỆT ĐỐI giữ nguyên MỘT cặp xưng hô xuyên suốt cho cùng 1 người nói trong một cuộc hội thoại — "
+        "KHÔNG BAO GIỜ đang xưng 'tôi' lại nhảy sang 'tao' hay ngược lại ở câu liền kề của chính nhân vật đó; "
+        "TUYỆT ĐỐI KHÔNG dùng 'ta/ngươi' ở phim hiện đại và KHÔNG để nữ xưng 'anh'. "
+        "Chỉ trả JSON hợp lệ."
     )
-    batch_size = 15
-    zh_fb = cfg.get("models", {}).get("zh_analyst_model", "philbert440/Qwen3.8-27B-W4A16-AWQ")
+    batch_size = 30
+    zh_fb = cfg.get("models", {}).get("zh_analyst_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit")
     ctx = nullcontext(conn) if conn else _managed_vllm_with_fallback(model_id, [zh_fb], cfg, "Pha 5B")
+    ran_translation = False
     with ctx as (base_url, mid):
         for i in range(0, len(todo_turns), batch_size):
             batch = todo_turns[i : i + batch_size]
@@ -522,7 +537,7 @@ def _phase5b_gemma4_vi(
                 {"id": int(pt["id"]), "speaker": roles_map.get(int(pt["id"]), {}).get("speaker_role", ""), "vi": done_map[int(pt["id"])]}
                 for pt in turns
                 if int(pt["id"]) < int(batch[0]["id"]) and int(pt["id"]) in done_map
-            ][-4:]
+            ][-6:]
             packed = []
             for t in batch:
                 tid = int(t["id"])
@@ -543,13 +558,13 @@ def _phase5b_gemma4_vi(
                 )
             user_prompt = (
                 f"Bảng tên nhân vật/địa danh (chỉ áp dụng đúng TÊN RIÊNG): {json.dumps(glossary, ensure_ascii=False)}\n"
-                f"Ngữ cảnh 4 câu vừa dịch trước đó (để giữ mạch xưng hô liền lạc): {json.dumps(prev_ctx, ensure_ascii=False)}\n"
-                "Dịch từng câu sau sang Tiếng Việt hiện đại ngắn gọn vừa miệng đọc trong `dur_s` giây, "
-                "dùng ĐÚNG `self_pronoun` (người nói tự xưng) và `other_pronoun` (gọi đối phương). Trả JSON dạng: "
-                '`{"items": [{"id": 1, "vi": "..."}]}`.\n\n'
+                f"Ngữ cảnh 6 câu vừa dịch trước đó (bắt buộc giữ nhất quán xưng hô): {json.dumps(prev_ctx, ensure_ascii=False)}\n"
+                "Dịch từng câu sau sang Tiếng Việt hiện đại ngắn gọn, sát nghĩa gốc, vừa miệng đọc trong `dur_s` giây. "
+                "Lưu ý: nếu cùng 1 nhân vật nói nhiều câu liên tiếp, phải dùng THỐNG NHẤT một kiểu xưng hô (không tự nhảy tôi ↔ tao giữa chừng!). "
+                'Trả JSON dạng: `{"items": [{"id": 1, "vi": "..."}]}`.\n\n'
                 f"{json.dumps(packed, ensure_ascii=False)}"
             )
-            res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.25)
+            res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.15)
             raw_items = res if isinstance(res, list) else (res.get("items") or res.get("roles") or [])
             if isinstance(raw_items, dict):
                 raw_items = [{"id": k, "vi": v} if not isinstance(v, dict) else {"id": k, **v} for k, v in raw_items.items()]
@@ -567,8 +582,54 @@ def _phase5b_gemma4_vi(
                 done_map[tid] = vi_txt
                 out_items.append({"id": tid, "vi": vi_txt})
             _append_jsonl_batch(vi_jsonl, out_items)
-            pct = 36.0 + (len(done_map) / max(1, len(turns))) * 29.0
+            ran_translation = True
+            pct = 36.0 + (len(done_map) / max(1, len(turns))) * 22.0
             emit_progress(pct, f"Pha 5B Gemma 4 (VI): {len(done_map)}/{len(turns)} câu")
+
+        # Pha 5B.2: Rà soát nguyên cảnh để khóa cứng tính nhất quán xưng hô (chỉ sửa câu bị lệch xưng hô/lệch nghĩa)
+        if ran_translation or not (target_dir / "tracks" / "vi.srt").exists():
+            emit_progress(60.0, "Pha 5B.2: Gemma 4 rà soát nhất quán xưng hô toàn cảnh...")
+            polish_changed = False
+            for start_idx in range(0, len(turns), 40):
+                win_start = max(0, start_idx - 6)
+                window_turns = turns[win_start : start_idx + 40]
+                script_rows = [
+                    {
+                        "id": int(t["id"]),
+                        "speaker": roles_map.get(int(t["id"]), {}).get("speaker_role", ""),
+                        "zh": t["text"],
+                        "vi": done_map.get(int(t["id"]), t["text"]),
+                    }
+                    for t in window_turns
+                ]
+                polish_prompt = (
+                    "Đọc TOÀN BỘ đoạn hội thoại Tiếng Trung (`zh`) và bản dịch Tiếng Việt (`vi`) dưới đây từ đầu tới cuối.\n"
+                    "Chỉ sửa lại `vi` của những câu nào bị 1 trong 3 lỗi sau:\n"
+                    "1) CÙNG 1 NGƯỜI đang nói liên tục trong cảnh mà bị nhảy xưng hô (ví dụ câu trước xưng 'tôi' câu sau nhảy 'tao', hoặc câu trước 'em' câu sau 'mày' — phải thống nhất lại theo mạch vai vế!).\n"
+                    "2) Nhân vật NỮ tự xưng 'anh' hoặc dùng từ cổ trang 'ta/ngươi' trong phim hiện đại.\n"
+                    "3) Dịch chưa sát sắc thái câu gốc (vd '千死/干死这个外国佬' phải dứt khoát là 'Đánh chết thằng Tây này đi!' hoặc 'Giết chết thằng Tây này đi!').\n"
+                    'Trả JSON chỉ gồm các câu cần sửa (hoặc toàn bộ): `{"items": [{"id": 1, "vi": "..."}]}`.\n\n'
+                    f"{json.dumps(script_rows, ensure_ascii=False)}"
+                )
+                try:
+                    pres = _chat_json(base_url, mid, sys_prompt, polish_prompt, temp=0.1)
+                    p_items = pres if isinstance(pres, list) else (pres.get("items") or [])
+                    if isinstance(p_items, dict):
+                        p_items = [{"id": k, "vi": v} if not isinstance(v, dict) else {"id": k, **v} for k, v in p_items.items()]
+                    for x in p_items:
+                        if not isinstance(x, dict):
+                            continue
+                        xid = _safe_int(x.get("id"))
+                        new_vi = str(x.get("vi") or x.get("text") or "").strip()
+                        if xid is not None and new_vi and xid in done_map and xid >= int(turns[start_idx]["id"]):
+                            if done_map[xid] != new_vi:
+                                done_map[xid] = new_vi
+                                polish_changed = True
+                except Exception as exc:
+                    print(f"[S5B POLISH WARN] Bỏ qua rà soát cảnh: {exc}", flush=True)
+            if polish_changed:
+                vi_jsonl.unlink(missing_ok=True)
+                _append_jsonl_batch(vi_jsonl, [{"id": int(t["id"]), "vi": done_map[int(t["id"])]} for t in turns])
 
     _write_srt(turns, done_map, target_dir / "tracks" / "vi.srt")
     return done_map
@@ -763,24 +824,30 @@ def run_step5(target_dir: Path, langs: list[str], glossary_in: Path | None = Non
     base_glossary = read_json_safe(glossary_in) if glossary_in else {}
     base_glossary = base_glossary or {}
 
-    glossary, roles_map = _phase5a_qwen_analyze(target_dir, turns, acoustics_map, cfg, base_glossary, force=force)
-
     models_cfg = cfg.get("models", {})
-    vi_model = models_cfg.get("vi_translate_model", "google/gemma-4-26B-A4B-it")
-    fg_model = models_cfg.get("foreign_translate_model", "google/gemma-4-26B-A4B-it")
+    zh_model = models_cfg.get("zh_analyst_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit")
+    vi_model = models_cfg.get("vi_translate_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit")
+    fg_model = models_cfg.get("foreign_translate_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit")
     need_vi = "vi" in langs
     need_fg = any(x != "vi" for x in langs)
 
-    if need_vi and need_fg and vi_model == fg_model:
-        # Tái sử dụng 1 lần nạp Gemma 4 cho cả VI và EN/JA/KO/ES (tiết kiệm ~50s reload), tự lùi Qwen3.8 nếu lỗi nạp
-        zh_fb = models_cfg.get("zh_analyst_model", "philbert440/Qwen3.8-27B-W4A16-AWQ")
-        emit_progress(35.0, f"Nạp {vi_model} dùng chung Pha 5B + 5C...")
-        with _managed_vllm_with_fallback(vi_model, [zh_fb], cfg, "Pha 5B+5C") as conn:
-            vi_done = _phase5b_gemma4_vi(target_dir, turns, glossary, roles_map, cfg, force=force, conn=conn)
+    if zh_model == vi_model == fg_model:
+        # Nạp ĐÚNG 1 LẦN Google Gemma 4 cho toàn bộ Pha 5A + 5B + Rà soát + 5C + QA (nhanh gấp đôi!)
+        emit_progress(5.0, f"Nạp Google Gemma 4 ({vi_model}) chạy trọn Bước 5...")
+        with _managed_vllm_with_fallback(vi_model, ["philbert440/Qwen3.8-27B-W4A16-AWQ"], cfg, "Gemma 4 Bước 5") as conn:
+            glossary, roles_map = _phase5a_qwen_analyze(target_dir, turns, acoustics_map, cfg, base_glossary, force=force, conn=conn)
+            vi_done = _phase5b_gemma4_vi(target_dir, turns, glossary, roles_map, cfg, force=force, conn=conn) if need_vi else None
             _phase5c_translategemma_foreign(target_dir, turns, langs, glossary, roles_map, cfg, force=force, conn=conn, vi_map=vi_done)
     else:
-        vi_done = _phase5b_gemma4_vi(target_dir, turns, glossary, roles_map, cfg, force=force) if need_vi else None
-        _phase5c_translategemma_foreign(target_dir, turns, langs, glossary, roles_map, cfg, force=force, vi_map=vi_done)
+        glossary, roles_map = _phase5a_qwen_analyze(target_dir, turns, acoustics_map, cfg, base_glossary, force=force)
+        if need_vi and need_fg and vi_model == fg_model:
+            emit_progress(35.0, f"Nạp {vi_model} dùng chung Pha 5B + 5C...")
+            with _managed_vllm_with_fallback(vi_model, [zh_model], cfg, "Pha 5B+5C") as conn:
+                vi_done = _phase5b_gemma4_vi(target_dir, turns, glossary, roles_map, cfg, force=force, conn=conn)
+                _phase5c_translategemma_foreign(target_dir, turns, langs, glossary, roles_map, cfg, force=force, conn=conn, vi_map=vi_done)
+        else:
+            vi_done = _phase5b_gemma4_vi(target_dir, turns, glossary, roles_map, cfg, force=force) if need_vi else None
+            _phase5c_translategemma_foreign(target_dir, turns, langs, glossary, roles_map, cfg, force=force, vi_map=vi_done)
 
     elapsed = round(time.perf_counter() - t0, 2)
     meta = {"elapsed_s": elapsed, "langs": langs, "turns": len(turns), "glossary_entries": len(glossary)}
