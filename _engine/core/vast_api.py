@@ -106,6 +106,7 @@ def search_best_offers(
         "rentable": {"eq": True},
         "rented": {"eq": False},
         "num_gpus": {"eq": 1},
+        "gpu_frac": {"eq": 1.0},
         "cpu_arch": {"eq": "amd64"},
         "compute_cap": {"gte": 860, "lte": 890},
         "gpu_ram": {"gte": int(min_vram_gb * 1000)},
@@ -143,6 +144,8 @@ def search_best_offers(
         if str(o.get("cpu_arch") or "amd64").lower() not in ("amd64", "x86_64"):
             continue
         if int(o.get("num_gpus") or 0) != 1:
+            continue
+        if float(o.get("gpu_frac") or 0.0) < 0.99:
             continue
         cc = int(o.get("compute_cap") or 0)
         if not (860 <= cc <= 890):
