@@ -584,7 +584,7 @@
           <tbody>
             ${offers.map((o) => `
               <tr>
-                <td><strong>${esc(o.gpu_name)}</strong><div class="muted">PCIe ${esc(o.pcie_bw_gbs)} GB/s</div></td>
+                <td><strong>${esc(o.gpu_name)}</strong><div class="muted">PCIe ${esc(o.pcie_bw_gbs)} GB/s · ${o.single_gpu_host ? "1-GPU riêng (NVENC chắc)" : "Multi-GPU share"}</div></td>
                 <td>${esc(o.vram_gb)} GB<div class="muted">CUDA ${esc(o.cuda_max)}</div></td>
                 <td>${esc(o.inet_down_mbps)} / ${esc(o.inet_up_mbps)} Mbps</td>
                 <td>${esc(o.ram_gb)} GB / ${esc(o.cpu_cores)}c</td>

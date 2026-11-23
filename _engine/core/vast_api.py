@@ -106,7 +106,6 @@ def search_best_offers(
         "rentable": {"eq": True},
         "rented": {"eq": False},
         "num_gpus": {"eq": 1},
-        "gpu_frac": {"eq": 1.0},
         "cpu_arch": {"eq": "amd64"},
         "compute_cap": {"gte": 860, "lte": 890},
         "gpu_ram": {"gte": int(min_vram_gb * 1000)},
@@ -145,8 +144,6 @@ def search_best_offers(
             continue
         if int(o.get("num_gpus") or 0) != 1:
             continue
-        if float(o.get("gpu_frac") or 0.0) < 0.99:
-            continue
         cc = int(o.get("compute_cap") or 0)
         if not (860 <= cc <= 890):
             continue
@@ -182,6 +179,7 @@ def search_best_offers(
                 "disk_free_gb": round(float(o.get("disk_space") or 0), 0),
                 "pcie_bw_gbs": round(float(o.get("pcie_bw") or 0), 1),
                 "cuda_max": o.get("cuda_max_good"),
+                "single_gpu_host": float(o.get("gpu_frac") or 0.0) >= 0.99,
                 "reliability_pct": round(float(o.get("reliability") or 0) * 100.0, 2),
                 "geolocation": o.get("geolocation") or "",
                 "dph_total": round(float(o.get("dph_total") or 0), 4),
