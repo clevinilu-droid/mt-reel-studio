@@ -1,14 +1,15 @@
 """Tích hợp Vast.ai REST API: Lọc GPU tốc độ tối đa, thuê với MT Reel Template & hủy máy chống tốn tiền.
 
-Tiêu chí lọc GPU chuẩn công nghiệp (rút kinh nghiệm lỗi chậm & nghẽn hôm qua):
-  - `verified == True`, `rentable == True`, `rented == False`, `num_gpus == 1`
-  - `gpu_ram >= 24000` MB (24 GB+ VRAM cho Qwen3.8-27B & Gemma-4-26B-A4B 4-bit)
-  - `cuda_max_good >= 12.2` (tương thích vLLM & ONNX GPU)
+Tiêu chí lọc GPU chuẩn công nghiệp (mọi máy trả ra đều tương thích 100% Docker `:v2`):
+  - `verified == True`, `rentable == True`, `rented == False`, `num_gpus == 1`, `cpu_arch == "amd64"`
+  - `compute_cap` thuộc Ampere/Ada (`860–890`: RTX 3090/3090Ti/4090/A5000/A6000/Ada có NVENC + BF16 + tương thích PyTorch cu124 & vLLM)
+  - `gpu_ram >= 24000` MB (24 GB+ VRAM cho Gemma-4-26B-A4B 4-bit + Qwen3.5-4B)
+  - `cuda_max_good >= 13.0` (bắt buộc tương thích vLLM CUDA runtime trong image `:v2`)
   - `inet_down >= 1000` & `inet_up >= 1000` Mbps (mạng > 1000 Mbps kéo weights & Drive siêu nhanh)
-  - `cpu_cores_effective >= 6` & `cpu_ram >= 24000` MB (chống nghẽn FFmpeg/PyAV và đủ RAM nạp 4-bit)
+  - `cpu_cores_effective >= 6`, `cpu_ram >= 24000` MB, `pcie_bw >= 8.0` GB/s
   - `disk_bw >= 400` MB/s & `disk_space >= 120` GB (NVMe đọc model nhanh, đủ chỗ chứa weights + video)
   - `reliability >= 0.985`
-  - Loại bỏ các quốc gia bị chặn/bóp Google Drive & HuggingFace (`CN`, `RU`, `IR`, `BY`, `KP`).
+  - Loại bỏ các quốc gia bị chặn/bóp Google Drive & HuggingFace (`CN`, `RU`, `IR`, `BY`, `KP`), datacenter GPU thiếu NVENC (`A100`, `A40`, `H100`), và Blackwell (`sm_100/120`, chưa chạy `torch cu124`).
 
 Bảo mật: `VAST_API_KEY` đọc từ `.env` cục bộ, KHÔNG bao giờ gửi lên server thuê hay trả ra trình duyệt.
 """
@@ -105,6 +106,8 @@ def search_best_offers(
         "rentable": {"eq": True},
         "rented": {"eq": False},
         "num_gpus": {"eq": 1},
+        "cpu_arch": {"eq": "amd64"},
+        "compute_cap": {"gte": 860, "lte": 890},
         "gpu_ram": {"gte": int(min_vram_gb * 1000)},
         "cuda_max_good": {"gte": 13.0},
         "inet_down": {"gte": int(min_inet_mbps)},
@@ -113,6 +116,7 @@ def search_best_offers(
         "cpu_ram": {"gte": int(min_ram_gb * 1000)},
         "disk_space": {"gte": int(min_disk_gb)},
         "disk_bw": {"gte": int(min_disk_bw)},
+        "pcie_bw": {"gte": 8.0},
         "reliability": {"gte": 0.985},
         "dph_total": {"lte": float(max_dph)},
         "type": "on-demand",
@@ -126,14 +130,41 @@ def search_best_offers(
     data = _vast_request("GET", f"/bundles/?q={encoded}", timeout=25)
     offers = data.get("offers", []) if isinstance(data, dict) else []
 
+    blocked_models = (
+        "P40", "P100", "V100", "T4", "2080", "TITAN", "RTX 8000",
+        "A100", "A40", "A30", "A10", "H100", "H200", "B200", "GB10",
+        "RTX PRO", "RTX 5090", "4080", "CMP",
+    )
     clean: list[dict[str, Any]] = []
     for o in offers:
         if _is_blocked_location(o):
             continue
-        # Loại GPU dòng cũ Turing/Pascal dù VRAM lớn (không hỗ trợ tốt Ampere BF16/FA2 cho vLLM)
+        # Kiểm tra lại lần 2 bằng Python để bảo đảm 100% máy trả ra đều thỏa mãn mọi tiêu chí
+        if str(o.get("cpu_arch") or "amd64").lower() not in ("amd64", "x86_64"):
+            continue
+        if int(o.get("num_gpus") or 0) != 1:
+            continue
+        cc = int(o.get("compute_cap") or 0)
+        if not (860 <= cc <= 890):
+            continue
+        cuda_max = float(o.get("cuda_max_good") or 0.0)
+        if cuda_max < 13.0:
+            continue
+        if float(o.get("gpu_ram") or 0) < int(min_vram_gb * 1000):
+            continue
+        if float(o.get("cpu_ram") or 0) < int(min_ram_gb * 1000):
+            continue
+        if float(o.get("cpu_cores_effective") or 0) < float(min_cpu_cores):
+            continue
+        if float(o.get("inet_down") or 0) < int(min_inet_mbps) or float(o.get("inet_up") or 0) < int(min_inet_mbps):
+            continue
+        if float(o.get("disk_space") or 0) < int(min_disk_gb) or float(o.get("disk_bw") or 0) < int(min_disk_bw):
+            continue
+        if float(o.get("pcie_bw") or 0) < 8.0 or float(o.get("reliability") or 0) < 0.985:
+            continue
         gname = str(o.get("gpu_name") or "")
         up = gname.upper()
-        if any(old in up for old in ("P40", "P100", "V100", "T4", "2080", "TITAN", "RTX 8000")) or ("RTX 6000" in up and "ADA" not in up):
+        if any(bad in up for bad in blocked_models) or ("RTX 6000" in up and "ADA" not in up):
             continue
         clean.append(
             {
