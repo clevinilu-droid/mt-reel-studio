@@ -1,14 +1,14 @@
 """Tích hợp Vast.ai REST API: Lọc GPU tốc độ tối đa, thuê với MT Reel Template & hủy máy chống tốn tiền.
 
-Tiêu chí lọc GPU chuẩn công nghiệp (mọi máy trả ra đều tương thích 100% Docker `:v2`):
-  - `verified == True`, `rentable == True`, `rented == False`, `num_gpus == 1`, `cpu_arch == "amd64"`
-  - `compute_cap` thuộc Ampere/Ada (`860–890`: RTX 3090/3090Ti/4090/A5000/A6000/Ada có NVENC + BF16 + tương thích PyTorch cu124 & vLLM)
+Tiêu chí lọc GPU chuẩn công nghiệp (mọi máy trả ra đều tương thích 100% Docker `:v2` & NVENC):
+  - `verified == True`, `rentable == True`, `rented == False`, `num_gpus == 1`, `gpu_frac == 1.0` (1-GPU riêng biệt, tránh lỗi multi-GPU NVENC `unsupported device`)
+  - `cpu_arch == "amd64"`, `compute_cap` thuộc Ampere/Ada (`860–890`: RTX 3090/3090Ti/4090/A5000/A6000/Ada có NVENC + BF16 + cu124/vLLM)
   - `gpu_ram >= 24000` MB (24 GB+ VRAM cho Gemma-4-26B-A4B 4-bit + Qwen3.5-4B)
   - `cuda_max_good >= 13.0` (bắt buộc tương thích vLLM CUDA runtime trong image `:v2`)
-  - `inet_down >= 1000` & `inet_up >= 1000` Mbps (mạng > 1000 Mbps kéo weights & Drive siêu nhanh)
+  - `inet_down >= 800` & `inet_up >= 800` Mbps (mạng khỏe kéo weights & Drive nhanh)
   - `cpu_cores_effective >= 6`, `cpu_ram >= 24000` MB, `pcie_bw >= 8.0` GB/s
-  - `disk_bw >= 400` MB/s & `disk_space >= 120` GB (NVMe đọc model nhanh, đủ chỗ chứa weights + video)
-  - `reliability >= 0.985`
+  - `disk_bw >= 400` MB/s & `disk_space >= 70` GB (NVMe đọc model nhanh, đủ 25GB weights + 15-20GB phim)
+  - `reliability >= 0.985`, tính sẵn tổng giá thật/giờ (`GPU + ổ cứng`)
   - Loại bỏ các quốc gia bị chặn/bóp Google Drive & HuggingFace (`CN`, `RU`, `IR`, `BY`, `KP`), datacenter GPU thiếu NVENC (`A100`, `A40`, `H100`), và Blackwell (`sm_100/120`, chưa chạy `torch cu124`).
 
 Bảo mật: `VAST_API_KEY` đọc từ `.env` cục bộ, KHÔNG bao giờ gửi lên server thuê hay trả ra trình duyệt.
@@ -93,19 +93,22 @@ def search_best_offers(
     min_inet_mbps: int = 800,
     min_cpu_cores: float = 6.0,
     min_ram_gb: int = 24,
-    min_disk_gb: int = 120,
+    min_disk_gb: int = 70,
     min_disk_bw: int = 400,
     max_dph: float = 0.65,
     gpu_filter: str = "ANY",
     sort_by: str = "price",
     limit: int = 25,
+    disk_gb: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Truy vấn và lọc Top GPU tối ưu cho pipeline từ Vast.ai (tránh Trung Quốc)."""
+    """Truy vấn và lọc Top GPU 1-GPU riêng chuẩn NVENC + CUDA >= 13.0 từ Vast.ai."""
+    req_disk = max(50, int(disk_gb if disk_gb is not None else min_disk_gb))
     q: dict[str, Any] = {
         "verified": {"eq": True},
         "rentable": {"eq": True},
         "rented": {"eq": False},
         "num_gpus": {"eq": 1},
+        "gpu_frac": {"eq": 1.0},
         "cpu_arch": {"eq": "amd64"},
         "compute_cap": {"gte": 860, "lte": 890},
         "gpu_ram": {"gte": int(min_vram_gb * 1000)},
@@ -114,7 +117,7 @@ def search_best_offers(
         "inet_up": {"gte": int(min_inet_mbps)},
         "cpu_cores_effective": {"gte": float(min_cpu_cores)},
         "cpu_ram": {"gte": int(min_ram_gb * 1000)},
-        "disk_space": {"gte": int(min_disk_gb)},
+        "disk_space": {"gte": req_disk},
         "disk_bw": {"gte": int(min_disk_bw)},
         "pcie_bw": {"gte": 8.0},
         "reliability": {"gte": 0.985},
@@ -142,7 +145,7 @@ def search_best_offers(
         # Kiểm tra lại lần 2 bằng Python để bảo đảm 100% máy trả ra đều thỏa mãn mọi tiêu chí
         if str(o.get("cpu_arch") or "amd64").lower() not in ("amd64", "x86_64"):
             continue
-        if int(o.get("num_gpus") or 0) != 1:
+        if int(o.get("num_gpus") or 0) != 1 or float(o.get("gpu_frac") or 0.0) < 0.99:
             continue
         cc = int(o.get("compute_cap") or 0)
         if not (860 <= cc <= 890):
@@ -158,13 +161,18 @@ def search_best_offers(
             continue
         if float(o.get("inet_down") or 0) < int(min_inet_mbps) or float(o.get("inet_up") or 0) < int(min_inet_mbps):
             continue
-        if float(o.get("disk_space") or 0) < int(min_disk_gb) or float(o.get("disk_bw") or 0) < int(min_disk_bw):
+        if float(o.get("disk_space") or 0) < req_disk or float(o.get("disk_bw") or 0) < int(min_disk_bw):
             continue
         if float(o.get("pcie_bw") or 0) < 8.0 or float(o.get("reliability") or 0) < 0.985:
             continue
         gname = str(o.get("gpu_name") or "")
         up = gname.upper()
         if any(bad in up for bad in blocked_models) or ("RTX 6000" in up and "ADA" not in up):
+            continue
+        gpu_dph = float(o.get("dph_total") or 0.0)
+        storage_dph = (float(o.get("storage_cost") or 0.0) * float(req_disk)) / 730.0
+        est_total_dph = gpu_dph + storage_dph
+        if est_total_dph > float(max_dph) + 1e-6:
             continue
         clean.append(
             {
@@ -179,19 +187,22 @@ def search_best_offers(
                 "disk_free_gb": round(float(o.get("disk_space") or 0), 0),
                 "pcie_bw_gbs": round(float(o.get("pcie_bw") or 0), 1),
                 "cuda_max": o.get("cuda_max_good"),
-                "single_gpu_host": float(o.get("gpu_frac") or 0.0) >= 0.99,
+                "single_gpu_host": True,
                 "reliability_pct": round(float(o.get("reliability") or 0) * 100.0, 2),
                 "geolocation": o.get("geolocation") or "",
-                "dph_total": round(float(o.get("dph_total") or 0), 4),
+                "disk_gb": req_disk,
+                "dph_total": round(gpu_dph, 4),
+                "storage_dph": round(storage_dph, 4),
+                "est_total_dph": round(est_total_dph, 4),
                 "dlperf": round(float(o.get("dlperf") or 0), 1),
-                "score": _score_offer(o),
+                "score": _score_offer({**o, "dph_total": est_total_dph}),
             }
         )
 
     if sort_by == "score":
-        clean.sort(key=lambda x: (-x["score"], x["dph_total"]))
+        clean.sort(key=lambda x: (-x["score"], x["est_total_dph"]))
     else:
-        clean.sort(key=lambda x: (x["dph_total"], -x["score"]))
+        clean.sort(key=lambda x: (x["est_total_dph"], -x["score"]))
     return clean[:limit]
 
 
@@ -213,7 +224,7 @@ def rent_instance(
     offer_id: int,
     image: str = "",
     template_hash_id: str = "",
-    disk_gb: int = 120,
+    disk_gb: int = 70,
     include_rclone: bool = True,
 ) -> dict[str, Any]:
     """Thuê GPU trên Vast.ai kèm Docker Image / Template MT Reel & tự mở cổng 7860."""

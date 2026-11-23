@@ -115,7 +115,7 @@ class VastRentReq(BaseModel):
     offer_id: int
     image: str = ""
     template_hash_id: str = ""
-    disk_gb: int = 120
+    disk_gb: int = 70
     include_rclone: bool = True
 
 
@@ -347,11 +347,11 @@ def push_output_drive(job_id: str):
 
 
 @app.get("/api/vast/offers")
-def vast_offers(gpu: str = "ANY", min_inet: int = 800, max_dph: float = 0.65, sort_by: str = "price"):
+def vast_offers(gpu: str = "ANY", min_inet: int = 800, max_dph: float = 0.65, sort_by: str = "price", disk_gb: int = 70):
     if not get_vast_api_key():
         raise HTTPException(status_code=400, detail="Chưa cấu hình VAST_API_KEY trong file .env trên máy.")
     try:
-        offers = search_best_offers(gpu_filter=gpu, min_inet_mbps=min_inet, max_dph=max_dph, sort_by=sort_by, limit=25)
+        offers = search_best_offers(gpu_filter=gpu, min_inet_mbps=min_inet, max_dph=max_dph, sort_by=sort_by, limit=25, disk_gb=disk_gb)
         return {"offers": offers}
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Lỗi truy vấn Vast.ai: {exc}")

@@ -560,11 +560,13 @@
     wrap.innerHTML = '<div class="muted">Đang truy vấn Vast.ai và lọc các máy đạt chuẩn nhanh nhất...</div>';
     $("btnSearchVast").disabled = true;
     try {
+      const diskGb = Number($("vastDiskGb")?.value || 70);
       const q = new URLSearchParams({
         gpu: $("vastGpu").value,
         sort_by: $("vastSort").value,
         min_inet: $("vastMinInet").value || "800",
         max_dph: $("vastMaxDph").value || "0.65",
+        disk_gb: String(diskGb),
       });
       const res = await fetch(`/api/vast/offers?${q.toString()}`);
       if (!res.ok) throw new Error(await res.text());
@@ -590,7 +592,7 @@
                 <td>${esc(o.ram_gb)} GB / ${esc(o.cpu_cores)}c</td>
                 <td>${esc(o.disk_bw_mbs)} MB/s</td>
                 <td>${esc(o.geolocation)}<div class="muted">Rel ${esc(o.reliability_pct)}%</div></td>
-                <td><strong>$${Number(o.dph_total).toFixed(3)}</strong>/h</td>
+                <td><strong>$${Number(o.est_total_dph ?? o.dph_total).toFixed(3)}</strong>/h<div class="muted">GPU $${Number(o.dph_total).toFixed(3)} + Đĩa ${esc(o.disk_gb || 70)}G $${Number(o.storage_dph || 0).toFixed(3)}</div></td>
                 <td><button type="button" class="btn primary sm" data-rent="${o.id}">Thuê máy</button></td>
               </tr>
             `).join("")}
@@ -613,8 +615,9 @@
       $("vastImage").focus();
       return;
     }
+    const diskGb = Number($("vastDiskGb")?.value || 70);
     const looksLikeHash = !imgVal.includes("/") && !imgVal.includes(":");
-    if (!confirm(`Xác nhận thuê Vast.ai offer #${offerId} (ổ cứng 120GB, tự mở port 7860 + tự nạp rclone)?`)) return;
+    if (!confirm(`Xác nhận thuê Vast.ai offer #${offerId} (ổ cứng ${diskGb}GB, tự mở port 7860 + tự nạp rclone)?`)) return;
     try {
       const res = await fetch("/api/vast/rent", {
         method: "POST",
@@ -623,7 +626,7 @@
           offer_id: offerId,
           image: looksLikeHash ? "" : imgVal,
           template_hash_id: looksLikeHash ? imgVal : "",
-          disk_gb: 120,
+          disk_gb: diskGb,
           include_rclone: true,
         }),
       });
