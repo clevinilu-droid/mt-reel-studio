@@ -106,7 +106,7 @@ def search_best_offers(
         "rented": {"eq": False},
         "num_gpus": {"eq": 1},
         "gpu_ram": {"gte": int(min_vram_gb * 1000)},
-        "cuda_max_good": {"gte": 12.2},
+        "cuda_max_good": {"gte": 13.0},
         "inet_down": {"gte": int(min_inet_mbps)},
         "inet_up": {"gte": int(min_inet_mbps)},
         "cpu_cores_effective": {"gte": float(min_cpu_cores)},
