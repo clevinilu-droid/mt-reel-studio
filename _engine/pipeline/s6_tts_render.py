@@ -325,61 +325,184 @@ def _mix_track_streaming(turns: list[dict[str, Any]], turn_files: list[Path], cl
         raw_wav.unlink(missing_ok=True)
 
 
-def _render_master_mp4(cfr_mp4: Path, master_audio: Path, master_srt: Path | None, out_mp4: Path):
-    """Render MP4 chuẩn chất lượng cao dùng GPU NVENC/QSV + Watermark + Soft Sub (không setpts lỗi cắt phim)."""
+def _detect_sub_blur_rect(cfr_mp4: Path, turns: list[dict[str, Any]] | None = None) -> tuple[int, int, int, int]:
+    """Tự đo khung phụ đề Trung thực tế trên video để làm mờ chiều ngang & dọc vừa khít.
+
+    Lấy mẫu tối đa 16 khung hình ưu tiên các câu thoại dài nhất (để phủ đủ câu rộng nhất),
+    căn giữa đối xứng theo chiều ngang + chừa viền gọn (26px ngang, 14px dọc).
+    """
+    default_rect = (120, 1440, 840, 120)
+    try:
+        from _engine.core.vram_guard import patch_onnx_threads
+
+        patch_onnx_threads(4)
+        from rapidocr_onnxruntime import RapidOCR
+    except Exception:
+        return default_rect
+
+    # Chọn tối đa 16 mốc thời gian: ưu tiên 10 câu dài nhất + 6 mốc rải đều
+    sample_ts: list[float] = []
+    if turns:
+        valid = [t for t in turns if float(t.get("end", 0)) > float(t.get("start", 0))]
+        by_len = sorted(valid, key=lambda t: len(str(t.get("text", ""))), reverse=True)[:10]
+        step = max(1, len(valid) // 6)
+        by_spread = valid[::step][:6]
+        seen = set()
+        for t in by_len + by_spread:
+            mid = round((float(t["start"]) + float(t["end"])) / 2.0, 2)
+            if mid not in seen:
+                seen.add(mid)
+                sample_ts.append(mid)
+    if not sample_ts:
+        sample_ts = [10.0, 25.0, 40.0, 55.0, 70.0, 90.0, 110.0]
+
+    ocr = RapidOCR()
+    xs0: list[float] = []
+    xs1: list[float] = []
+    ys0: list[float] = []
+    ys1: list[float] = []
+    W, H = 1080, 1920
+
+    try:
+        import av
+
+        with av.open(str(cfr_mp4)) as cont:
+            st = cont.streams.video[0]
+            W, H = int(st.width or 1080), int(st.height or 1920)
+            y_top, y_bot = int(H * 0.56), int(H * 0.94)
+            max_line_h = int(H * 0.08)
+            for sec in sample_ts:
+                try:
+                    cont.seek(max(0, int(sec / float(st.time_base))), stream=st, backward=True)
+                    for frame in cont.decode(st):
+                        arr = frame.to_ndarray(format="bgr24")
+                        res, _ = ocr(arr[y_top:y_bot, :])
+                        if res:
+                            for box, txt, conf in res:
+                                if float(conf) < 0.55 or not any("\u4e00" <= c <= "\u9fff" for c in txt):
+                                    continue
+                                by0 = min(p[1] for p in box) + y_top
+                                by1 = max(p[1] for p in box) + y_top
+                                bx0 = min(p[0] for p in box)
+                                bx1 = max(p[0] for p in box)
+                                if (by1 - by0) > max_line_h:
+                                    continue
+                                xs0.append(bx0)
+                                xs1.append(bx1)
+                                ys0.append(by0)
+                                ys1.append(by1)
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        return default_rect
+
+    if not xs0:
+        return default_rect
+
+    if len(xs0) >= 6:
+        raw_x0 = float(np.percentile(xs0, 2))
+        raw_x1 = float(np.percentile(xs1, 98))
+        raw_y0 = float(np.percentile(ys0, 2))
+        raw_y1 = float(np.percentile(ys1, 98))
+    else:
+        raw_x0, raw_x1 = min(xs0), max(xs1)
+        raw_y0, raw_y1 = min(ys0), max(ys1)
+
+    pad_x, pad_y = 26, 14
+    x0 = max(20.0, raw_x0 - pad_x)
+    x1 = min(W - 20.0, raw_x1 + pad_x)
+    y0 = max(int(H * 0.50), int(raw_y0 - pad_y))
+    y1 = min(H - 20, int(raw_y1 + pad_y))
+
+    # Căn giữa đối xứng ngang để dải mờ cân đối, khống chế bề rộng tối thiểu/tối đa vừa đẹp
+    half_w = max(W / 2.0 - x0, x1 - W / 2.0, W * 0.28)
+    half_w = min(half_w, (W - 40) / 2.0)
+    bx = max(0, int(round(W / 2.0 - half_w))) & ~1
+    bw = min(W - bx, int(round(half_w * 2.0))) & ~1
+    bh = max(84, min(220, y1 - y0))
+    by = max(0, min(H - bh, int(round((y0 + y1) / 2.0 - bh / 2.0)))) & ~1
+    bh = min(H - by, bh) & ~1
+    print(f"[S6 SUB-BLUR] Tự đo từ {len(xs0)} dòng sub Trung -> ({bx}, {by}, {bw}x{bh})", flush=True)
+    return bx, by, bw, bh
+
+
+def _compute_wm_alpha_scale(wm_png: Path, target_opacity: float = 0.05) -> float:
+    """Tính hệ số `aa` cho colorchannelmixer sao cho độ đục cuối của watermark đạt đúng ~5%."""
+    try:
+        from PIL import Image
+
+        arr = np.array(Image.open(wm_png).convert("RGBA"))
+        max_a = int(arr[:, :, 3].max())
+        if max_a > 0:
+            return round(min(1.0, max(0.02, (target_opacity * 255.0) / float(max_a))), 3)
+    except Exception:
+        pass
+    return round(target_opacity, 3)
+
+
+def _render_master_mp4(
+    cfr_mp4: Path,
+    master_audio: Path,
+    master_srt: Path | None,
+    out_mp4: Path,
+    turns: list[dict[str, Any]] | None = None,
+):
+    """Render MP4 9:16 chuẩn chất lượng cao: làm mờ sub Trung vừa khít + watermark mờ 5% đè lên dải mờ + soft sub."""
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
     enc_name, hw_args, enc_args = detect_gpu_encoder()
     wm_png = ROOT_DIR / "branding" / "MT_Reel_Strip_Watermark.png"
 
-    cmd = ["ffmpeg", "-y", "-v", "warning", *hw_args, "-i", str(cfr_mp4), "-i", str(master_audio)]
-    sub_idx = None
-    wm_idx = None
-    next_i = 2
-    if wm_png.exists():
-        cmd += ["-i", str(wm_png)]
-        wm_idx = next_i
-        next_i += 1
-    if master_srt and master_srt.exists():
-        cmd += ["-i", str(master_srt)]
-        sub_idx = next_i
+    bx, by, bw, bh = _detect_sub_blur_rect(cfr_mp4, turns)
+    lr = max(6, min(32, min(bw, bh) // 2 - 2))
+    cr = max(4, min(18, min(bw, bh) // 4 - 2))
 
-    if wm_idx is not None:
-        cmd += [
-            "-filter_complex",
-            f"[{wm_idx}:v]scale=iw*0.92:-1,format=rgba,colorchannelmixer=aa=0.82[wm];[0:v][wm]overlay=(W-w)/2:H*0.03[vout]",
-            "-map",
-            "[vout]",
-        ]
-    else:
-        cmd += ["-map", "0:v:0"]
+    has_wm = wm_png.exists()
+    wm_aa = _compute_wm_alpha_scale(wm_png, target_opacity=0.05) if has_wm else 0.05
 
-    cmd += ["-map", "1:a:0", *enc_args, "-c:a", "copy", "-movflags", "+faststart"]
-    if sub_idx is not None:
-        cmd += ["-map", f"{sub_idx}:0", "-c:s", "mov_text", "-metadata:s:s:0", "language=vie"]
-    cmd.append(str(out_mp4))
-    print(f"[S6 RENDER] Encoder={enc_name} -> {out_mp4}", flush=True)
+    def _build_cmd(use_hw: bool) -> list[str]:
+        cmd = ["ffmpeg", "-y", "-v", "warning"]
+        if use_hw:
+            cmd += [*hw_args]
+        cmd += ["-i", str(cfr_mp4), "-i", str(master_audio)]
+        wm_idx = None
+        sub_idx = None
+        next_i = 2
+        if has_wm:
+            cmd += ["-i", str(wm_png)]
+            wm_idx = next_i
+            next_i += 1
+        if master_srt and master_srt.exists():
+            cmd += ["-i", str(master_srt)]
+            sub_idx = next_i
+
+        blur_chain = (
+            f"[0:v]split=2[fgraw][fgsub];"
+            f"[fgsub]crop={bw}:{bh}:{bx}:{by},boxblur=luma_radius={lr}:luma_power=4:chroma_radius={cr}:chroma_power=3[subblur];"
+        )
+        if wm_idx is not None:
+            fc = (
+                f"{blur_chain}"
+                f"[fgraw][subblur]overlay={bx}:{by}[vblur];"
+                f"[{wm_idx}:v]scale={bw}:{bh}:force_original_aspect_ratio=decrease,format=rgba,colorchannelmixer=aa={wm_aa:.3f}[wm];"
+                f"[vblur][wm]overlay={bx}+({bw}-w)/2:{by}+({bh}-h)/2,format=yuv420p[vout]"
+            )
+        else:
+            fc = f"{blur_chain}[fgraw][subblur]overlay={bx}:{by},format=yuv420p[vout]"
+
+        v_enc = enc_args if use_hw else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
+        cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "1:a:0", *v_enc, "-c:a", "copy", "-movflags", "+faststart"]
+        if sub_idx is not None:
+            cmd += ["-map", f"{sub_idx}:0", "-c:s", "mov_text", "-metadata:s:s:0", "language=vie"]
+        cmd.append(str(out_mp4))
+        return cmd
+
+    cmd = _build_cmd(use_hw=(enc_name != "libx264"))
+    print(f"[S6 RENDER] Encoder={enc_name} | SubBlur=({bx},{by},{bw}x{bh}) | WM_aa={wm_aa} -> {out_mp4}", flush=True)
     res = subprocess.run(cmd)
     if res.returncode != 0 and enc_name != "libx264":
         print(f"[S6 RENDER WARN] {enc_name} lỗi (exit={res.returncode}) -> tự chuyển sang libx264...", flush=True)
-        fb_cmd = ["ffmpeg", "-y", "-v", "warning", "-i", str(cfr_mp4), "-i", str(master_audio)]
-        if wm_idx is not None:
-            fb_cmd += ["-i", str(wm_png)]
-        if sub_idx is not None:
-            fb_cmd += ["-i", str(master_srt)]
-        if wm_idx is not None:
-            fb_cmd += [
-                "-filter_complex",
-                f"[{wm_idx}:v]scale=iw*0.92:-1,format=rgba,colorchannelmixer=aa=0.82[wm];[0:v][wm]overlay=(W-w)/2:H*0.03[vout]",
-                "-map",
-                "[vout]",
-            ]
-        else:
-            fb_cmd += ["-map", "0:v:0"]
-        fb_cmd += ["-map", "1:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-c:a", "copy", "-movflags", "+faststart"]
-        if sub_idx is not None:
-            fb_cmd += ["-map", f"{sub_idx}:0", "-c:s", "mov_text", "-metadata:s:s:0", "language=vie"]
-        fb_cmd.append(str(out_mp4))
-        subprocess.run(fb_cmd, check=True)
+        subprocess.run(_build_cmd(use_hw=False), check=True)
     elif res.returncode != 0:
         raise subprocess.CalledProcessError(res.returncode, cmd)
 
@@ -443,7 +566,7 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
     master_srt = sub_out_dir / f"{primary_lang}.srt"
     mp4_name = f"preview_5min_{primary_lang}.mp4" if is_test_5min else f"final_{primary_lang}.mp4"
     out_mp4 = out_base / mp4_name
-    _render_master_mp4(cfr_mp4, master_audio, master_srt, out_mp4)
+    _render_master_mp4(cfr_mp4, master_audio, master_srt, out_mp4, turns=turns)
 
     elapsed = round(time.perf_counter() - t0, 2)
     meta = {
