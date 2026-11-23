@@ -90,7 +90,7 @@ def _score_offer(o: dict[str, Any]) -> float:
 
 def search_best_offers(
     min_vram_gb: int = 24,
-    min_inet_mbps: int = 1000,
+    min_inet_mbps: int = 800,
     min_cpu_cores: float = 6.0,
     min_ram_gb: int = 24,
     min_disk_gb: int = 120,

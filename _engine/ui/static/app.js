@@ -563,7 +563,7 @@
       const q = new URLSearchParams({
         gpu: $("vastGpu").value,
         sort_by: $("vastSort").value,
-        min_inet: $("vastMinInet").value || "1000",
+        min_inet: $("vastMinInet").value || "800",
         max_dph: $("vastMaxDph").value || "0.65",
       });
       const res = await fetch(`/api/vast/offers?${q.toString()}`);

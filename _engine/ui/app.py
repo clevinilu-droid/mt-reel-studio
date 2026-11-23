@@ -347,7 +347,7 @@ def push_output_drive(job_id: str):
 
 
 @app.get("/api/vast/offers")
-def vast_offers(gpu: str = "ANY", min_inet: int = 1000, max_dph: float = 0.65, sort_by: str = "price"):
+def vast_offers(gpu: str = "ANY", min_inet: int = 800, max_dph: float = 0.65, sort_by: str = "price"):
     if not get_vast_api_key():
         raise HTTPException(status_code=400, detail="Chưa cấu hình VAST_API_KEY trong file .env trên máy.")
     try:
