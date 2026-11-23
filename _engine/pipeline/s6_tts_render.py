@@ -328,6 +328,109 @@ def _synth_voxcpm_foreign(
     return turn_paths
 
 
+def _synth_voxcpm_batch_foreign(
+    target_dir: Path,
+    foreign_langs: list[str],
+    lang_tmaps: dict[str, dict[int, str]],
+    turns: list[dict[str, Any]],
+    roles_map: dict[int, dict[str, Any]],
+    voice_mode: str,
+    cfg: dict[str, Any],
+    prog_base: float,
+    prog_span: float,
+) -> dict[str, list[Path]]:
+    """Nạp VoxCPM2 ĐÚNG 1 LẦN để tổng hợp đồng loạt tất cả ngoại ngữ (EN/JA/KO/ES), giảm ~3x thời gian nạp."""
+    results: dict[str, list[Path]] = {}
+    lang_jobs: list[dict[str, Any]] = []
+    use_clone_global = False
+    total_todo = 0
+
+    for lang in foreign_langs:
+        use_clone, turn_paths, todo = _resolve_foreign_voice_plan(
+            target_dir, lang, turns, lang_tmaps[lang], roles_map, voice_mode, engine_tag="voxcpm2"
+        )
+        results[lang] = turn_paths
+        use_clone_global = use_clone_global or use_clone
+        if todo:
+            cache_dir = target_dir / "tts_cache" / lang
+            tasks_payload = []
+            for tid, txt, r, wp in todo:
+                g = "MALE" if voice_mode == "single_male" else ("FEMALE" if voice_mode == "single_female" else str(r.get("gender", "FEMALE")).upper())
+                tasks_payload.append(
+                    {
+                        "tid": tid,
+                        "text": txt,
+                        "gender": g,
+                        "emotion": str(r.get("emotion", "NEUTRAL")).upper(),
+                        "out_wav": str(wp),
+                    }
+                )
+            total_todo += len(tasks_payload)
+            lang_jobs.append(
+                {
+                    "lang": lang,
+                    "anchor_paths": {
+                        "FEMALE": str(cache_dir / "synth_anchor_female.wav"),
+                        "MALE": str(cache_dir / "synth_anchor_male.wav"),
+                    },
+                    "ref_paths": {
+                        "FEMALE": str(target_dir / "04_ref_female.wav"),
+                        "MALE": str(target_dir / "04_ref_male.wav"),
+                    },
+                    "tasks": tasks_payload,
+                }
+            )
+
+    if total_todo == 0:
+        emit_progress(prog_base + prog_span, f"Tái sử dụng cache VoxCPM2 ({','.join(foreign_langs).upper()})")
+        return results
+
+    voxcpm_py = _ensure_voxcpm_python(cfg, prog_base)
+    model_id = cfg.get("models", {}).get("tts_foreign_voxcpm_model", "openbmb/VoxCPM2")
+    worker_py = ENGINE_DIR / "pipeline" / "voxcpm_worker.py"
+    manifest_path = target_dir / "tts_cache" / "_voxcpm_batch_manifest.json"
+    atomic_write_json(
+        manifest_path,
+        {
+            "model_id": model_id,
+            "voice_mode": voice_mode,
+            "use_clone": use_clone_global,
+            "languages": lang_jobs,
+        },
+    )
+
+    emit_progress(prog_base, f"Nạp 1 lần VoxCPM2 cho {', '.join(foreign_langs).upper()} ({total_todo} câu)...")
+    env = dict(os.environ)
+    env.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    proc = subprocess.Popen(
+        [str(voxcpm_py), "-u", str(worker_py), "--manifest", str(manifest_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    assert proc.stdout is not None
+    for raw_line in proc.stdout:
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = re.match(r"\[VOXCPM_PROGRESS\]\s*(\d+)/(\d+)(?:\s+([A-Z]+))?", line)
+        if m:
+            cur, tot = int(m.group(1)), max(1, int(m.group(2)))
+            lg_tag = m.group(3) or "FOREIGN"
+            if cur % 4 == 0 or cur == tot:
+                emit_progress(prog_base + (cur / tot) * prog_span, f"VoxCPM2 {lg_tag}: {cur}/{tot} câu")
+        else:
+            print(line, flush=True)
+
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"voxcpm_worker batch thoát với mã lỗi {rc}")
+    return results
+
+
 def _synth_qwen3_tts_foreign(
     target_dir: Path,
     lang: str,
@@ -744,17 +847,32 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
         if (target_dir / "tracks" / "vi.srt").exists():
             shutil.copy2(target_dir / "tracks" / "vi.srt", sub_out_dir / "vi.srt")
 
-    # 6B. Ngoại ngữ (VoxCPM2 mặc định hoặc Qwen3-TTS fallback)
+    # 6B. Ngoại ngữ (VoxCPM2 nạp 1 lần cho cả EN/JA/KO/ES, tự động dự phòng Qwen3-TTS nếu lỗi)
     foreign_langs = [x for x in langs if x != "vi"]
     if foreign_langs:
+        lang_tmaps = {
+            lang: {k: v["text"] for k, v in _load_jsonl_map(target_dir / f"05c_sub_{lang}.jsonl").items()}
+            for lang in foreign_langs
+        }
+        engine = str(cfg.get("models", {}).get("tts_foreign_engine", "voxcpm2")).lower()
+        lang_wavs: dict[str, list[Path]] = {}
+        if engine == "voxcpm2":
+            try:
+                lang_wavs = _synth_voxcpm_batch_foreign(
+                    target_dir, foreign_langs, lang_tmaps, turns, roles_map, voice_mode, cfg, 38.0, 38.0
+                )
+            except Exception as exc:
+                print(f"[S6 VOXCPM WARN] VoxCPM2 batch lỗi ({exc}) -> chuyển dự phòng sang Qwen3-TTS.", flush=True)
+
         span = 45.0 / len(foreign_langs)
         qwen_holder: dict[str, Any] = {}
         try:
             for idx, lang in enumerate(foreign_langs):
-                tmap = {k: v["text"] for k, v in _load_jsonl_map(target_dir / f"05c_sub_{lang}.jsonl").items()}
-                wavs = _synth_foreign_tts(
-                    target_dir, lang, turns, tmap, roles_map, voice_mode, cfg, 38.0 + idx * span, span * 0.85, qwen_holder=qwen_holder
-                )
+                wavs = lang_wavs.get(lang)
+                if wavs is None:
+                    wavs = _synth_qwen3_tts_foreign(
+                        target_dir, lang, turns, lang_tmaps[lang], roles_map, voice_mode, cfg, 38.0 + idx * span, span * 0.85, model_holder=qwen_holder
+                    )
                 _mix_track_streaming(turns, wavs, clean_bed, audio_out_dir / f"audio_{lang}.m4a")
                 if (target_dir / "tracks" / f"{lang}.srt").exists():
                     shutil.copy2(target_dir / "tracks" / f"{lang}.srt", sub_out_dir / f"{lang}.srt")

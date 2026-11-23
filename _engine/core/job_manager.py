@@ -334,6 +334,7 @@ class JobManager:
         force_step1: bool = False,
         target_stage: str = "auto",
         voice_mode: str | None = None,
+        langs: list[str] | None = None,
     ):
         with self._lock:
             m = self.jobs.get(job_id)
@@ -345,6 +346,8 @@ class JobManager:
                 m["mode"] = mode
             if voice_mode:
                 m["voice_mode"] = voice_mode
+            if langs:
+                m["langs"] = langs
             if target_stage == "auto":
                 has_cuda = self.telemetry._has_nvidia
                 target_stage = "all" if has_cuda else "s1"

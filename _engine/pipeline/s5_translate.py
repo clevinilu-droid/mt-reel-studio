@@ -335,7 +335,53 @@ def _phase5a_qwen_analyze(
 
     done_roles = _load_jsonl_map(roles_jsonl)
     glossary = read_json_safe(glossary_path) or dict(base_glossary)
-    bible = read_json_safe(bible_path) or {"characters": [], "relationships": []}
+    bible = read_json_safe(bible_path) or {"era": "MODERN", "genre": "", "characters": [], "relationships": []}
+    bible.setdefault("era", "MODERN")
+    bible.setdefault("genre", "")
+    bible.setdefault("characters", [])
+    bible.setdefault("relationships", [])
+
+    def _merge_bible(res_obj: dict[str, Any], detected_era: str):
+        bible["era"] = detected_era
+        if isinstance(res_obj.get("genre"), str) and res_obj["genre"].strip():
+            bible["genre"] = res_obj["genre"].strip()
+        b_add = res_obj.get("bible_add") if isinstance(res_obj.get("bible_add"), dict) else res_obj
+        char_seen = {str(c.get("role", "")).strip(): c for c in bible["characters"] if isinstance(c, dict) and c.get("role")}
+        for c in (b_add.get("characters") or []):
+            if not isinstance(c, dict):
+                continue
+            rname = str(c.get("role") or "").strip()
+            if rname and rname not in char_seen:
+                entry = {
+                    "role": rname,
+                    "gender": str(c.get("gender") or "").upper(),
+                    "status": str(c.get("status") or "").strip(),
+                }
+                bible["characters"].append(entry)
+                char_seen[rname] = entry
+        rel_seen = {
+            (str(x.get("from_role", "")).strip(), str(x.get("to_role", "")).strip()): x
+            for x in bible["relationships"]
+            if isinstance(x, dict) and x.get("from_role") and x.get("to_role")
+        }
+        for rel in (b_add.get("relationships") or []):
+            if not isinstance(rel, dict):
+                continue
+            fr = str(rel.get("from_role") or "").strip()
+            to = str(rel.get("to_role") or "").strip()
+            if fr and to and (fr, to) not in rel_seen:
+                entry = {
+                    "from_role": fr,
+                    "to_role": to,
+                    "vi_self": str(rel.get("vi_self") or "tôi").strip(),
+                    "vi_other": str(rel.get("vi_other") or "cậu").strip(),
+                    "tone": str(rel.get("tone") or "ngang hàng").strip(),
+                    "ko_level": str(rel.get("ko_level") or "haeyo").strip(),
+                    "ja_level": str(rel.get("ja_level") or "plain_modern").strip(),
+                    "es_pronoun": str(rel.get("es_pronoun") or "tú").strip(),
+                }
+                bible["relationships"].append(entry)
+                rel_seen[(fr, to)] = entry
 
     todo_turns = [t for t in turns if int(t["id"]) not in done_roles]
     if not todo_turns and glossary_path.exists():
@@ -348,10 +394,10 @@ def _phase5a_qwen_analyze(
         cfg.get("models", {}).get("vi_translate_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit"),
         "philbert440/Qwen3.8-27B-W4A16-AWQ",
     ]
-    emit_progress(5.0, f"Pha 5A: Nạp {model_id} phân tích ngữ cảnh & phân vai...")
+    emit_progress(5.0, f"Pha 5A: Nạp {model_id} lập Sổ Quan Hệ & phân vai...")
 
     sys_prompt = (
-        "Bạn là biên kịch kiêm đạo diễn lồng tiếng chuyên phim ngắn Trung Quốc. "
+        "Bạn là biên kịch kiêm đạo diễn lồng tiếng chuyên phim ngắn thuyết minh 1 giọng nữ (chuẩn YouTube/Reels). "
         "Trả về DUY NHẤT JSON hợp lệ, không giải thích thêm."
     )
     batch_size = 30
@@ -363,6 +409,7 @@ def _phase5a_qwen_analyze(
                 {
                     "id": int(pt["id"]),
                     "speaker_role": done_roles[int(pt["id"])].get("speaker_role", ""),
+                    "listener_role": done_roles[int(pt["id"])].get("listener_role", ""),
                     "gender": done_roles[int(pt["id"])].get("gender", ""),
                     "self_pronoun": done_roles[int(pt["id"])].get("self_pronoun", ""),
                     "other_pronoun": done_roles[int(pt["id"])].get("other_pronoun", ""),
@@ -370,7 +417,7 @@ def _phase5a_qwen_analyze(
                 }
                 for pt in turns
                 if int(pt["id"]) < int(batch[0]["id"]) and int(pt["id"]) in done_roles
-            ][-5:]
+            ][-6:]
             packed = []
             for t in batch:
                 ac = acoustics_map.get(int(t["id"]), {})
@@ -385,23 +432,19 @@ def _phase5a_qwen_analyze(
                 )
 
             user_prompt = (
-                "Đọc LIỀN MẠCH cả đoạn đối thoại tiếng Trung dưới đây để phân vai từng câu.\n"
+                "Đọc LIỀN MẠCH cả đoạn đối thoại tiếng Trung dưới đây để lập Sổ Quan Hệ Nhân Vật (`bible_add`) và phân vai từng câu.\n"
+                "Vì bản lồng tiếng dùng 1 giọng nữ đọc cho mọi nhân vật, phần phân vai & xưng hô giữa `speaker_role` → `listener_role` PHẢI cực kỳ rõ ràng và khóa cố định theo từng cặp quan hệ.\n"
                 "Lưu ý QUAN TRỌNG:\n"
-                "- `f0_hz` chỉ là tham khảo thô; phải suy luận người nói theo MẠCH HỘI THOẠI liên tiếp (cùng 1 người nói liên tục 3-5 câu thì PHẢI giữ y hệt `speaker_role`, `gender`, `self_pronoun`, `other_pronoun`!).\n"
-                "- Đặc biệt nếu nhân vật đang xưng `'tôi' - 'cậu'` (hoặc `'chị' - 'cậu'`) thì KHÔNG ĐƯỢC tự dưng nhảy sang `'tao' - 'mày'` ở câu kế tiếp của chính người đó!\n"
+                "- `f0_hz` chỉ là tham khảo thô; phải suy luận người nói & người nghe theo MẠCH HỎI-ĐÁP liên tiếp. Cùng 1 cặp nhân vật (`speaker_role -> listener_role`) nói xuyên suốt cảnh phải giữ ĐÚNG MỘT cặp xưng hô `self_pronoun / other_pronoun` (tuyệt đối không nhảy `tôi/cậu` sang `tao/mày` giữa chừng).\n"
                 "- Xác định `era`: `'MODERN'` (phim hiện đại) hoặc `'HISTORICAL'` (cổ trang). Với `'MODERN'` CẤM dùng `'ta'`, `'ngươi'`, `'tại hạ'`.\n\n"
-                f"5 câu neo ngay trước đó (giữ nguyên xưng hô liên mạch): {json.dumps(anchor_prev, ensure_ascii=False)}\n"
+                f"Sổ Quan Hệ hiện có (bắt buộc tuân thủ cặp đã khóa): {json.dumps(bible, ensure_ascii=False)}\n"
+                f"6 câu neo ngay trước đó: {json.dumps(anchor_prev, ensure_ascii=False)}\n"
                 "Xuất JSON gồm:\n"
-                "1) `era`: `'MODERN'` | `'HISTORICAL'`\n"
-                "2) `glossary_add`: CHỈ chứa TÊN RIÊNG thực sự (họ tên nhân vật, tên công ty, địa danh) -> dict {tên_Trung: tên_Hán_Việt}. KHÔNG cho danh từ/động từ thường.\n"
-                "3) `roles`: list cho từng câu theo ĐÚNG số nguyên `id` với các trường:\n"
-                "   - `id`: số nguyên\n"
-                "   - `gender`: `'MALE'` | `'FEMALE'`\n"
-                "   - `speaker_role`: vai ngắn gọn (vd `'Nữ chủ sòng'`, `'Nam chính'`, `'Đám đông'`)\n"
-                "   - `self_pronoun`: đại từ NGƯỜI NÓI tự xưng (vd `'tôi'`, `'chị'`, `'anh'`, `'tao'`; CẤM `'anh'` nếu `gender='FEMALE'`!)\n"
-                "   - `other_pronoun`: đại từ gọi NGƯỜI NGHE (vd `'cậu'`, `'mày'`, `'em'`, `'ông'`)\n"
-                "   - `age_tone`: `'YOUNG'` | `'MATURE'`\n"
-                "   - `emotion`: `'NEUTRAL'` | `'ANGRY'` | `'HAPPY'` | `'SAD'` | `'WHISPER'` | `'URGENT'`\n\n"
+                "1) `era`: `'MODERN'` | `'HISTORICAL'`, `genre`: thể loại ngắn (vd `'hành động hiện đại'`, `'tổng tài'`, `'gia đình'`)\n"
+                "2) `glossary_add`: CHỈ chứa TÊN RIÊNG thực sự (họ tên người, tên công ty, địa danh) -> dict {Trung: Hán_Việt}. KHÔNG cho danh từ/động từ thường.\n"
+                "3) `bible_add`: `{\"characters\": [{\"role\": \"...\", \"gender\": \"MALE|FEMALE\", \"status\": \"...\"}], \"relationships\": [{\"from_role\": \"...\", \"to_role\": \"...\", \"vi_self\": \"...\", \"vi_other\": \"...\", \"tone\": \"kính trọng|ngang hàng|bề trên|thù địch\", \"ko_level\": \"haeyo|banmal\", \"ja_level\": \"desu_masu|plain_modern\", \"es_pronoun\": \"tú|usted\"}]}`\n"
+                "4) `roles`: list cho từng câu theo ĐÚNG số nguyên `id`:\n"
+                "   - `id`, `gender` (`'MALE'|'FEMALE'`), `speaker_role`, `listener_role`, `self_pronoun`, `other_pronoun` (CẤM nữ tự xưng `'anh'`), `age_tone` (`'YOUNG'|'MATURE'`), `emotion` (`'NEUTRAL'|'ANGRY'|'HAPPY'|'SAD'|'WHISPER'|'URGENT'`).\n\n"
                 f"Glossary hiện có: {json.dumps(glossary, ensure_ascii=False)}\n"
                 f"Danh sách câu:\n{json.dumps(packed, ensure_ascii=False)}"
             )
@@ -411,9 +454,14 @@ def _phase5a_qwen_analyze(
             elif not isinstance(res, dict):
                 res = {}
 
-            era = str(res.get("era") or "MODERN").upper()
+            era = str(res.get("era") or bible.get("era") or "MODERN").upper()
             if era not in ("MODERN", "HISTORICAL"):
                 era = "MODERN"
+            _merge_bible(res, era)
+            rel_lookup = {
+                (str(x.get("from_role", "")).strip(), str(x.get("to_role", "")).strip()): x
+                for x in bible.get("relationships", [])
+            }
 
             raw_gloss = res.get("glossary_add")
             if isinstance(raw_gloss, dict):
@@ -467,11 +515,16 @@ def _phase5a_qwen_analyze(
                     if self_p.lower() in ("ta", "tại hạ", "bổn tọa", "bổn cô nương", ""):
                         self_p = "tôi"
                     if other_p.lower() in ("ngươi", "các hạ", "tiểu tử", ""):
-                        other_p = "cậu" if g == "FEMALE" else "mày/cậu"
+                        other_p = "cậu"
                 self_p = self_p or "tôi"
                 other_p = other_p or "cậu"
                 spk_role = str(r.get("speaker_role") or ("Nhân vật nữ" if g == "FEMALE" else "Nhân vật nam")).strip()
-                addr = f"Người nói ({spk_role}, {g}) tự xưng '{self_p}', gọi người nghe là '{other_p}'"
+                lst_role = str(r.get("listener_role") or "Đối phương").strip()
+                locked_rel = rel_lookup.get((spk_role, lst_role))
+                if locked_rel:
+                    self_p = locked_rel.get("vi_self") or self_p
+                    other_p = locked_rel.get("vi_other") or other_p
+                addr = f"{spk_role} → {lst_role}: tự xưng '{self_p}', gọi '{other_p}'"
 
                 item = {
                     "id": tid,
@@ -480,8 +533,12 @@ def _phase5a_qwen_analyze(
                     "age_tone": age_t,
                     "emotion": emo,
                     "speaker_role": spk_role,
+                    "listener_role": lst_role,
                     "self_pronoun": self_p,
                     "other_pronoun": other_p,
+                    "ko_level": (locked_rel or {}).get("ko_level", ""),
+                    "ja_level": (locked_rel or {}).get("ja_level", ""),
+                    "es_pronoun": (locked_rel or {}).get("es_pronoun", ""),
                     "addressing": addr,
                 }
                 role_items.append(item)
@@ -515,15 +572,17 @@ def _phase5b_gemma4_vi(
         emit_progress(65.0, f"Tái sử dụng Pha 5B Gemma 4 ({len(done_map)} câu Việt)")
         return done_map
 
+    bible = read_json_safe(target_dir / "relationship_bible.json") or {}
     model_id = cfg.get("models", {}).get("vi_translate_model", "google/gemma-4-26B-A4B-it")
     emit_progress(35.0, f"Pha 5B: Nạp {model_id} dịch thoại Tiếng Việt...")
     sys_prompt = (
-        "Bạn là biên kịch lồng tiếng phim ngắn Tiếng Việt hàng đầu. "
-        "Dịch SÁT NGHĨA và tự nhiên khẩu ngữ Tiếng Việt HIỆN ĐẠI (vd '干死/千死这个外国佬' = 'Đánh chết thằng Tây này đi!', "
-        "'小帅哥想试试' = 'Cậu em muốn thử không?', '叠被子比赛' = 'Thi gấp chăn', '送命' = 'Nộp mạng', '地下黑拳' = 'đánh quyền ngầm', '现金' = 'tiền mặt'). "
-        "TUYỆT ĐỐI giữ nguyên MỘT cặp xưng hô xuyên suốt cho cùng 1 người nói trong một cuộc hội thoại — "
-        "KHÔNG BAO GIỜ đang xưng 'tôi' lại nhảy sang 'tao' hay ngược lại ở câu liền kề của chính nhân vật đó; "
-        "TUYỆT ĐỐI KHÔNG dùng 'ta/ngươi' ở phim hiện đại và KHÔNG để nữ xưng 'anh'. "
+        "Bạn là biên kịch lồng tiếng phim ngắn Tiếng Việt hàng đầu trên YouTube. "
+        "Phim được thuyết minh bằng MỘT GIỌNG NỮ duy nhất đọc mọi vai, nên bản dịch PHẢI: "
+        "(1) Khẩu ngữ đời thường tự nhiên, gọn gàng vừa miệng đọc, tuyệt đối tránh văn dịch chữ cứng nhắc; "
+        "(2) Giữ chuẩn & KHÓA CỨNG cặp xưng hô `self_pronoun -> other_pronoun` cho từng cặp `speaker -> listener` theo `relationship_bible` "
+        "để người nghe không cần đổi giọng vẫn phân biệt rạch ròi vai vế, địa vị, thái độ giữa các nhân vật; "
+        "(3) Phù hợp ngữ cảnh hỏi-đáp liên hoàn (các câu ngắn/tỉnh lược chủ ngữ phải nối đúng mạch nhân vật đang nói); "
+        "(4) Với phim `MODERN`, CẤM dùng `'ta/ngươi/tại hạ'`; KHÔNG bao giờ để nữ tự xưng `'anh'`. "
         "Chỉ trả JSON hợp lệ."
     )
     batch_size = 30
@@ -534,7 +593,11 @@ def _phase5b_gemma4_vi(
         for i in range(0, len(todo_turns), batch_size):
             batch = todo_turns[i : i + batch_size]
             prev_ctx = [
-                {"id": int(pt["id"]), "speaker": roles_map.get(int(pt["id"]), {}).get("speaker_role", ""), "vi": done_map[int(pt["id"])]}
+                {
+                    "id": int(pt["id"]),
+                    "pair": f"{roles_map.get(int(pt['id']), {}).get('speaker_role', '')} -> {roles_map.get(int(pt['id']), {}).get('listener_role', '')}",
+                    "vi": done_map[int(pt["id"])],
+                }
                 for pt in turns
                 if int(pt["id"]) < int(batch[0]["id"]) and int(pt["id"]) in done_map
             ][-6:]
@@ -549,6 +612,7 @@ def _phase5b_gemma4_vi(
                         "dur_s": dur,
                         "era": r.get("era", "MODERN"),
                         "speaker": r.get("speaker_role", ""),
+                        "listener": r.get("listener_role", ""),
                         "gender": r.get("gender", "MALE"),
                         "self_pronoun": r.get("self_pronoun", "tôi"),
                         "other_pronoun": r.get("other_pronoun", "cậu"),
@@ -557,10 +621,11 @@ def _phase5b_gemma4_vi(
                     }
                 )
             user_prompt = (
-                f"Bảng tên nhân vật/địa danh (chỉ áp dụng đúng TÊN RIÊNG): {json.dumps(glossary, ensure_ascii=False)}\n"
-                f"Ngữ cảnh 6 câu vừa dịch trước đó (bắt buộc giữ nhất quán xưng hô): {json.dumps(prev_ctx, ensure_ascii=False)}\n"
-                "Dịch từng câu sau sang Tiếng Việt hiện đại ngắn gọn, sát nghĩa gốc, vừa miệng đọc trong `dur_s` giây. "
-                "Lưu ý: nếu cùng 1 nhân vật nói nhiều câu liên tiếp, phải dùng THỐNG NHẤT một kiểu xưng hô (không tự nhảy tôi ↔ tao giữa chừng!). "
+                f"Sổ Quan Hệ Nhân Vật (bắt buộc giữ nhất quán): {json.dumps(bible.get('relationships', []), ensure_ascii=False)}\n"
+                f"Bảng tên riêng: {json.dumps(glossary, ensure_ascii=False)}\n"
+                f"Ngữ cảnh 6 câu vừa dịch trước đó: {json.dumps(prev_ctx, ensure_ascii=False)}\n"
+                "Dịch từng câu sau sang Tiếng Việt hiện đại tự nhiên như phim lồng tiếng, vừa miệng đọc trong `dur_s` giây. "
+                "CÙNG 1 cặp `speaker -> listener` phải giữ thống nhất 1 cặp xưng hô (tuyệt đối không tự nhảy tôi ↔ tao giữa chừng!). "
                 'Trả JSON dạng: `{"items": [{"id": 1, "vi": "..."}]}`.\n\n'
                 f"{json.dumps(packed, ensure_ascii=False)}"
             )
@@ -596,7 +661,9 @@ def _phase5b_gemma4_vi(
                 script_rows = [
                     {
                         "id": int(t["id"]),
-                        "speaker": roles_map.get(int(t["id"]), {}).get("speaker_role", ""),
+                        "pair": f"{roles_map.get(int(t['id']), {}).get('speaker_role', '')} -> {roles_map.get(int(t['id']), {}).get('listener_role', '')}",
+                        "self_pronoun": roles_map.get(int(t["id"]), {}).get("self_pronoun", ""),
+                        "other_pronoun": roles_map.get(int(t["id"]), {}).get("other_pronoun", ""),
                         "zh": t["text"],
                         "vi": done_map.get(int(t["id"]), t["text"]),
                     }
@@ -604,10 +671,11 @@ def _phase5b_gemma4_vi(
                 ]
                 polish_prompt = (
                     "Đọc TOÀN BỘ đoạn hội thoại Tiếng Trung (`zh`) và bản dịch Tiếng Việt (`vi`) dưới đây từ đầu tới cuối.\n"
-                    "Chỉ sửa lại `vi` của những câu nào bị 1 trong 3 lỗi sau:\n"
-                    "1) CÙNG 1 NGƯỜI đang nói liên tục trong cảnh mà bị nhảy xưng hô (ví dụ câu trước xưng 'tôi' câu sau nhảy 'tao', hoặc câu trước 'em' câu sau 'mày' — phải thống nhất lại theo mạch vai vế!).\n"
+                    f"Sổ Quan Hệ tham chiếu: {json.dumps(bible.get('relationships', []), ensure_ascii=False)}\n"
+                    "Chỉ sửa lại `vi` của những câu bị 1 trong 3 lỗi sau:\n"
+                    "1) Cặp `speaker -> listener` bị nhảy xưng hô giữa chừng (lúc xưng 'tôi' lúc nhảy 'tao', hoặc lệch với `self_pronoun/other_pronoun`).\n"
                     "2) Nhân vật NỮ tự xưng 'anh' hoặc dùng từ cổ trang 'ta/ngươi' trong phim hiện đại.\n"
-                    "3) Dịch chưa sát sắc thái câu gốc (vd '千死/干死这个外国佬' phải dứt khoát là 'Đánh chết thằng Tây này đi!' hoặc 'Giết chết thằng Tây này đi!').\n"
+                    "3) Dịch còn gượng kiểu văn dịch chữ hoặc sai chủ ngữ của người đang nói.\n"
                     'Trả JSON chỉ gồm các câu cần sửa (hoặc toàn bộ): `{"items": [{"id": 1, "vi": "..."}]}`.\n\n'
                     f"{json.dumps(script_rows, ensure_ascii=False)}"
                 )
@@ -647,13 +715,24 @@ def _build_qa_html_and_backtrans(
     """Dịch ngược nhanh các bản ngoại ngữ (EN/JA/KO/ES) sang Tiếng Việt để người dùng tự kiểm tra 100% độ chuẩn."""
     foreign_langs = [lg for lg in lang_done.keys() if lang_done.get(lg)]
     back_vi: dict[str, dict[int, str]] = {lg: {} for lg in foreign_langs}
-    sys_qa = "You are a bilingual quality reviewer. Back-translate each foreign subtitle line faithfully into concise Vietnamese so an editor can verify its meaning. Return ONLY valid JSON."
+    sys_qa = (
+        "You are a bilingual quality reviewer. Back-translate each foreign subtitle line faithfully into concise MODERN Vietnamese "
+        "(use natural 'tôi/cậu/anh/em', NEVER use archaic 'ta/ngươi' for English 'you/I' or Spanish 'tú'). Return ONLY valid JSON."
+    )
 
     for lg in foreign_langs:
         dmap = lang_done[lg]
         for i in range(0, len(turns), 20):
             chunk = turns[i : i + 20]
-            packed = [{"id": int(t["id"]), "txt": dmap.get(int(t["id"]), "")} for t in chunk if dmap.get(int(t["id"]))]
+            packed = [
+                {
+                    "id": int(t["id"]),
+                    "pair": f"{roles_map.get(int(t['id']), {}).get('speaker_role', '')} -> {roles_map.get(int(t['id']), {}).get('listener_role', '')}",
+                    "txt": dmap.get(int(t["id"]), ""),
+                }
+                for t in chunk
+                if dmap.get(int(t["id"]))
+            ]
             if not packed:
                 continue
             try:
@@ -748,26 +827,59 @@ def _phase5c_translategemma_foreign(
     model_id = cfg.get("models", {}).get("foreign_translate_model", "google/gemma-4-26B-A4B-it")
     emit_progress(67.0, f"Pha 5C: Nạp {model_id} dịch {', '.join(foreign_langs).upper()}...")
 
+    bible = read_json_safe(target_dir / "relationship_bible.json") or {}
+    lang_dub_rules = {
+        "en": "Natural conversational American dubbing English; keep speaker intent & emotional punch clear even on short lines.",
+        "ja": (
+            "Natural modern spoken Japanese suitable for a single female voice-over narrator; "
+            "keep ONE consistent politeness level (desu/masu vs plain) per speaker->listener pair, "
+            "and AVOID harsh overly-masculine/archaic slang endings like 'じゃねえか', 'ぞ', or 'わし'."
+        ),
+        "ko": (
+            "Natural modern spoken Korean matching character status; "
+            "STRICTLY keep ONE speech level (해요체/하십시오체 vs 반말) per speaker->listener pair across the scene — "
+            "NEVER randomly switch from '-요' to banmal in consecutive lines of the same pair; "
+            "preserve exact speaker perspective on elliptical replies (do NOT confuse challenger vs host)."
+        ),
+        "es": "Natural neutral Latin-American dubbing Spanish; lock 'tú' vs 'usted' consistently per speaker->listener pair.",
+    }
+
     batch_size = 15
     zh_fb = cfg.get("models", {}).get("zh_analyst_model", "philbert440/Qwen3.8-27B-W4A16-AWQ")
     ctx = nullcontext(conn) if conn else _managed_vllm_with_fallback(model_id, [zh_fb], cfg, "Pha 5C")
     with ctx as (base_url, mid):
         for l_idx, lang in enumerate(foreign_langs):
             lname = LANG_NAMES.get(lang, lang)
+            rule = lang_dub_rules.get(lang, "Natural spoken dubbing style matching character register.")
             jp = target_dir / f"05c_sub_{lang}.jsonl"
             dmap = lang_done[lang]
             todo = [t for t in turns if int(t["id"]) not in dmap]
             sys_prompt = (
-                f"You are a professional dubbing script translator for modern short dramas. "
-                f"Translate Chinese dialogue into concise, natural spoken {lname} matching character register (`speaker_role`, `self_pronoun`->`other_pronoun`) and `vi_ref` intent. Output ONLY valid JSON."
+                f"You are a professional dubbing script translator for modern vertical short dramas (1-female-narrator voice-over). "
+                f"Translate Chinese dialogue into concise, natural spoken {lname} strictly honoring character relationships, speaker perspective, `self_pronoun`/`other_pronoun` politeness, and `vi_ref` intent. "
+                f"Language rule for {lname}: {rule} Output ONLY valid JSON."
             )
             for i in range(0, len(todo), batch_size):
                 batch = todo[i : i + batch_size]
+                prev_ctx = [
+                    {
+                        "id": int(pt["id"]),
+                        "pair": f"{roles_map.get(int(pt['id']), {}).get('speaker_role', '')} -> {roles_map.get(int(pt['id']), {}).get('listener_role', '')}",
+                        "text": dmap[int(pt["id"])],
+                    }
+                    for pt in turns
+                    if int(pt["id"]) < int(batch[0]["id"]) and int(pt["id"]) in dmap
+                ][-6:]
                 packed = [
                     {
                         "id": int(t["id"]),
                         "dur_s": round(max(0.4, float(t["end"]) - float(t["start"])), 2),
+                        "era": roles_map.get(int(t["id"]), {}).get("era", "MODERN"),
                         "speaker": roles_map.get(int(t["id"]), {}).get("speaker_role", ""),
+                        "listener": roles_map.get(int(t["id"]), {}).get("listener_role", ""),
+                        "self_pronoun": roles_map.get(int(t["id"]), {}).get("self_pronoun", ""),
+                        "other_pronoun": roles_map.get(int(t["id"]), {}).get("other_pronoun", ""),
+                        "register_hint": roles_map.get(int(t["id"]), {}).get(f"{lang}_level") or roles_map.get(int(t["id"]), {}).get("es_pronoun", ""),
                         "emotion": roles_map.get(int(t["id"]), {}).get("emotion", "NEUTRAL"),
                         "vi_ref": vi_ref.get(int(t["id"]), ""),
                         "zh": t["text"],
@@ -775,7 +887,9 @@ def _phase5c_translategemma_foreign(
                     for t in batch
                 ]
                 user_prompt = (
-                    f"Translate each Chinese line to natural spoken {lname} matching `dur_s` duration and `vi_ref` context/politeness. "
+                    f"Relationship Bible: {json.dumps(bible.get('relationships', []), ensure_ascii=False)}\n"
+                    f"Previous {lname} lines (keep register & perspective consistent): {json.dumps(prev_ctx, ensure_ascii=False)}\n"
+                    f"Translate each Chinese line to natural spoken {lname} matching `dur_s` duration, `speaker -> listener` relationship, and `vi_ref` meaning. "
                     f'Return JSON: {{"items": [{{"id": 1, "text": "..."}}]}}.\n'
                     f"Proper-noun Glossary: {json.dumps(glossary, ensure_ascii=False)}\n"
                     f"Lines: {json.dumps(packed, ensure_ascii=False)}"

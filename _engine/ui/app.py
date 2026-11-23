@@ -124,6 +124,7 @@ class StartJobReq(BaseModel):
     force_step1: bool = False
     target_stage: str = "auto"
     voice_mode: str | None = None
+    langs: list[str] | None = None
 
 
 class UploadInitReq(BaseModel):
@@ -245,7 +246,14 @@ def create_job_from_path(req: FromPathReq):
 @app.post("/api/jobs/{job_id}/start")
 def start_job(job_id: str, req: StartJobReq):
     try:
-        manager.enqueue_job(job_id, mode=req.mode, force_step1=req.force_step1, target_stage=req.target_stage, voice_mode=req.voice_mode)
+        manager.enqueue_job(
+            job_id,
+            mode=req.mode,
+            force_step1=req.force_step1,
+            target_stage=req.target_stage,
+            voice_mode=req.voice_mode,
+            langs=req.langs,
+        )
         return {"ok": True}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
