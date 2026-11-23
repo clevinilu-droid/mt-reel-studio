@@ -153,6 +153,24 @@ def get_state():
     return manager.get_snapshot()
 
 
+@app.get("/api/diag")
+def get_diag():
+    """Chẩn đoán phần cứng tức thì (h264_nvenc + ONNX CUDA) không cần mở SSH."""
+    from _engine.pipeline.s1_prepare import diagnose_gpu_encoder
+
+    ort_info: dict[str, Any] = {}
+    try:
+        from _engine.core.vram_guard import ensure_onnx_cuda_libs
+
+        loaded = ensure_onnx_cuda_libs()
+        import onnxruntime as ort
+
+        ort_info = {"providers": ort.get_available_providers(), "preloaded": loaded[:8]}
+    except Exception as exc:
+        ort_info = {"error": str(exc)}
+    return {"nvenc": diagnose_gpu_encoder(), "onnx": ort_info}
+
+
 @app.get("/api/downloads")
 def get_downloads():
     return {"items": manager.list_download_videos()}

@@ -63,6 +63,52 @@ def emit_progress(pct: float, detail: str):
     print(f"[PROG] {max(0.0, min(100.0, pct)):.1f} | {detail}", flush=True)
 
 
+def ensure_onnx_cuda_libs() -> list[str]:
+    """Nạp sẵn CUDA/cuDNN shared libs từ venv hiện tại để ONNX Runtime bật được CUDAExecutionProvider."""
+    loaded: list[str] = []
+    try:
+        import onnxruntime as ort
+
+        if hasattr(ort, "preload_dlls"):
+            ort.preload_dlls()
+            loaded.append("ort.preload_dlls")
+    except Exception:
+        pass
+
+    if not sys.platform.startswith("linux"):
+        return loaded
+
+    try:
+        import ctypes
+        import glob
+
+        lib_dirs = []
+        for base in (Path(sys.prefix), Path("/opt/venvs/asr_sep"), Path("/opt/venvs/vlm_llm")):
+            for pat in (
+                str(base / "lib" / "python*" / "site-packages" / "nvidia" / "*" / "lib"),
+                str(base / "lib" / "python*" / "site-packages" / "torch" / "lib"),
+            ):
+                for d in glob.glob(pat):
+                    if d not in lib_dirs and Path(d).is_dir():
+                        lib_dirs.append(d)
+        if lib_dirs:
+            cur_ld = os.environ.get("LD_LIBRARY_PATH", "")
+            parts = [p for p in [*lib_dirs, *cur_ld.split(":")] if p]
+            os.environ["LD_LIBRARY_PATH"] = ":".join(dict.fromkeys(parts))
+            # Nạp trước các thư viện cốt lõi bằng RTLD_GLOBAL để dlopen của onnxruntime tìm thấy ngay
+            for d in lib_dirs:
+                for so in sorted(Path(d).glob("lib*.so*")):
+                    if any(k in so.name for k in ("libcudnn", "libcublas", "libcudart", "libnvrtc", "libcufft")):
+                        try:
+                            ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
+                            loaded.append(so.name)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+    return loaded
+
+
 def patch_onnx_threads(threads: int = 4):
     """Giới hạn số luồng ONNX Runtime CPU (tránh spinlock 128 threads trên container giới hạn cgroup EPYC)."""
     for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):

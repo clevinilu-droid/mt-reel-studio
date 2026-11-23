@@ -219,7 +219,7 @@ def rent_instance(
     env_map: dict[str, str] = {
         "-p 7860:7860": "1",
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        "NVIDIA_DRIVER_CAPABILITIES": "compute,utility,video",
+        "NVIDIA_DRIVER_CAPABILITIES": "all",
     }
     if include_rclone:
         rc_b64 = _read_local_rclone_b64()

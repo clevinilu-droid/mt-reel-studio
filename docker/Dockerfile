@@ -68,7 +68,7 @@ RUN uv venv /opt/venvs/voxcpm --python python3.11 && \
     uv pip install --python /opt/venvs/voxcpm/bin/python \
       voxcpm soundfile hf-transfer
 
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+ENV NVIDIA_DRIVER_CAPABILITIES=all
 
 WORKDIR /workspace/mt_video
 COPY _engine /workspace/mt_video/_engine

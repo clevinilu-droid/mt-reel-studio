@@ -17,17 +17,15 @@ if [ -n "${RCLONE_CONF_B64:-}" ]; then
   echo "[BOOT] Đã nạp cấu hình Google Drive (rclone.conf)."
 fi
 
-# 2. Thiết lập đường dẫn thư viện CUDA cho ONNX Runtime
-LD_EXTRA=$(/opt/venvs/asr_sep/bin/python - <<'PY'
-import importlib.util
+# 2. Thiết lập đường dẫn thư viện CUDA cho ONNX Runtime (quét mọi venv)
+LD_EXTRA=$(python3 - <<'PY'
+import glob
 from pathlib import Path
 dirs = []
-for m in ("nvidia", "torch"):
-    s = importlib.util.find_spec(m)
-    if s and s.submodule_search_locations:
-        for p in Path(list(s.submodule_search_locations)[0]).rglob("lib"):
-            if p.is_dir():
-                dirs.append(str(p))
+for pat in ("/opt/venvs/*/lib/python*/site-packages/nvidia/*/lib", "/opt/venvs/*/lib/python*/site-packages/torch/lib"):
+    for p in glob.glob(pat):
+        if Path(p).is_dir():
+            dirs.append(p)
 print(":".join(dict.fromkeys(dirs)))
 PY
 )

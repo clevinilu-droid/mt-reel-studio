@@ -87,9 +87,12 @@ def probe_media(src_path: Path) -> dict[str, Any]:
 def detect_gpu_encoder() -> tuple[str, list[str], list[str]]:
     """Tự nhận diện GPU encoder mạnh nhất trên máy (NVENC > Intel QSV > CPU libx264)."""
     candidates = [
-        ("h264_nvenc", ["-hwaccel", "cuda"], ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19"]),
+        ("h264_nvenc", [], ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "19", "-b:v", "0"]),
+        ("h264_nvenc", [], ["-c:v", "h264_nvenc", "-preset", "fast", "-cq", "20"]),
+        ("h264_nvenc", [], ["-c:v", "h264_nvenc"]),
         ("h264_qsv", ["-hwaccel", "d3d11va"], ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "20"]),
     ]
+    nvenc_errs: list[str] = []
     for name, hw_args, enc_args in candidates:
         res = subprocess.run(
             [
@@ -109,10 +112,54 @@ def detect_gpu_encoder() -> tuple[str, list[str], list[str]]:
                 "-",
             ],
             capture_output=True,
+            text=True,
+            errors="replace",
         )
         if res.returncode == 0:
             return name, hw_args, enc_args
+        if name == "h264_nvenc" and res.stderr:
+            nvenc_errs.append(res.stderr.strip().splitlines()[-1])
+    if nvenc_errs:
+        print(f"[GPU ENCODER WARN] h264_nvenc không khả dụng ({nvenc_errs[0]}) -> fallback libx264", flush=True)
     return "libx264", [], ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
+
+
+def diagnose_gpu_encoder() -> dict[str, Any]:
+    """Kiểm tra chi tiết nguyên nhân NVENC/ONNX CUDA để chẩn đoán tức thì qua /api/diag."""
+    import glob
+    import os
+
+    res = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=0.3:size=320x240:rate=30",
+            "-pix_fmt",
+            "nv12",
+            "-c:v",
+            "h264_nvenc",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    enc_name, _, _ = detect_gpu_encoder()
+    nv_libs = sorted(glob.glob("/usr/lib/**/libnvidia-encode*", recursive=True))
+    return {
+        "selected_encoder": enc_name,
+        "nvenc_probe_rc": res.returncode,
+        "nvenc_probe_stderr": (res.stderr or "").strip(),
+        "nvidia_driver_capabilities": os.environ.get("NVIDIA_DRIVER_CAPABILITIES", ""),
+        "libnvidia_encode_paths": nv_libs[:8],
+    }
 
 
 def _ffmpeg_cfr_flag() -> str:

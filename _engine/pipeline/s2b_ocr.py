@@ -24,7 +24,7 @@ import numpy as np
 from PIL import Image
 
 from _engine.core.checkpoint import atomic_write_json, read_json_safe
-from _engine.core.vram_guard import emit_progress, load_pipeline_config, patch_onnx_threads, release_vram
+from _engine.core.vram_guard import emit_progress, ensure_onnx_cuda_libs, load_pipeline_config, patch_onnx_threads, release_vram
 
 CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
 
@@ -61,9 +61,9 @@ def extract_guided_keyframes(
     manifest_kf_path: Path,
     crop_y0_ratio: float = 0.60,
     crop_y1_ratio: float = 0.90,
-    speech_fps: float = 5.0,
-    idle_fps: float = 2.5,
-    diff_thresh: float = 8.5,
+    speech_fps: float = 4.0,
+    idle_fps: float = 1.2,
+    diff_thresh: float = 9.5,
 ) -> list[dict[str, Any]]:
     """Dùng PyAV quét video, chỉ trích lưu các ảnh Keyframe khi dải phụ đề thực sự đổi chữ."""
     existing = read_json_safe(manifest_kf_path)
@@ -306,18 +306,39 @@ def run_step2b(target_dir: Path, force: bool = False, batch_size: int = 16) -> d
 
     ocr_engine = None
     if not vlm_url:
-        emit_progress(48.5, "Đang nạp RapidOCR (4 luồng an toàn)...")
+        emit_progress(48.5, "Đang nạp RapidOCR (kiểm tra GPU CUDA)...")
+        ensure_onnx_cuda_libs()
         patch_onnx_threads(4)
+        import onnxruntime as ort
         from rapidocr_onnxruntime import RapidOCR
 
-        ocr_engine = RapidOCR(
-            use_angle_cls=False,
-            det_use_cuda=False,
-            det_model_path=None,
-            rec_use_cuda=False,
-            rec_model_path=None,
-        )
-        engine_used = "rapidocr_cpu"
+        has_cuda_ep = "CUDAExecutionProvider" in ort.get_available_providers()
+        if has_cuda_ep:
+            try:
+                gpu_ocr = RapidOCR(
+                    use_angle_cls=False,
+                    det_use_cuda=True,
+                    det_model_path=None,
+                    rec_use_cuda=True,
+                    rec_model_path=None,
+                )
+                # Thử 1 ảnh nhỏ để xác nhận cuDNN/CUDA ExecutionProvider chạy thật trước khi quét batch
+                gpu_ocr(np.zeros((64, 160, 3), dtype=np.uint8))
+                ocr_engine = gpu_ocr
+                engine_used = "rapidocr_cuda"
+                batch_size = max(batch_size, 64)
+            except Exception as exc:
+                print(f"[S2B CUDA WARN] RapidOCR CUDA lỗi ({exc}) -> fallback rapidocr_cpu", flush=True)
+
+        if ocr_engine is None:
+            ocr_engine = RapidOCR(
+                use_angle_cls=False,
+                det_use_cuda=False,
+                det_model_path=None,
+                rec_use_cuda=False,
+                rec_model_path=None,
+            )
+            engine_used = "rapidocr_cpu"
 
     total_todo = len(todo)
     processed = 0
