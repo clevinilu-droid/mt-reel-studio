@@ -203,16 +203,18 @@ def _chat_json(base_url: str, model_id: str, system_prompt: str, user_prompt: st
     last_err = None
     use_json_mode = True
     use_no_think = True
-    for attempt in range(4):
+    max_tokens: int | None = 2400
+    for attempt in range(5):
         payload: dict[str, Any] = {
             "model": model_id,
             "temperature": temp,
-            "max_tokens": 8192,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         if use_json_mode:
             payload["response_format"] = {"type": "json_object"}
         if use_no_think:
@@ -226,6 +228,10 @@ def _chat_json(base_url: str, model_id: str, system_prompt: str, user_prompt: st
             last_err = exc
             err_s = str(exc).lower()
             if "http 400" in err_s or "http 422" in err_s:
+                if max_tokens is not None and ("max_tokens" in err_s or "max_model_len" in err_s or "context length" in err_s):
+                    # Bỏ max_tokens để vLLM tự lấy phần còn lại của max_model_len
+                    max_tokens = None
+                    continue
                 if use_no_think and ("chat_template_kwargs" in err_s or "extra_forbidden" in err_s):
                     use_no_think = False
                     continue
@@ -233,7 +239,7 @@ def _chat_json(base_url: str, model_id: str, system_prompt: str, user_prompt: st
                     use_json_mode = False
                     continue
             time.sleep(2.0 * (attempt + 1))
-    raise RuntimeError(f"Gọi LLM thất bại sau 4 lần ({model_id}): {last_err}")
+    raise RuntimeError(f"Gọi LLM thất bại sau 5 lần ({model_id}): {last_err}")
 
 
 def _load_jsonl_map(path: Path, key: str = "id") -> dict[int, dict[str, Any]]:
@@ -306,7 +312,7 @@ def _phase5a_qwen_analyze(
         "Bạn là biên kịch kiêm đạo diễn lồng tiếng chuyên phim ngắn Trung Quốc. "
         "Trả về DUY NHẤT JSON hợp lệ, không giải thích thêm."
     )
-    batch_size = 25
+    batch_size = 15
     vllm_ctx = None
     last_exc = None
     for cand_m in cand_models:
@@ -415,7 +421,7 @@ def _phase5b_gemma4_vi(
         "Dịch tiếng Trung sang văn nói Tiếng Việt tự nhiên, sắc sảo, không dịch sượng Hán Việt, "
         "độ dài câu khớp thời lượng giây cho phép. Chỉ trả JSON hợp lệ."
     )
-    batch_size = 25
+    batch_size = 15
     ctx = nullcontext(conn) if conn else managed_vllm_server(model_id, cfg)
     with ctx as (base_url, mid):
         for i in range(0, len(todo_turns), batch_size):
@@ -494,7 +500,7 @@ def _phase5c_translategemma_foreign(
     model_id = cfg.get("models", {}).get("foreign_translate_model", "google/gemma-4-26B-A4B-it")
     emit_progress(67.0, f"Pha 5C: Nạp {model_id} dịch {', '.join(foreign_langs).upper()}...")
 
-    batch_size = 25
+    batch_size = 15
     ctx = nullcontext(conn) if conn else managed_vllm_server(model_id, cfg)
     with ctx as (base_url, mid):
         for l_idx, lang in enumerate(foreign_langs):
