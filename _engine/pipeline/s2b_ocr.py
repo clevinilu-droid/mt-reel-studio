@@ -59,11 +59,11 @@ def extract_guided_keyframes(
     asr_segs: list[dict[str, Any]],
     kf_dir: Path,
     manifest_kf_path: Path,
-    crop_y0_ratio: float = 0.56,
-    crop_y1_ratio: float = 0.94,
-    speech_fps: float = 4.0,
-    idle_fps: float = 1.0,
-    diff_thresh: float = 9.5,
+    crop_y0_ratio: float = 0.60,
+    crop_y1_ratio: float = 0.90,
+    speech_fps: float = 5.0,
+    idle_fps: float = 2.5,
+    diff_thresh: float = 8.5,
 ) -> list[dict[str, Any]]:
     """Dùng PyAV quét video, chỉ trích lưu các ảnh Keyframe khi dải phụ đề thực sự đổi chữ."""
     existing = read_json_safe(manifest_kf_path)
@@ -200,10 +200,11 @@ def _ocr_batch_vlm_openai(
 
 
 def _ocr_batch_rapidocr(batch_items: list[dict[str, Any]], kf_dir: Path, ocr_engine) -> list[dict[str, Any]]:
-    """Đọc batch ảnh bằng RapidOCR (ONNX CUDA trên 3090 / CPU local)."""
+    """Đọc batch ảnh bằng RapidOCR và lọc bỏ nhiễu chữ áo/quần đùi/góc màn hình."""
     out: list[dict[str, Any]] = []
     for item in batch_items:
         arr = np.array(Image.open(kf_dir / item["file"]).convert("RGB"))
+        sh, sw, _ = arr.shape
         # RapidOCR dùng BGR
         bgr = arr[:, :, ::-1].copy()
         res, _ = ocr_engine(bgr)
@@ -211,11 +212,21 @@ def _ocr_batch_rapidocr(batch_items: list[dict[str, Any]], kf_dir: Path, ocr_eng
         if res:
             for r in res:
                 box, txt, conf = r[0], r[1].strip(), float(r[2])
-                if conf < 0.55 or not clean_cjk(txt):
+                ck = clean_cjk(txt)
+                if conf < 0.60 or not ck:
                     continue
                 ys = [p[1] for p in box]
                 xs = [p[0] for p in box]
-                if (max(ys) - min(ys)) > 125:
+                if (max(ys) - min(ys)) > max(90, int(sh * 0.34)):
+                    continue
+                # Hard-sub thoại luôn căn giữa khung hình; chữ 1-2 ký tự lệch biên (logo áo/quần) hoặc tự tin thấp phải loại bỏ
+                cx = (min(xs) + max(xs)) / 2.0
+                off_center = abs(cx - sw / 2.0) / max(1.0, sw)
+                if len(ck) == 1 and (conf < 0.82 or off_center > 0.14):
+                    continue
+                if len(ck) == 2 and (off_center > 0.22 or (off_center > 0.15 and conf < 0.78)):
+                    continue
+                if off_center > 0.36:
                     continue
                 kept.append((min(ys), min(xs), txt, conf))
         if kept:

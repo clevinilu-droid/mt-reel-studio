@@ -234,181 +234,141 @@ def run_step3(target_dir: Path, force: bool = False) -> dict[str, Any]:
     ocr_segs = ocr_data.get("segments", [])
     used_ocr_ids: set[int] = set()
 
-    emit_progress(10.0, f"Đang đối chiếu {len(asr_segs)} câu ASR ↔ {len(ocr_segs)} dòng OCR (Pinyin={_HAS_PYPINYIN})...")
+    emit_progress(10.0, f"Đang đối chiếu {len(asr_segs)} câu ASR ↔ {len(ocr_segs)} dòng Hard-sub (Pinyin={_HAS_PYPINYIN})...")
 
-    # Lượt 1: ghép ứng viên OCR tốt nhất cho từng câu Audio
     candidates: list[dict[str, Any]] = []
-    need_rescue_indices: list[int] = []
-
-    for idx, a in enumerate(asr_segs):
-        a_s, a_e = _tighten_words_span(a)
-        a_txt = str(a["text"]).strip()
-        a_ck = clean_cjk(a_txt)
-
-        # Chống đoạn ASR bị gom nhiều câu (vd: 15 câu dồn vào 0.7s): tách theo các dòng OCR đã chứa trong đoạn ASR đó
-        if len(a_ck) >= 20:
-            a_py = to_pinyin_plain(a_txt)
-            covered_ocr = []
-            for o in ocr_segs:
-                o_ck = clean_cjk(o["text"])
-                o_py = to_pinyin_plain(o["text"])
-                if not o_ck:
-                    continue
-                if o_ck in a_ck or (len(o_py) >= 6 and o_py in a_py):
-                    covered_ocr.append(o)
-            if len(covered_ocr) >= 2:
-                for o in covered_ocr:
-                    used_ocr_ids.add(int(o["id"]))
-                    candidates.append(
-                        {
-                            "start": round(float(o["start"]), 3),
-                            "end": round(float(o["end"]), 3),
-                            "text": str(o["text"]).strip(),
-                            "asr_text": str(o["text"]).strip(),
-                            "ocr_text": str(o["text"]).strip(),
-                            "spk_id": a.get("spk_id", "SPK_UNK"),
-                            "audit_status": "MATCHED",
-                            "pinyin_sim": 0.95,
-                        }
-                    )
-                continue
-
-        # Lấy tất cả OCR quanh [a_s - 1.3s, a_e + 1.3s]
-        nearby = [o for o in ocr_segs if float(o["end"]) >= a_s - 1.3 and float(o["start"]) <= a_e + 1.3]
-        best_ocr = None
-        best_score = -1.0
-
-        for o in nearby:
-            sim = pinyin_similarity(a_txt, o["text"])
-            overlap = max(0.0, min(a_e, float(o["end"])) - max(a_s, float(o["start"])))
-            dist = max(0.0, max(a_s - float(o["end"]), float(o["start"]) - a_e))
-            score = sim * 0.72 + (0.28 if overlap > 0 else max(0.0, 0.22 - dist * 0.15))
-            if score > best_score:
-                best_score = score
-                best_ocr = o
-
-        ocr_txt = best_ocr["text"] if best_ocr else ""
-        ocr_ck = clean_cjk(ocr_txt)
-        sim_best = pinyin_similarity(a_txt, ocr_txt) if best_ocr else 0.0
-
-        # Kiểm tra trường hợp 1 câu ASR gộp 2 dòng OCR liên tiếp nằm gọn bên trong khung giờ đó
-        combined_text = ""
-        combined_ids: list[int] = []
-        if len(nearby) >= 2 and len(ocr_ck) < int(len(a_ck) * 0.75):
-            in_win = [o for o in nearby if float(o["end"]) >= a_s - 0.5 and float(o["start"]) <= a_e + 0.5]
-            in_win.sort(key=lambda x: float(x["start"]))
-            cand_join = " ".join(o["text"] for o in in_win[:2])
-            if pinyin_similarity(a_txt, cand_join) > sim_best + 0.15:
-                combined_text = cand_join
-                combined_ids = [int(o["id"]) for o in in_win[:2]]
-                ocr_txt = combined_text
-                ocr_ck = clean_cjk(ocr_txt)
-                sim_best = pinyin_similarity(a_txt, ocr_txt)
-
-        is_short = len(a_ck) <= 2
-        truncated = bool(best_ocr) and len(a_ck) >= 4 and len(ocr_ck) < max(2, int(len(a_ck) * 0.58))
-        matched = bool(best_ocr) and (sim_best >= 0.45 or (is_short and len(ocr_ck) >= 1)) and not truncated
-
-        if matched and best_ocr:
-            if combined_ids:
-                used_ocr_ids.update(combined_ids)
-            else:
-                used_ocr_ids.add(int(best_ocr["id"]))
-            candidates.append(
-                {
-                    "start": round(a_s, 3),
-                    "end": round(a_e, 3),
-                    "text": ocr_txt,
-                    "asr_text": a_txt,
-                    "ocr_text": ocr_txt,
-                    "spk_id": a.get("spk_id", "SPK_UNK"),
-                    "audit_status": "MATCHED",
-                    "pinyin_sim": round(sim_best, 3),
-                }
-            )
-        else:
-            candidates.append(
-                {
-                    "start": round(a_s, 3),
-                    "end": round(a_e, 3),
-                    "text": ocr_txt if (len(ocr_ck) >= len(a_ck) and sim_best >= 0.35) else a_txt,
-                    "asr_text": a_txt,
-                    "ocr_text": ocr_txt,
-                    "spk_id": a.get("spk_id", "SPK_UNK"),
-                    "audit_status": "NEEDS_RESCUE",
-                    "pinyin_sim": round(sim_best, 3),
-                }
-            )
-            need_rescue_indices.append(idx)
-
-    # Lượt 2: Cứu hộ cục bộ 8 fps bằng PyAV + RapidOCR cho những câu OCR trống / cụt
+    screen_captions: list[dict[str, Any]] = []
     rescued_ocr = 0
     fallback_asr = 0
-    if need_rescue_indices and cfr_mp4.exists():
-        patch_onnx_threads(4)
-        from rapidocr_onnxruntime import RapidOCR
-
-        ocr_engine = RapidOCR(use_angle_cls=False, det_use_cuda=False, rec_use_cuda=False)
-        for ri, ci in enumerate(need_rescue_indices, start=1):
-            c = candidates[ci]
-            if ri % 5 == 1 or ri == len(need_rescue_indices):
-                pct = 35.0 + (ri / len(need_rescue_indices)) * 55.0
-                emit_progress(pct, f"Đang cứu hộ OCR cục bộ 8fps: {ri}/{len(need_rescue_indices)} câu nghi cụt/sót...")
-            r_txt = rescue_ocr_window(cfr_mp4, ocr_engine, c["start"], c["end"], fps=8.0)
-            r_ck = clean_cjk(r_txt)
-            a_ck = clean_cjk(c["asr_text"])
-            r_sim = pinyin_similarity(c["asr_text"], r_txt) if r_ck else 0.0
-            if r_ck and (r_sim >= 0.48 or (len(a_ck) <= 2 and r_sim >= 0.30)):
-                c["text"] = r_txt
-                c["ocr_text"] = r_txt
-                c["audit_status"] = "OCR_RESCUED"
-                c["pinyin_sim"] = round(r_sim, 3)
-                rescued_ocr += 1
-            else:
-                c["text"] = c["asr_text"]
-                c["audit_status"] = "ASR_FALLBACK"
-                fallback_asr += 1
-
-    # Lượt 3: Kiểm tra âm thanh ngược với các dòng OCR chưa ghép cặp (cứu câu ngắn/hét bị Whisper sót)
-    wav_16k = target_dir / "01_orig_16k_ai.wav"
-    wf_16k = wave.open(str(wav_16k), "rb") if wav_16k.exists() else None
-    screen_captions: list[dict[str, Any]] = []
     ocr_promoted = 0
-    try:
-        for o in ocr_segs:
-            if int(o["id"]) in used_ocr_ids:
-                continue
-            os_t, oe_t = float(o["start"]), float(o["end"])
-            o_txt = str(o["text"]).strip()
-            # Nếu đè lên câu đã có hoặc trùng Pinyin ngay cạnh thì bỏ qua tránh lặp câu
-            dup = any(
-                (max(0.0, min(c["end"], oe_t) - max(c["start"], os_t)) > 0.25 and pinyin_similarity(c["text"], o_txt) >= 0.50)
-                or (abs(c["start"] - os_t) <= 0.6 and clean_cjk(c["text"]) == clean_cjk(o_txt))
-                for c in candidates
-            )
-            if dup:
-                continue
-            rms, f0_hits, med_f0 = _measure_voice_in_wav(wf_16k, os_t, oe_t)
-            if rms >= 0.035 and f0_hits >= 5:
+
+    if len(ocr_segs) >= 3:
+        # CHẾ ĐỘ CHUẨN HARDSUB-FIRST:
+        # Hard-sub hiển thị từng câu trên màn hình là chuẩn gốc cả về nội dung lẫn timeline [start, end].
+        # ASR chỉ dùng để gắn `spk_id` (nếu có) và sửa câu OCR bị nhìn nhầm khi trùng độ dài & Pinyin cao.
+        wav_16k = target_dir / "01_orig_16k_ai.wav"
+        wf_16k = wave.open(str(wav_16k), "rb") if wav_16k.exists() else None
+        try:
+            for o in ocr_segs:
+                os_t = float(o["start"])
+                oe_t = max(os_t + 0.18, float(o["end"]))
+                o_txt = str(o["text"]).strip()
+                o_ck = clean_cjk(o_txt)
+                o_conf = float(o.get("conf", 0.8) or 0.8)
+                if not o_ck:
+                    continue
+
+                # Tìm đoạn ASR gần nhất (không dùng ASR gom nhiều câu để thay thế)
+                spk_id = "SPK_UNK"
+                best_asr_txt = ""
+                best_sim = 0.0
+                for a in asr_segs:
+                    a_s, a_e = _tighten_words_span(a)
+                    if a_e < os_t - 1.5 or a_s > oe_t + 1.5:
+                        continue
+                    spk_cand = str(a.get("spk_id") or "SPK_UNK")
+                    if spk_cand != "SPK_UNK":
+                        spk_id = spk_cand
+                    a_txt = str(a.get("text") or "").strip()
+                    a_ck = clean_cjk(a_txt)
+                    sim = pinyin_similarity(a_txt, o_txt)
+                    if sim > best_sim and abs(len(a_ck) - len(o_ck)) <= max(2, int(len(o_ck) * 0.25)):
+                        best_sim = sim
+                        best_asr_txt = a_txt
+
+                rms, f0_hits, med_f0 = _measure_voice_in_wav(wf_16k, os_t, oe_t)
+                # Nếu câu chỉ có 1-2 chữ, tự tin thấp và hoàn toàn im lặng (logo áo/chữ cảnh) -> lọc bỏ
+                if len(o_ck) <= 2 and o_conf < 0.85 and rms < 0.015 and f0_hits < 2 and best_sim < 0.4:
+                    screen_captions.append(o)
+                    continue
+
                 candidates.append(
                     {
                         "start": round(os_t, 3),
                         "end": round(oe_t, 3),
                         "text": o_txt,
-                        "asr_text": "",
+                        "asr_text": best_asr_txt,
                         "ocr_text": o_txt,
-                        "spk_id": "SPK_UNK",
-                        "audit_status": "OCR_AUDIO_CONFIRMED",
-                        "pinyin_sim": 1.0,
+                        "spk_id": spk_id,
+                        "audit_status": "MATCHED" if best_sim >= 0.45 else "OCR_HARDSUB",
+                        "pinyin_sim": round(best_sim, 3),
                         "f0_hint": med_f0,
                     }
                 )
-                ocr_promoted += 1
+        finally:
+            if wf_16k is not None:
+                wf_16k.close()
+    else:
+        # FALLBACK CHO PHIM THÔ KHÔNG CÓ HARDSUB: đối chiếu ASR + cứu hộ OCR 8fps
+        need_rescue_indices: list[int] = []
+        for idx, a in enumerate(asr_segs):
+            a_s, a_e = _tighten_words_span(a)
+            a_txt = str(a["text"]).strip()
+            a_ck = clean_cjk(a_txt)
+            nearby = [o for o in ocr_segs if float(o["end"]) >= a_s - 1.3 and float(o["start"]) <= a_e + 1.3]
+            best_ocr = None
+            best_score = -1.0
+            for o in nearby:
+                sim = pinyin_similarity(a_txt, o["text"])
+                overlap = max(0.0, min(a_e, float(o["end"])) - max(a_s, float(o["start"])))
+                dist = max(0.0, max(a_s - float(o["end"]), float(o["start"]) - a_e))
+                score = sim * 0.72 + (0.28 if overlap > 0 else max(0.0, 0.22 - dist * 0.15))
+                if score > best_score:
+                    best_score = score
+                    best_ocr = o
+            ocr_txt = best_ocr["text"] if best_ocr else ""
+            ocr_ck = clean_cjk(ocr_txt)
+            sim_best = pinyin_similarity(a_txt, ocr_txt) if best_ocr else 0.0
+            matched = bool(best_ocr) and (sim_best >= 0.45 or (len(a_ck) <= 2 and len(ocr_ck) >= 1))
+            if matched and best_ocr:
+                used_ocr_ids.add(int(best_ocr["id"]))
+                candidates.append(
+                    {
+                        "start": round(a_s, 3),
+                        "end": round(a_e, 3),
+                        "text": ocr_txt,
+                        "asr_text": a_txt,
+                        "ocr_text": ocr_txt,
+                        "spk_id": a.get("spk_id", "SPK_UNK"),
+                        "audit_status": "MATCHED",
+                        "pinyin_sim": round(sim_best, 3),
+                    }
+                )
             else:
-                screen_captions.append(o)
-    finally:
-        if wf_16k is not None:
-            wf_16k.close()
+                candidates.append(
+                    {
+                        "start": round(a_s, 3),
+                        "end": round(a_e, 3),
+                        "text": ocr_txt if (len(ocr_ck) >= len(a_ck) and sim_best >= 0.35) else a_txt,
+                        "asr_text": a_txt,
+                        "ocr_text": ocr_txt,
+                        "spk_id": a.get("spk_id", "SPK_UNK"),
+                        "audit_status": "NEEDS_RESCUE",
+                        "pinyin_sim": round(sim_best, 3),
+                    }
+                )
+                need_rescue_indices.append(idx)
+
+        if need_rescue_indices and cfr_mp4.exists():
+            patch_onnx_threads(4)
+            from rapidocr_onnxruntime import RapidOCR
+
+            ocr_engine = RapidOCR(use_angle_cls=False, det_use_cuda=False, rec_use_cuda=False)
+            for ri, ci in enumerate(need_rescue_indices, start=1):
+                c = candidates[ci]
+                r_txt = rescue_ocr_window(cfr_mp4, ocr_engine, c["start"], c["end"], fps=8.0)
+                r_ck = clean_cjk(r_txt)
+                r_sim = pinyin_similarity(c["asr_text"], r_txt) if r_ck else 0.0
+                if r_ck and r_sim >= 0.45:
+                    c["text"] = r_txt
+                    c["ocr_text"] = r_txt
+                    c["audit_status"] = "OCR_RESCUED"
+                    c["pinyin_sim"] = round(r_sim, 3)
+                    rescued_ocr += 1
+                else:
+                    c["text"] = c["asr_text"]
+                    c["audit_status"] = "ASR_FALLBACK"
+                    fallback_asr += 1
 
     candidates.sort(key=lambda c: c["start"])
     # Khóa chống chồng chéo timeline tuyệt đối (không bao giờ hiện 2 dòng sub đè nhau cùng lúc)

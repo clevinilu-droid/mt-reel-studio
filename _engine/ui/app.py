@@ -71,7 +71,7 @@ async def proxy_remote_target(request: Request, call_next):
             raise HTTPException(status_code=400, detail="Địa chỉ máy Vast điều khiển từ xa không hợp lệ.")
         path_qs = f"{path}?{request.url.query}" if request.url.query else path
         body = await request.body()
-        timeout = 300 if (path == "/api/jobs/from-drive" or path.startswith("/api/upload/")) else 25
+        timeout = 300 if (path == "/api/jobs/from-drive" or path.startswith("/api/upload/") or path.endswith("/push-output")) else 25
         try:
             status, ctype, raw = await asyncio.to_thread(
                 _forward_remote_sync,
@@ -254,6 +254,16 @@ def start_job(job_id: str, req: StartJobReq):
 def pause_job(job_id: str):
     manager.pause_job(job_id)
     return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/reset")
+def reset_job(job_id: str, mode: str | None = None):
+    try:
+        return manager.reset_downstream_cache(job_id, mode=mode)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/jobs/{job_id}/push-drive")

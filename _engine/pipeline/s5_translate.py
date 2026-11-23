@@ -498,7 +498,7 @@ def _phase5b_gemma4_vi(
                     }
                 )
             user_prompt = (
-                f"Bảng tên riêng bắt buộc (Glossary): {json.dumps(glossary, ensure_ascii=False)}\n"
+                f"Bảng tên nhân vật/địa danh (chỉ áp dụng đúng TÊN RIÊNG, bỏ qua nếu là danh từ/động từ thường): {json.dumps(glossary, ensure_ascii=False)}\n"
                 "Dịch từng câu sau sang Tiếng Việt ngắn gọn vừa miệng đọc trong `dur_s` giây, "
                 "tuân thủ đúng `addressing` và `emotion`. Trả JSON dạng: "
                 '`{"items": [{"id": 1, "vi": "..."}]}`.\n\n'

@@ -53,6 +53,7 @@ class JobManager:
 
         self._pipeline_queue: queue.Queue[tuple[str, bool, str]] = queue.Queue()
         self._drive_queue: queue.Queue[str] = queue.Queue()
+        self._push_output_busy: set[str] = set()
         self._ws_clients: set[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = set()
         self.drive_pull: dict[str, Any] = {"status": "idle", "work_rel": "", "progress_pct": 0.0, "detail": ""}
 
@@ -208,16 +209,53 @@ class JobManager:
         return m
 
     def push_output_drive(self, job_id: str) -> dict[str, Any]:
-        """Đẩy thư mục thành phẩm `output/<work_rel>/` lên Google Drive."""
+        """Đẩy thư mục thành phẩm `output/<work_rel>/` lên Google Drive (khóa chống bấm đúp gây trùng file)."""
         with self._lock:
             m = self.jobs.get(job_id)
             if not m:
                 raise KeyError(f"Không tìm thấy job {job_id}")
+            if job_id in self._push_output_busy:
+                return {"ok": True, "already_running": True, "remote": ""}
+            self._push_output_busy.add(job_id)
             rel = m["work_rel"]
-        out_dir = OUTPUT_ROOT / rel
-        res = push_output_to_drive(rel, out_dir, log_cb=lambda msg: self.append_log(job_id, msg))
-        self.append_log(job_id, f"[DRIVE OUTPUT] Đã đẩy xong thành phẩm -> {res['remote']}")
-        return res
+        try:
+            out_dir = OUTPUT_ROOT / rel
+            res = push_output_to_drive(rel, out_dir, log_cb=lambda msg: self.append_log(job_id, msg))
+            self.append_log(job_id, f"[DRIVE OUTPUT] Đã đẩy xong thành phẩm -> {res['remote']}")
+            return res
+        finally:
+            with self._lock:
+                self._push_output_busy.discard(job_id)
+
+    def reset_downstream_cache(self, job_id: str, mode: str | None = None) -> dict[str, Any]:
+        """Xóa cache B2A -> B6 (giữ nguyên video/audio B1) để chạy lại test/full sạch theo bản vá mới."""
+        import shutil
+
+        with self._lock:
+            m = self.jobs.get(job_id)
+            if not m:
+                raise KeyError(f"Không tìm thấy job {job_id}")
+            if m.get("status") == "running":
+                raise RuntimeError("Job đang chạy, không thể xóa cache.")
+            use_mode = mode or m.get("mode", "test_5min")
+            work_dir = Path(m["work_dir"])
+            target_dir = (work_dir / "_test_5min") if use_mode == "test_5min" else work_dir
+            for pat in ("02a*", "02b*", "03*", "04*", "05*", "glossary.json", "relationship_bible.json"):
+                for p in target_dir.glob(pat):
+                    if p.is_file():
+                        p.unlink(missing_ok=True)
+            for dname in ("keyframes", "tracks", "tts_cache"):
+                dp = target_dir / dname
+                if dp.exists():
+                    shutil.rmtree(dp, ignore_errors=True)
+            for sk in ("s2a", "s2b", "s3", "s4", "s5", "s6"):
+                if sk in m.get("steps", {}):
+                    m["steps"][sk].update({"status": "pending", "progress_pct": 0.0, "detail": "", "elapsed_s": 0.0})
+            m["status"] = "paused"
+            save_manifest(m)
+        self.append_log(job_id, f"[RESET] Đã dọn cache B2A -> B6 ({target_dir.name}), giữ nguyên B1.")
+        self._notify_ws()
+        return {"ok": True, "target_dir": str(target_dir)}
 
     def add_or_attach_job(
         self,
