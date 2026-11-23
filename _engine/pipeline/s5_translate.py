@@ -21,6 +21,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextlib import nullcontext
 from pathlib import Path
@@ -401,152 +402,179 @@ def _phase5a_qwen_analyze(
         "Trả về DUY NHẤT JSON hợp lệ, không giải thích thêm."
     )
     batch_size = 30
-    ctx = nullcontext(conn) if conn else _managed_vllm_with_fallback(model_id, fallback_models, cfg, "Pha 5A")
-    with ctx as (base_url, mid):
-        for i in range(0, len(todo_turns), batch_size):
-            batch = todo_turns[i : i + batch_size]
-            anchor_prev = [
+    wave_workers = 6
+    all_batches = [todo_turns[i : i + batch_size] for i in range(0, len(todo_turns), batch_size)]
+
+    def _build_5a_prompt(batch: list[dict[str, Any]], snap_bible: dict[str, Any], snap_gloss: dict[str, Any]) -> str:
+        first_id = int(batch[0]["id"])
+        anchor_prev = []
+        for pt in turns:
+            pid = int(pt["id"])
+            if pid >= first_id:
+                break
+            r_prev = done_roles.get(pid, {})
+            anchor_prev.append(
                 {
-                    "id": int(pt["id"]),
-                    "speaker_role": done_roles[int(pt["id"])].get("speaker_role", ""),
-                    "listener_role": done_roles[int(pt["id"])].get("listener_role", ""),
-                    "gender": done_roles[int(pt["id"])].get("gender", ""),
-                    "self_pronoun": done_roles[int(pt["id"])].get("self_pronoun", ""),
-                    "other_pronoun": done_roles[int(pt["id"])].get("other_pronoun", ""),
+                    "id": pid,
+                    "speaker_role": r_prev.get("speaker_role", ""),
+                    "listener_role": r_prev.get("listener_role", ""),
+                    "self_pronoun": r_prev.get("self_pronoun", ""),
+                    "other_pronoun": r_prev.get("other_pronoun", ""),
                     "zh": pt["text"],
                 }
-                for pt in turns
-                if int(pt["id"]) < int(batch[0]["id"]) and int(pt["id"]) in done_roles
-            ][-6:]
-            packed = []
-            for t in batch:
-                ac = acoustics_map.get(int(t["id"]), {})
-                packed.append(
-                    {
-                        "id": int(t["id"]),
-                        "spk_id": t.get("spk_id", "SPK_UNK"),
-                        "f0_hz": ac.get("f0_hz"),
-                        "gender_hint": ac.get("gender_hint", "UNKNOWN"),
-                        "zh": t["text"],
-                    }
-                )
-
-            user_prompt = (
-                "Đọc LIỀN MẠCH cả đoạn đối thoại tiếng Trung dưới đây để lập Sổ Quan Hệ Nhân Vật (`bible_add`) và phân vai từng câu.\n"
-                "Vì bản lồng tiếng dùng 1 giọng nữ đọc cho mọi nhân vật, phần phân vai & xưng hô giữa `speaker_role` → `listener_role` PHẢI cực kỳ rõ ràng và khóa cố định theo từng cặp quan hệ.\n"
-                "Lưu ý QUAN TRỌNG:\n"
-                "- `f0_hz` chỉ là tham khảo thô; phải suy luận người nói & người nghe theo MẠCH HỎI-ĐÁP liên tiếp. Cùng 1 cặp nhân vật (`speaker_role -> listener_role`) nói xuyên suốt cảnh phải giữ ĐÚNG MỘT cặp xưng hô `self_pronoun / other_pronoun` (tuyệt đối không nhảy `tôi/cậu` sang `tao/mày` giữa chừng).\n"
-                "- Xác định `era`: `'MODERN'` (phim hiện đại) hoặc `'HISTORICAL'` (cổ trang). Với `'MODERN'` CẤM dùng `'ta'`, `'ngươi'`, `'tại hạ'`.\n\n"
-                f"Sổ Quan Hệ hiện có (bắt buộc tuân thủ cặp đã khóa): {json.dumps(bible, ensure_ascii=False)}\n"
-                f"6 câu neo ngay trước đó: {json.dumps(anchor_prev, ensure_ascii=False)}\n"
-                "Xuất JSON gồm:\n"
-                "1) `era`: `'MODERN'` | `'HISTORICAL'`, `genre`: thể loại ngắn (vd `'hành động hiện đại'`, `'tổng tài'`, `'gia đình'`)\n"
-                "2) `glossary_add`: CHỈ chứa TÊN RIÊNG thực sự (họ tên người, tên công ty, địa danh) -> dict {Trung: Hán_Việt}. KHÔNG cho danh từ/động từ thường.\n"
-                "3) `bible_add`: `{\"characters\": [{\"role\": \"...\", \"gender\": \"MALE|FEMALE\", \"status\": \"...\"}], \"relationships\": [{\"from_role\": \"...\", \"to_role\": \"...\", \"vi_self\": \"...\", \"vi_other\": \"...\", \"tone\": \"kính trọng|ngang hàng|bề trên|thù địch\", \"ko_level\": \"haeyo|banmal\", \"ja_level\": \"desu_masu|plain_modern\", \"es_pronoun\": \"tú|usted\"}]}`\n"
-                "4) `roles`: list cho từng câu theo ĐÚNG số nguyên `id`:\n"
-                "   - `id`, `gender` (`'MALE'|'FEMALE'`), `speaker_role`, `listener_role`, `self_pronoun`, `other_pronoun` (CẤM nữ tự xưng `'anh'`), `age_tone` (`'YOUNG'|'MATURE'`), `emotion` (`'NEUTRAL'|'ANGRY'|'HAPPY'|'SAD'|'WHISPER'|'URGENT'`).\n\n"
-                f"Glossary hiện có: {json.dumps(glossary, ensure_ascii=False)}\n"
-                f"Danh sách câu:\n{json.dumps(packed, ensure_ascii=False)}"
             )
-            res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.1)
-            if isinstance(res, list):
-                res = {"era": "MODERN", "glossary_add": {}, "roles": res}
-            elif not isinstance(res, dict):
-                res = {}
-
-            era = str(res.get("era") or bible.get("era") or "MODERN").upper()
-            if era not in ("MODERN", "HISTORICAL"):
-                era = "MODERN"
-            _merge_bible(res, era)
-            rel_lookup = {
-                (str(x.get("from_role", "")).strip(), str(x.get("to_role", "")).strip()): x
-                for x in bible.get("relationships", [])
+        anchor_prev = anchor_prev[-6:]
+        packed = [
+            {
+                "id": int(t["id"]),
+                "spk_id": t.get("spk_id", "SPK_UNK"),
+                "zh": t["text"],
             }
+            for t in batch
+        ]
+        return (
+            "Đọc LIỀN MẠCH đoạn đối thoại tiếng Trung dưới đây để cập nhật Sổ Quan Hệ Nhân Vật (`bible_add`) và phân vai từng câu.\n"
+            "Vì bản lồng tiếng dùng 1 giọng nữ đọc cho mọi nhân vật, phần phân vai & xưng hô giữa `speaker_role` → `listener_role` PHẢI rõ ràng và khóa cố định theo từng cặp quan hệ.\n"
+            "- Suy luận người nói & người nghe theo MẠCH HỎI-ĐÁP liên tiếp. Cùng 1 cặp nhân vật (`speaker_role -> listener_role`) phải giữ ĐÚNG MỘT cặp xưng hô `self_pronoun / other_pronoun` (không nhảy `tôi/cậu` sang `tao/mày` giữa chừng).\n"
+            "- `era`: `'MODERN'` (phim hiện đại, CẤM `'ta/ngươi/tại hạ'`) hoặc `'HISTORICAL'` (cổ trang).\n\n"
+            f"Sổ Quan Hệ hiện có (bắt buộc tuân thủ cặp đã khóa): {json.dumps(snap_bible, ensure_ascii=False)}\n"
+            f"6 câu neo ngay trước đó: {json.dumps(anchor_prev, ensure_ascii=False)}\n"
+            "Xuất JSON gọn gồm:\n"
+            "1) `era`: `'MODERN'` | `'HISTORICAL'`\n"
+            "2) `glossary_add`: CHỈ chứa TÊN RIÊNG mới (họ tên người, công ty, địa danh) -> dict {Trung: Hán_Việt}.\n"
+            "3) `bible_add`: `{\"characters\": [{\"role\": \"...\", \"gender\": \"MALE|FEMALE\", \"status\": \"...\"}], \"relationships\": [{\"from_role\": \"...\", \"to_role\": \"...\", \"vi_self\": \"...\", \"vi_other\": \"...\", \"tone\": \"kính trọng|ngang hàng|bề trên|thù địch\", \"ko_level\": \"haeyo|banmal\", \"ja_level\": \"desu_masu|plain_modern\", \"es_pronoun\": \"tú|usted\"}]}` (chỉ thêm cặp mới chưa có)\n"
+            "4) `roles`: list cho từng câu theo ĐÚNG `id`: `{\"id\": 1, \"g\": \"MALE|FEMALE\", \"s\": \"vai_người_nói\", \"l\": \"vai_người_nghe\", \"sp\": \"xưng\", \"op\": \"gọi\", \"e\": \"NEUTRAL|ANGRY|HAPPY|SAD|WHISPER|URGENT\"}` (CẤM nữ tự xưng `'anh'`).\n\n"
+            f"Glossary hiện có: {json.dumps(snap_gloss, ensure_ascii=False)}\n"
+            f"Danh sách câu:\n{json.dumps(packed, ensure_ascii=False)}"
+        )
 
-            raw_gloss = res.get("glossary_add")
-            if isinstance(raw_gloss, dict):
-                for k, v in raw_gloss.items():
-                    if k and isinstance(v, str) and v.strip() and k not in glossary:
-                        glossary[str(k)] = v.strip()
-            atomic_write_json(glossary_path, glossary)
+    def _apply_5a_result(batch: list[dict[str, Any]], res: Any):
+        if isinstance(res, list):
+            res = {"era": "MODERN", "glossary_add": {}, "roles": res}
+        elif not isinstance(res, dict):
+            res = {}
 
-            raw_roles = res.get("roles") or res.get("items") or []
-            if isinstance(raw_roles, dict):
-                raw_roles = [
-                    ({"id": rk, **rv} if isinstance(rv, dict) else {"id": rk})
-                    for rk, rv in raw_roles.items()
-                ]
-            res_map: dict[int, dict[str, Any]] = {}
-            spk_map: dict[str, dict[str, Any]] = {}
-            for r in raw_roles:
-                if not isinstance(r, dict):
-                    continue
-                rid = _safe_int(r.get("id"))
-                if rid is not None:
-                    res_map[rid] = r
-                else:
-                    sk = str(r.get("spk_id") or r.get("id") or "").strip()
-                    if sk:
-                        spk_map[sk] = r
+        era = str(res.get("era") or bible.get("era") or "MODERN").upper()
+        if era not in ("MODERN", "HISTORICAL"):
+            era = "MODERN"
+        _merge_bible(res, era)
+        rel_lookup = {
+            (str(x.get("from_role", "")).strip(), str(x.get("to_role", "")).strip()): x
+            for x in bible.get("relationships", [])
+        }
 
-            role_items = []
-            for t in batch:
-                tid = int(t["id"])
-                ac = acoustics_map.get(tid, {})
-                r = res_map.get(tid) or spk_map.get(str(t.get("spk_id") or "")) or {}
-                g = str(r.get("gender") or ac.get("gender_hint") or "MALE").upper()
-                if g not in ("MALE", "FEMALE"):
-                    g = "FEMALE" if ac.get("gender_hint") == "FEMALE" else "MALE"
-                age_t = str(r.get("age_tone") or "YOUNG").upper()
-                if age_t not in ("YOUNG", "MATURE"):
-                    age_t = "YOUNG"
-                emo = str(r.get("emotion") or "NEUTRAL").upper()
-                if emo not in ("NEUTRAL", "ANGRY", "HAPPY", "SAD", "WHISPER", "URGENT"):
-                    emo = "NEUTRAL"
+        raw_gloss = res.get("glossary_add")
+        if isinstance(raw_gloss, dict):
+            for k, v in raw_gloss.items():
+                if k and isinstance(v, str) and v.strip() and k not in glossary:
+                    glossary[str(k)] = v.strip()
 
-                self_p = str(r.get("self_pronoun") or "").strip()
-                other_p = str(r.get("other_pronoun") or "").strip()
-                # Chặn cứng lỗi nữ tự xưng 'anh' hoặc phim hiện đại xưng cổ trang 'ta/ngươi'
-                if g == "FEMALE" and self_p.lower() in ("anh", "chú", "ông", "tao_male"):
-                    self_p = "chị" if age_t == "YOUNG" else "tôi"
-                if g == "MALE" and self_p.lower() in ("chị", "cô", "dì", "bà"):
+        raw_roles = res.get("roles") or res.get("items") or []
+        if isinstance(raw_roles, dict):
+            raw_roles = [
+                ({"id": rk, **rv} if isinstance(rv, dict) else {"id": rk})
+                for rk, rv in raw_roles.items()
+            ]
+        res_map: dict[int, dict[str, Any]] = {}
+        spk_map: dict[str, dict[str, Any]] = {}
+        for r in raw_roles:
+            if not isinstance(r, dict):
+                continue
+            rid = _safe_int(r.get("id"))
+            if rid is not None:
+                res_map[rid] = r
+            else:
+                sk = str(r.get("spk_id") or r.get("id") or "").strip()
+                if sk:
+                    spk_map[sk] = r
+
+        role_items = []
+        for t in batch:
+            tid = int(t["id"])
+            ac = acoustics_map.get(tid, {})
+            r = res_map.get(tid) or spk_map.get(str(t.get("spk_id") or "")) or {}
+            g_raw = str(r.get("gender") or r.get("g") or ac.get("gender_hint") or "MALE").upper()
+            g = "FEMALE" if g_raw.startswith("F") else "MALE"
+            age_t = str(r.get("age_tone") or r.get("a") or "YOUNG").upper()
+            if age_t not in ("YOUNG", "MATURE"):
+                age_t = "YOUNG"
+            emo = str(r.get("emotion") or r.get("e") or "NEUTRAL").upper()
+            if emo not in ("NEUTRAL", "ANGRY", "HAPPY", "SAD", "WHISPER", "URGENT"):
+                emo = "NEUTRAL"
+
+            self_p = str(r.get("self_pronoun") or r.get("sp") or "").strip()
+            other_p = str(r.get("other_pronoun") or r.get("op") or "").strip()
+            if g == "FEMALE" and self_p.lower() in ("anh", "chú", "ông", "tao_male"):
+                self_p = "chị" if age_t == "YOUNG" else "tôi"
+            if g == "MALE" and self_p.lower() in ("chị", "cô", "dì", "bà"):
+                self_p = "tôi"
+            if era == "MODERN":
+                if self_p.lower() in ("ta", "tại hạ", "bổn tọa", "bổn cô nương", ""):
                     self_p = "tôi"
-                if era == "MODERN":
-                    if self_p.lower() in ("ta", "tại hạ", "bổn tọa", "bổn cô nương", ""):
-                        self_p = "tôi"
-                    if other_p.lower() in ("ngươi", "các hạ", "tiểu tử", ""):
-                        other_p = "cậu"
-                self_p = self_p or "tôi"
-                other_p = other_p or "cậu"
-                spk_role = str(r.get("speaker_role") or ("Nhân vật nữ" if g == "FEMALE" else "Nhân vật nam")).strip()
-                lst_role = str(r.get("listener_role") or "Đối phương").strip()
-                locked_rel = rel_lookup.get((spk_role, lst_role))
-                if locked_rel:
-                    self_p = locked_rel.get("vi_self") or self_p
-                    other_p = locked_rel.get("vi_other") or other_p
-                addr = f"{spk_role} → {lst_role}: tự xưng '{self_p}', gọi '{other_p}'"
+                if other_p.lower() in ("ngươi", "các hạ", "tiểu tử", ""):
+                    other_p = "cậu"
+            self_p = self_p or "tôi"
+            other_p = other_p or "cậu"
+            spk_role = str(r.get("speaker_role") or r.get("s") or ("Nhân vật nữ" if g == "FEMALE" else "Nhân vật nam")).strip()
+            lst_role = str(r.get("listener_role") or r.get("l") or "Đối phương").strip()
+            locked_rel = rel_lookup.get((spk_role, lst_role))
+            if locked_rel:
+                self_p = locked_rel.get("vi_self") or self_p
+                other_p = locked_rel.get("vi_other") or other_p
+            addr = f"{spk_role} → {lst_role}: tự xưng '{self_p}', gọi '{other_p}'"
 
-                item = {
-                    "id": tid,
-                    "era": era,
-                    "gender": g,
-                    "age_tone": age_t,
-                    "emotion": emo,
-                    "speaker_role": spk_role,
-                    "listener_role": lst_role,
-                    "self_pronoun": self_p,
-                    "other_pronoun": other_p,
-                    "ko_level": (locked_rel or {}).get("ko_level", ""),
-                    "ja_level": (locked_rel or {}).get("ja_level", ""),
-                    "es_pronoun": (locked_rel or {}).get("es_pronoun", ""),
-                    "addressing": addr,
-                }
-                role_items.append(item)
-                done_roles[tid] = item
-            _append_jsonl_batch(roles_jsonl, role_items)
+            item = {
+                "id": tid,
+                "era": era,
+                "gender": g,
+                "age_tone": age_t,
+                "emotion": emo,
+                "speaker_role": spk_role,
+                "listener_role": lst_role,
+                "self_pronoun": self_p,
+                "other_pronoun": other_p,
+                "ko_level": (locked_rel or {}).get("ko_level", ""),
+                "ja_level": (locked_rel or {}).get("ja_level", ""),
+                "es_pronoun": (locked_rel or {}).get("es_pronoun", ""),
+                "addressing": addr,
+            }
+            role_items.append(item)
+            done_roles[tid] = item
+        _append_jsonl_batch(roles_jsonl, role_items)
 
-            pct = 8.0 + (len(done_roles) / max(1, len(turns))) * 25.0
-            emit_progress(pct, f"Pha 5A Gemma 4: đã phân tích vai & xưng hô {len(done_roles)}/{len(turns)} câu")
+    ctx = nullcontext(conn) if conn else _managed_vllm_with_fallback(model_id, fallback_models, cfg, "Pha 5A")
+    with ctx as (base_url, mid):
+        start_b = 0
+        # Nếu mới bắt đầu chưa có Sổ Quan Hệ, chạy tuần tự 2 batch đầu (60 câu) để khóa nhân vật chính trước
+        if len(done_roles) < 60 and all_batches:
+            seed_cnt = min(2, len(all_batches))
+            for b_idx in range(seed_cnt):
+                batch = all_batches[b_idx]
+                up = _build_5a_prompt(batch, bible, glossary)
+                res = _chat_json(base_url, mid, sys_prompt, up, temp=0.1)
+                _apply_5a_result(batch, res)
+                atomic_write_json(glossary_path, glossary)
+                atomic_write_json(bible_path, bible)
+                pct = 8.0 + (len(done_roles) / max(1, len(turns))) * 25.0
+                emit_progress(pct, f"Pha 5A Gemma 4: đã phân tích vai & xưng hô {len(done_roles)}/{len(turns)} câu")
+            start_b = seed_cnt
+
+        # Chạy song song 6 batch/lượt (continuous batching trên vLLM đẩy RTX 3090 lên ~95% GPU)
+        rem_batches = all_batches[start_b:]
+        with ThreadPoolExecutor(max_workers=wave_workers) as pool:
+            for w0 in range(0, len(rem_batches), wave_workers):
+                wave = rem_batches[w0 : w0 + wave_workers]
+                snap_bible = json.loads(json.dumps(bible))
+                snap_gloss = dict(glossary)
+                prompts = [_build_5a_prompt(b, snap_bible, snap_gloss) for b in wave]
+                futs = [pool.submit(_chat_json, base_url, mid, sys_prompt, up, 0.1) for up in prompts]
+                for batch, fut in zip(wave, futs):
+                    res = fut.result()
+                    _apply_5a_result(batch, res)
+                atomic_write_json(glossary_path, glossary)
+                atomic_write_json(bible_path, bible)
+                pct = 8.0 + (len(done_roles) / max(1, len(turns))) * 25.0
+                emit_progress(pct, f"Pha 5A Gemma 4 (x6 GPU): đã phân tích vai & xưng hô {len(done_roles)}/{len(turns)} câu")
 
     atomic_write_json(glossary_path, glossary)
     atomic_write_json(bible_path, bible)
@@ -586,76 +614,89 @@ def _phase5b_gemma4_vi(
         "Chỉ trả JSON hợp lệ."
     )
     batch_size = 30
+    wave_workers = 6
     zh_fb = cfg.get("models", {}).get("zh_analyst_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit")
     ctx = nullcontext(conn) if conn else _managed_vllm_with_fallback(model_id, [zh_fb], cfg, "Pha 5B")
     ran_translation = False
-    with ctx as (base_url, mid):
-        for i in range(0, len(todo_turns), batch_size):
-            batch = todo_turns[i : i + batch_size]
-            prev_ctx = [
-                {
-                    "id": int(pt["id"]),
-                    "pair": f"{roles_map.get(int(pt['id']), {}).get('speaker_role', '')} -> {roles_map.get(int(pt['id']), {}).get('listener_role', '')}",
-                    "vi": done_map[int(pt["id"])],
-                }
-                for pt in turns
-                if int(pt["id"]) < int(batch[0]["id"]) and int(pt["id"]) in done_map
-            ][-6:]
-            packed = []
-            for t in batch:
-                tid = int(t["id"])
-                r = roles_map.get(tid, {})
-                dur = round(max(0.4, float(t["end"]) - float(t["start"])), 2)
-                packed.append(
-                    {
-                        "id": tid,
-                        "dur_s": dur,
-                        "era": r.get("era", "MODERN"),
-                        "speaker": r.get("speaker_role", ""),
-                        "listener": r.get("listener_role", ""),
-                        "gender": r.get("gender", "MALE"),
-                        "self_pronoun": r.get("self_pronoun", "tôi"),
-                        "other_pronoun": r.get("other_pronoun", "cậu"),
-                        "emotion": r.get("emotion", "NEUTRAL"),
-                        "zh": t["text"],
-                    }
-                )
-            user_prompt = (
-                f"Sổ Quan Hệ Nhân Vật (bắt buộc giữ nhất quán): {json.dumps(bible.get('relationships', []), ensure_ascii=False)}\n"
-                f"Bảng tên riêng: {json.dumps(glossary, ensure_ascii=False)}\n"
-                f"Ngữ cảnh 6 câu vừa dịch trước đó: {json.dumps(prev_ctx, ensure_ascii=False)}\n"
-                "Dịch từng câu sau sang Tiếng Việt hiện đại tự nhiên như phim lồng tiếng, vừa miệng đọc trong `dur_s` giây. "
-                "CÙNG 1 cặp `speaker -> listener` phải giữ thống nhất 1 cặp xưng hô (tuyệt đối không tự nhảy tôi ↔ tao giữa chừng!). "
-                'Trả JSON dạng: `{"items": [{"id": 1, "vi": "..."}]}`.\n\n'
-                f"{json.dumps(packed, ensure_ascii=False)}"
-            )
-            res = _chat_json(base_url, mid, sys_prompt, user_prompt, temp=0.15)
-            raw_items = res if isinstance(res, list) else (res.get("items") or res.get("roles") or [])
-            if isinstance(raw_items, dict):
-                raw_items = [{"id": k, "vi": v} if not isinstance(v, dict) else {"id": k, **v} for k, v in raw_items.items()]
-            rmap: dict[int, str] = {}
-            for x in raw_items:
-                if not isinstance(x, dict):
-                    continue
-                xid = _safe_int(x.get("id"))
-                if xid is not None:
-                    rmap[xid] = str(x.get("vi") or x.get("text") or x.get("translation") or "").strip()
-            out_items = []
-            for t in batch:
-                tid = int(t["id"])
-                vi_txt = rmap.get(tid) or t["text"]
-                done_map[tid] = vi_txt
-                out_items.append({"id": tid, "vi": vi_txt})
-            _append_jsonl_batch(vi_jsonl, out_items)
-            ran_translation = True
-            pct = 36.0 + (len(done_map) / max(1, len(turns))) * 22.0
-            emit_progress(pct, f"Pha 5B Gemma 4 (VI): {len(done_map)}/{len(turns)} câu")
+    all_vi_batches = [todo_turns[i : i + batch_size] for i in range(0, len(todo_turns), batch_size)]
 
-        # Pha 5B.2: Rà soát nguyên cảnh để khóa cứng tính nhất quán xưng hô (chỉ sửa câu bị lệch xưng hô/lệch nghĩa)
+    def _build_5b_prompt(batch: list[dict[str, Any]]) -> str:
+        first_id = int(batch[0]["id"])
+        prev_ctx = [
+            {
+                "id": int(pt["id"]),
+                "pair": f"{roles_map.get(int(pt['id']), {}).get('speaker_role', '')} -> {roles_map.get(int(pt['id']), {}).get('listener_role', '')} ({roles_map.get(int(pt['id']), {}).get('self_pronoun', 'tôi')}/{roles_map.get(int(pt['id']), {}).get('other_pronoun', 'cậu')})",
+                "zh": pt["text"],
+                "vi": done_map.get(int(pt["id"]), ""),
+            }
+            for pt in turns
+            if int(pt["id"]) < first_id
+        ][-6:]
+        packed = []
+        for t in batch:
+            tid = int(t["id"])
+            r = roles_map.get(tid, {})
+            dur = round(max(0.4, float(t["end"]) - float(t["start"])), 2)
+            packed.append(
+                {
+                    "id": tid,
+                    "dur_s": dur,
+                    "era": r.get("era", "MODERN"),
+                    "speaker": r.get("speaker_role", ""),
+                    "listener": r.get("listener_role", ""),
+                    "gender": r.get("gender", "MALE"),
+                    "self_pronoun": r.get("self_pronoun", "tôi"),
+                    "other_pronoun": r.get("other_pronoun", "cậu"),
+                    "emotion": r.get("emotion", "NEUTRAL"),
+                    "zh": t["text"],
+                }
+            )
+        return (
+            f"Sổ Quan Hệ Nhân Vật (bắt buộc giữ nhất quán): {json.dumps(bible.get('relationships', []), ensure_ascii=False)}\n"
+            f"Bảng tên riêng: {json.dumps(glossary, ensure_ascii=False)}\n"
+            f"Ngữ cảnh 6 câu ngay trước đó: {json.dumps(prev_ctx, ensure_ascii=False)}\n"
+            "Dịch từng câu sau sang Tiếng Việt hiện đại tự nhiên như phim lồng tiếng, vừa miệng đọc trong `dur_s` giây. "
+            "CÙNG 1 cặp `speaker -> listener` phải giữ thống nhất 1 cặp xưng hô (tuyệt đối không tự nhảy tôi ↔ tao giữa chừng!). "
+            'Trả JSON dạng: `{"items": [{"id": 1, "vi": "..."}]}`.\n\n'
+            f"{json.dumps(packed, ensure_ascii=False)}"
+        )
+
+    with ctx as (base_url, mid):
+        with ThreadPoolExecutor(max_workers=wave_workers) as pool:
+            for w0 in range(0, len(all_vi_batches), wave_workers):
+                wave = all_vi_batches[w0 : w0 + wave_workers]
+                prompts = [_build_5b_prompt(b) for b in wave]
+                futs = [pool.submit(_chat_json, base_url, mid, sys_prompt, up, 0.15) for up in prompts]
+                for batch, fut in zip(wave, futs):
+                    res = fut.result()
+                    raw_items = res if isinstance(res, list) else (res.get("items") or res.get("roles") or [])
+                    if isinstance(raw_items, dict):
+                        raw_items = [{"id": k, "vi": v} if not isinstance(v, dict) else {"id": k, **v} for k, v in raw_items.items()]
+                    rmap: dict[int, str] = {}
+                    for x in raw_items:
+                        if not isinstance(x, dict):
+                            continue
+                        xid = _safe_int(x.get("id"))
+                        if xid is not None:
+                            rmap[xid] = str(x.get("vi") or x.get("text") or x.get("translation") or "").strip()
+                    out_items = []
+                    for t in batch:
+                        tid = int(t["id"])
+                        vi_txt = rmap.get(tid) or t["text"]
+                        done_map[tid] = vi_txt
+                        out_items.append({"id": tid, "vi": vi_txt})
+                    _append_jsonl_batch(vi_jsonl, out_items)
+                    ran_translation = True
+                pct = 36.0 + (len(done_map) / max(1, len(turns))) * 22.0
+                emit_progress(pct, f"Pha 5B Gemma 4 (VI x6 GPU): {len(done_map)}/{len(turns)} câu")
+
+        # Pha 5B.2: Rà soát nguyên cảnh song song 6 luồng để khóa cứng tính nhất quán xưng hô
         if ran_translation or not (target_dir / "tracks" / "vi.srt").exists():
-            emit_progress(60.0, "Pha 5B.2: Gemma 4 rà soát nhất quán xưng hô toàn cảnh...")
+            emit_progress(60.0, "Pha 5B.2: Gemma 4 rà soát nhất quán xưng hô toàn cảnh (x6 GPU)...")
             polish_changed = False
-            for start_idx in range(0, len(turns), 40):
+            polish_starts = list(range(0, len(turns), 40))
+
+            def _build_polish_prompt(start_idx: int) -> tuple[int, str]:
                 win_start = max(0, start_idx - 6)
                 window_turns = turns[win_start : start_idx + 40]
                 script_rows = [
@@ -669,32 +710,42 @@ def _phase5b_gemma4_vi(
                     }
                     for t in window_turns
                 ]
-                polish_prompt = (
+                pp = (
                     "Đọc TOÀN BỘ đoạn hội thoại Tiếng Trung (`zh`) và bản dịch Tiếng Việt (`vi`) dưới đây từ đầu tới cuối.\n"
                     f"Sổ Quan Hệ tham chiếu: {json.dumps(bible.get('relationships', []), ensure_ascii=False)}\n"
                     "Chỉ sửa lại `vi` của những câu bị 1 trong 3 lỗi sau:\n"
                     "1) Cặp `speaker -> listener` bị nhảy xưng hô giữa chừng (lúc xưng 'tôi' lúc nhảy 'tao', hoặc lệch với `self_pronoun/other_pronoun`).\n"
                     "2) Nhân vật NỮ tự xưng 'anh' hoặc dùng từ cổ trang 'ta/ngươi' trong phim hiện đại.\n"
                     "3) Dịch còn gượng kiểu văn dịch chữ hoặc sai chủ ngữ của người đang nói.\n"
-                    'Trả JSON chỉ gồm các câu cần sửa (hoặc toàn bộ): `{"items": [{"id": 1, "vi": "..."}]}`.\n\n'
+                    'Trả JSON chỉ gồm các câu cần sửa (nếu chuẩn hết trả `{"items": []}`): `{"items": [{"id": 1, "vi": "..."}]}`.\n\n'
                     f"{json.dumps(script_rows, ensure_ascii=False)}"
                 )
-                try:
-                    pres = _chat_json(base_url, mid, sys_prompt, polish_prompt, temp=0.1)
-                    p_items = pres if isinstance(pres, list) else (pres.get("items") or [])
-                    if isinstance(p_items, dict):
-                        p_items = [{"id": k, "vi": v} if not isinstance(v, dict) else {"id": k, **v} for k, v in p_items.items()]
-                    for x in p_items:
-                        if not isinstance(x, dict):
-                            continue
-                        xid = _safe_int(x.get("id"))
-                        new_vi = str(x.get("vi") or x.get("text") or "").strip()
-                        if xid is not None and new_vi and xid in done_map and xid >= int(turns[start_idx]["id"]):
-                            if done_map[xid] != new_vi:
-                                done_map[xid] = new_vi
-                                polish_changed = True
-                except Exception as exc:
-                    print(f"[S5B POLISH WARN] Bỏ qua rà soát cảnh: {exc}", flush=True)
+                return start_idx, pp
+
+            with ThreadPoolExecutor(max_workers=wave_workers) as pool:
+                for w0 in range(0, len(polish_starts), wave_workers):
+                    wave_starts = polish_starts[w0 : w0 + wave_workers]
+                    built = [_build_polish_prompt(s_idx) for s_idx in wave_starts]
+                    futs = [(s_idx, pool.submit(_chat_json, base_url, mid, sys_prompt, pp, 0.1)) for s_idx, pp in built]
+                    for s_idx, fut in futs:
+                        try:
+                            pres = fut.result()
+                            p_items = pres if isinstance(pres, list) else (pres.get("items") or [])
+                            if isinstance(p_items, dict):
+                                p_items = [{"id": k, "vi": v} if not isinstance(v, dict) else {"id": k, **v} for k, v in p_items.items()]
+                            for x in p_items:
+                                if not isinstance(x, dict):
+                                    continue
+                                xid = _safe_int(x.get("id"))
+                                new_vi = str(x.get("vi") or x.get("text") or "").strip()
+                                if xid is not None and new_vi and xid in done_map and xid >= int(turns[s_idx]["id"]):
+                                    if done_map[xid] != new_vi:
+                                        done_map[xid] = new_vi
+                                        polish_changed = True
+                        except Exception as exc:
+                            print(f"[S5B POLISH WARN] Bỏ qua rà soát cảnh: {exc}", flush=True)
+                    done_w = min(len(polish_starts), w0 + wave_workers)
+                    emit_progress(60.0 + (done_w / max(1, len(polish_starts))) * 5.0, f"Pha 5B.2 rà soát xưng hô: {done_w}/{len(polish_starts)} cảnh")
             if polish_changed:
                 vi_jsonl.unlink(missing_ok=True)
                 _append_jsonl_batch(vi_jsonl, [{"id": int(t["id"]), "vi": done_map[int(t["id"])]} for t in turns])
