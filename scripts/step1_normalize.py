@@ -50,6 +50,8 @@ def detect_best_encoder(preferred: str = "auto") -> tuple[str, list[str]]:
 def _encoder_flags(enc: str) -> list[str]:
     if enc == "h264_nvenc":
         return ["-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "23", "-preset", "p4", "-pix_fmt", "yuv420p"]
+    if enc == "hevc_nvenc":
+        return ["-c:v", "hevc_nvenc", "-rc", "vbr", "-cq", "26", "-preset", "p4", "-pix_fmt", "yuv420p"]
     if enc == "h264_qsv":
         return ["-c:v", "h264_qsv", "-global_quality", "26", "-preset", "faster"]
     if enc == "hevc_qsv":
@@ -75,7 +77,7 @@ def main():
     ap.add_argument("--width", type=int, default=1080)
     ap.add_argument("--height", type=int, default=1920)
     ap.add_argument("--fps", type=int, default=30)
-    ap.add_argument("--encoder", default="auto", choices=["auto", "h264_nvenc", "h264_qsv", "hevc_qsv", "libx264"])
+    ap.add_argument("--encoder", default="auto", choices=["auto", "h264_nvenc", "hevc_nvenc", "h264_qsv", "hevc_qsv", "libx264"])
     ap.add_argument("--force", action="store_true", help="Re-encode even if source_norm.mp4 already exists")
     args = ap.parse_args()
 
@@ -100,7 +102,7 @@ def main():
         f"scale={args.width}:{args.height}:force_original_aspect_ratio=increase,"
         f"crop={args.width}:{args.height},setsar=1,fps={args.fps},format=nv12"
     )
-    if enc_name in ("h264_nvenc", "libx264"):
+    if enc_name in ("h264_nvenc", "hevc_nvenc", "libx264"):
         vf = (
             f"scale={args.width}:{args.height}:force_original_aspect_ratio=increase,"
             f"crop={args.width}:{args.height},setsar=1,fps={args.fps}"

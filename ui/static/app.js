@@ -175,7 +175,7 @@ function openRentModal(idx) {
   if (!offer) return;
   selectedOffer = offer;
   const dph = parseFloat(offer["$/hr"] || "0");
-  $("rentDiskInput").value = Math.max(45, parseInt($("fMinDisk").value || "45", 10));
+  $("rentDiskInput").value = Math.max(60, parseInt($("fMinDisk").value || "60", 10));
   $("rentModalBody").innerHTML = `
     <div><b>Máy #${offer.ID}:</b> ${offer.Model} (${offer.VRAM} GB VRAM) — <b>${(offer.country || "").replaceAll("_", " ")}</b></div>
     <div><b>Giá thuê:</b> $${dph.toFixed(4)}/giờ · <b>Mạng:</b> ${offer.Net_up}/${offer.Net_down} Mbps</div>

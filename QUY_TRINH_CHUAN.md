@@ -57,7 +57,7 @@ MT-Video/
 ## 3. Bộ Lọc Thuê GPU Vast.ai Tối Ưu Giá Rẻ & Hiệu Quả Cao Nhất
 
 ```text
-gpu_ram>=12 num_gpus=1 compute_cap>=860 gpu_name notin [A100_SXM4,A100_PCIE,H100_SXM,H100_PCIE,H200] dlperf>=22 dph<=0.22 verified=True reliability>0.97 cuda_max_good>=12.8 cpu_cores_effective>=4 cpu_ram>=16 pcie_bw>=5 inet_down>=200 inet_up>=100 disk_space>=45 direct_port_count>=1 geolocation notin [CN] rented=False
+gpu_ram>=12 num_gpus=1 gpu_frac=1 compute_cap>=860 gpu_name notin [A100_SXM4,A100_PCIE,H100_SXM,H100_PCIE,H200] dlperf>=22 dph<=0.22 verified=True reliability>0.97 cuda_max_good>=12.8 cpu_cores_effective>=4 cpu_ram>=16 pcie_bw>=5 inet_down>=200 inet_up>=100 disk_space>=45 direct_port_count>=1 geolocation notin [CN] rented=False
 ```
 *(Sắp xếp theo `-o dph_total` để lấy giá/giờ thấp nhất, ưu tiên máy có chỉ số **`DLP/$ >= 350`**).*
 
@@ -78,8 +78,9 @@ gpu_ram>=12 num_gpus=1 compute_cap>=860 gpu_name notin [A100_SXM4,A100_PCIE,H100
    * **Tiếng Việt:** Dùng **`VieNeu-TTS` (`vieneu[cuda]`, 48 kHz)** phân 4 vai (Nam trẻ / Nam già / Nữ trẻ / Nữ già) hoặc clone giọng cho độ tự nhiên và chuẩn dấu thanh cao nhất.
    * **Anh / Nhật / Hàn:** Dùng **`pyVideoTrans v4.19`** (`CosyVoice` / `F5-TTS`) clone trực tiếp theo giọng gốc từng câu từ `vocals_48k_mono.flac` hoặc TTS phân vai tự nhiên.
 2. **Trộn âm (`Mix`):** Ghép giọng lồng tiếng mới lên `instrumental` (tự động dìm nhẹ BGM khoảng `-10dB` tại các giây có lời thoại).
-3. **Render Video Master (`FFmpeg h264_nvenc`):**
+3. **Render Video Master (`FFmpeg hevc_nvenc` / `h264_nvenc`):**
    * Áp dụng duy nhất bộ lọc làm mờ dải hardsub gốc (`blur_config.json`), **KHÔNG burn phụ đề mới vào video**.
+   * Tối ưu dung lượng up YouTube cho phim dài ~150 phút: dùng `hevc_nvenc -cq 29 -b:v 700k -maxrate 1200k` (~900 MB) hoặc `h264_nvenc -cq 28 -b:v 950k -maxrate 1500k` (~1.1–1.2 GB), giữ nguyên chi tiết so với nguồn gốc ~300 kbps mà upload cực nhanh.
    * Xuất kèm bộ **Audio tracks** (`audio_en.m4a`, `audio_ja.m4a`, `audio_ko.m4a`) và bộ **Softsub** (`subtitles/*.srt` / `.vtt` giữ thiết lập màu vàng `#FFEB50`, vị trí đè dải mờ nếu dùng định dạng hỗ trợ style).
 4. **Đóng gói YouTube:** Tạo Thumbnail + Tiêu đề/Mô tả/Chapters đa ngôn ngữ, tải về máy và tắt ngay máy Vast.ai.
 * 🔍 **Điểm bạn duyệt #3:** Nghe kiểm tra Đầu – Giữa – Cuối video thành phẩm và các track âm thanh đa ngôn ngữ trước khi đăng YouTube.

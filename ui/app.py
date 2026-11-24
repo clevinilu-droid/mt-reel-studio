@@ -143,6 +143,7 @@ def vast_offers(
     parts = [
         f"gpu_ram>={min_vram}",
         "num_gpus=1",
+        "gpu_frac=1",
         "compute_cap>=860",
         "gpu_name notin [A100_SXM4,A100_PCIE,H100_SXM,H100_PCIE,H200]",
         "verified=True",
@@ -201,7 +202,7 @@ def vast_rent(req: RentRequest):
 
 @app.post("/api/vast/destroy/{instance_id}")
 def vast_destroy(instance_id: int):
-    out = _run_vast(["destroy", "instance", str(instance_id)], timeout=30)
+    out = _run_vast(["destroy", "instance", str(instance_id), "-y"], timeout=30)
     return {"ok": True, "message": out.strip()}
 
 
