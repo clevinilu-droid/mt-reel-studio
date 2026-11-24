@@ -3,6 +3,7 @@ FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PIP_BREAK_SYSTEM_PACKAGES=1 \
     AUDIO_SEPARATOR_MODEL_DIR=/opt/audio-separator-models \
     UV_LINK_MODE=copy
 
