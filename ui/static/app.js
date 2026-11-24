@@ -1,6 +1,7 @@
 const $ = (id) => document.getElementById(id);
 let currentPreset = "balanced";
 let selectedOffer = null;
+let lastOffers = [];
 
 function toast(msg) {
   const el = $("toast");
@@ -119,12 +120,13 @@ async function loadOffers() {
     if (!res.ok) throw new Error(data.detail || "Không tải được GPU");
     $("queryStrBox").textContent = `${data.query} (-o ${data.sort})`;
 
-    if (!data.offers.length) {
+    lastOffers = data.offers || [];
+    if (!lastOffers.length) {
       tbody.innerHTML = `<tr><td colspan="9" class="center muted">Không có máy nào khớp bộ lọc — thử tăng Giá tối đa hoặc giảm Mạng.</td></tr>`;
       return;
     }
 
-    tbody.innerHTML = data.offers.map((o, idx) => {
+    tbody.innerHTML = lastOffers.map((o, idx) => {
       const id = o.ID;
       const model = o.Model || "";
       const vram = o.VRAM || "?";
@@ -142,8 +144,8 @@ async function loadOffers() {
       const rel = o.R || "?";
 
       let genBadge = `<span class="badge blue">Ampere</span>`;
-      if (model.includes("50")) genBadge = `<span class="badge green">Blackwell 50xx</span>`;
-      else if (model.includes("40")) genBadge = `<span class="badge blue">Ada 40xx</span>`;
+      if (/\b50\d{2}\b/.test(model)) genBadge = `<span class="badge green">Blackwell 50xx</span>`;
+      else if (/\b40\d{2}\b/.test(model) || /\bL40?S?\b/i.test(model)) genBadge = `<span class="badge blue">Ada 40xx</span>`;
 
       const isTop = dlpUsd >= 350 || idx === 0;
       return `
@@ -159,7 +161,7 @@ async function loadOffers() {
           <td>${vcpu} vCPU · ${ram} GB<div class="muted">Disk: ${disk} GB · PCIe ${o.PCIE || "?"}</div></td>
           <td>⬆ ${netUp} <div class="muted">⬇ ${netDown} Mbps</div></td>
           <td><b>${country}</b><div class="muted">Tin cậy: ${rel}%</div></td>
-          <td><button class="btn primary sm" onclick='openRentModal(${JSON.stringify(o)})'>🚀 Thuê</button></td>
+          <td><button class="btn primary sm" onclick="openRentModal(${idx})">🚀 Thuê</button></td>
         </tr>
       `;
     }).join("");
@@ -168,7 +170,9 @@ async function loadOffers() {
   }
 }
 
-function openRentModal(offer) {
+function openRentModal(idx) {
+  const offer = lastOffers[idx];
+  if (!offer) return;
   selectedOffer = offer;
   const dph = parseFloat(offer["$/hr"] || "0");
   $("rentDiskInput").value = Math.max(45, parseInt($("fMinDisk").value || "45", 10));

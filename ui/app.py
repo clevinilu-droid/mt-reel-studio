@@ -1,4 +1,4 @@
-"""
+r"""
 MT-Reel Studio UI v3 — Giao diện điều khiển sạch & khoa học cho quy trình 5 bước + Vast.ai GPU Picker.
 Chạy: .venv\Scripts\python.exe -m uvicorn ui.app:app --host 127.0.0.1 --port 8787
 """
@@ -42,37 +42,47 @@ def _vast_key() -> str:
     return key
 
 
-def _run_vast(args: list[str], timeout: int = 25) -> str:
+def _run_vast(args: list[str], timeout: int = 25, raw_json: bool = False) -> Any:
     exe = str(VAST_EXE) if VAST_EXE.exists() else "vastai"
     key = _vast_key()
-    cmd = [exe, *args, "--api-key", key]
+    prefix = ["--raw", "--no-color"] if raw_json else ["--no-color"]
+    cmd = [exe, *prefix, *args, "--api-key", key]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if res.returncode != 0:
         msg = (res.stderr or res.stdout or "Vast CLI error").strip()
         raise HTTPException(status_code=502, detail=msg[:400])
+    if raw_json:
+        txt = res.stdout.strip()
+        return json.loads(txt) if txt else []
     return res.stdout
 
 
-def _parse_vast_table(raw_text: str) -> list[dict[str, Any]]:
-    """Parse vastai CLI multi-section aligned table into clean JSON rows."""
-    blocks = re.split(r"\r?\n\s*\r?\n", raw_text.strip())
-    rows_by_idx: dict[str, dict[str, Any]] = {}
-    for blk in blocks:
-        lines = [ln.rstrip() for ln in blk.splitlines() if ln.strip()]
-        if len(lines) < 2 or not lines[0].lstrip().startswith("#"):
-            continue
-        headers = re.split(r"\s{2,}", lines[0].strip())
-        for ln in lines[1:]:
-            parts = re.split(r"\s{2,}", ln.strip())
-            if not parts or not parts[0].isdigit():
-                continue
-            row_id = parts[0]
-            rec = rows_by_idx.setdefault(row_id, {})
-            for h, v in zip(headers, parts):
-                rec[h] = v
-    # Sort by integer #
-    out = [rows_by_idx[k] for k in sorted(rows_by_idx.keys(), key=lambda x: int(x))]
-    return out
+def _fmt_offer(x: dict[str, Any]) -> dict[str, Any]:
+    dph = float(x.get("dph_total") or 0.0)
+    dlp = float(x.get("dlperf") or 0.0)
+    dlp_usd = x.get("dlperf_per_dphtotal")
+    if dlp_usd is None:
+        dlp_usd = (dlp / dph) if dph > 0 else 0.0
+    rel = float(x.get("reliability2") or x.get("reliability") or 0.0)
+    if rel <= 1.0:
+        rel *= 100.0
+    return {
+        "ID": int(x["id"]),
+        "Model": str(x.get("gpu_name") or "GPU"),
+        "VRAM": f"{float(x.get('gpu_ram') or 0) / 1000:.1f}",
+        "$/hr": f"{dph:.4f}",
+        "DLP": f"{dlp:.1f}",
+        "DLP/$": f"{float(dlp_usd):.1f}",
+        "vCPUs": f"{float(x.get('cpu_cores_effective') or 0):.1f}",
+        "RAM": f"{float(x.get('cpu_ram') or 0) / 1000:.1f}",
+        "Disk": f"{float(x.get('disk_space') or 0):.0f}",
+        "Net_up": f"{float(x.get('inet_up') or 0):.0f}",
+        "Net_down": f"{float(x.get('inet_down') or 0):.0f}",
+        "country": str(x.get("geolocation") or "-"),
+        "R": f"{rel:.1f}",
+        "CUDA": f"{float(x.get('cuda_max_good') or 0):.1f}",
+        "PCIE": f"{float(x.get('pcie_bw') or 0):.1f}",
+    }
 
 
 class RentRequest(BaseModel):
@@ -94,28 +104,29 @@ def index():
 @app.get("/api/vast/status")
 def vast_status():
     """Return account balance/email (no API key exposed) and active instances."""
-    user_raw = _run_vast(["show", "user"])
-    credit_m = re.search(r"\b\d+\.\d+\b\s+\S+@\S+", user_raw)
-    credit = None
-    email = None
-    for line in user_raw.splitlines():
-        m = re.search(r"^\s*1\s+([\d.]+)\s+(\S+@\S+)", line)
-        if m:
-            credit = float(m.group(1))
-            email = m.group(2)
-            break
+    user_data = _run_vast(["show", "user"], raw_json=True)
+    credit = float(user_data["credit"]) if isinstance(user_data, dict) and user_data.get("credit") is not None else None
+    email = user_data.get("email") if isinstance(user_data, dict) else None
 
-    inst_raw = _run_vast(["show", "instances"])
+    inst_raw = _run_vast(["show", "instances"], raw_json=True)
     instances = []
-    if "No instances found" not in inst_raw:
-        instances = _parse_vast_table(inst_raw)
+    if isinstance(inst_raw, list):
+        for x in inst_raw:
+            instances.append({
+                "ID": x.get("id"),
+                "Model": x.get("gpu_name") or "GPU",
+                "Status": x.get("actual_status") or x.get("cur_state") or x.get("intended_status") or "starting",
+                "$/hr": f"{float(x.get('dph_total') or 0):.4f}",
+                "SSH Addr": x.get("ssh_host") or x.get("public_ipaddr") or "",
+                "SSH Port": x.get("ssh_port") or "",
+                "Label": x.get("label") or "",
+            })
 
     return {
         "credit": credit,
         "email": email,
         "image": GHCR_IMAGE,
         "instances": instances,
-        "instances_raw": inst_raw.strip(),
     }
 
 
@@ -158,8 +169,8 @@ def vast_offers(
 
     query_str = " ".join(parts)
     sort_by = "dlperf-" if preset == "fast" else "dph_total"
-    raw = _run_vast(["search", "offers", query_str, "-o", sort_by, "--limit", str(limit)])
-    offers = _parse_vast_table(raw)
+    raw_offers = _run_vast(["search", "offers", query_str, "-o", sort_by, "--limit", str(limit)], raw_json=True)
+    offers = [_fmt_offer(x) for x in raw_offers] if isinstance(raw_offers, list) else []
     return {"query": query_str, "sort": sort_by, "count": len(offers), "offers": offers}
 
 
