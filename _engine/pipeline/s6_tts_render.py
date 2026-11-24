@@ -828,8 +828,14 @@ def run_step6(target_dir: Path, work_rel: str, langs: list[str], voice_mode: str
     if qa_html.exists():
         shutil.copy2(qa_html, sub_out_dir / "kiem_tra_dich.html")
 
-    # Gom glossary & relationship_bible vào thư mục phụ _info/ để thư mục thành phẩm gọn sạch
-    for ref_name in ("glossary.json", "relationship_bible.json"):
+    # Gom glossary, relationship_bible & các file kịch bản đã dịch vào _info/ để lưu trữ lâu dài trên Drive
+    for ref_name in (
+        "glossary.json",
+        "relationship_bible.json",
+        "03_aligned_master.json",
+        "05a_roles.jsonl",
+        "05b_sub_vi.jsonl",
+    ):
         rp = target_dir / ref_name
         if rp.exists():
             shutil.copy2(rp, info_out_dir / ref_name)

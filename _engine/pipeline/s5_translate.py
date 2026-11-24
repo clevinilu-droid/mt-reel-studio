@@ -438,6 +438,35 @@ def _phase5a_qwen_analyze(
         emit_progress(32.0, f"Tái sử dụng Pha 5A ({len(done_roles)} câu đã phân vai)")
         return glossary, done_roles
 
+    # Nếu đã có sẵn relationship_bible.json (>=2 cặp quan hệ) & glossary.json từ lần chạy trước,
+    # tạo nhanh roles_map theo Sổ Quan Hệ để nhảy thẳng sang Pha 5B dịch thoại (tiết kiệm ~18 phút)!
+    if not force and len(bible.get("relationships", [])) >= 2 and glossary:
+        era_locked = str(bible.get("era") or "MODERN").upper()
+        out_fast = []
+        for t in todo_turns:
+            tid = int(t["id"])
+            item = {
+                "id": tid,
+                "era": era_locked,
+                "gender": "FEMALE",
+                "age_tone": "YOUNG",
+                "emotion": "NEUTRAL",
+                "speaker_role": str(t.get("spk_id") or "SPK_00"),
+                "listener_role": "Đối phương",
+                "self_pronoun": "tôi",
+                "other_pronoun": "cậu",
+                "ko_level": "haeyo",
+                "ja_level": "plain_modern",
+                "es_pronoun": "tú",
+                "addressing": "Theo Sổ Quan Hệ",
+            }
+            done_roles[tid] = item
+            out_fast.append(item)
+        if out_fast:
+            _append_jsonl_batch(roles_jsonl, out_fast)
+        emit_progress(32.0, f"Tái sử dụng Sổ Quan Hệ & Glossary có sẵn ({len(bible.get('relationships', []))} cặp quan hệ)")
+        return glossary, done_roles
+
     model_id = cfg.get("models", {}).get("zh_analyst_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit")
     fallback_models = [
         model_id,
