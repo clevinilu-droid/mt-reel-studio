@@ -19,6 +19,7 @@ MT-Video/
         ├── HO_SO_NHAN_VAT.md                    ← Bảng nhân vật & xưng hô dùng chung P1, P2, P3...
         ├── character_glossary.json              ← Từ điển nhân vật khóa cứng cho LLM dịch
         └── P1/
+            ├── 00_buoc1_chuan_hoa/                ← 🔒 Master video chuẩn (source_norm.mp4: 1080x1920 CFR 30fps + 48kHz)
             ├── 01_buoc2_nhan_vat_va_khung_blur/ ← 🔍 Chốt duyệt #1 (grids/, blur_truoc_sau.jpg, blur_config.json)
             ├── 02_buoc3_hardsub_va_am_thanh/    ← zh_hardsub.srt + vocals + instrumental
             ├── 03_buoc4_ban_dich_da_ngon_ngu/   ← 🔍 Chốt duyệt #2 (vi.srt, en.srt, ja.srt, ko.srt + role_lines.json)
@@ -29,9 +30,9 @@ MT-Video/
 
 ## 2. Quy Trình 5 Bước Chuẩn (Từ A–Z)
 
-### Bước 1 — Chuẩn bị nguồn & Image GPU
-* Tải phim gốc (tách gọn theo `P1`, `P2`...) vào `Download/`, giữ nguyên bản gốc không chỉnh sửa đè lên.
-* Dùng Docker Image đóng gói sẵn trên GitHub Container Registry **`ghcr.io/clevinilu-droid/mt-reel-vast:latest`** làm Template Vast.ai (chứa sẵn `PyTorch 2.10 CUDA 12.8`, `FFmpeg 8.1 NVENC`, `rclone`, `audio-separator 0.48.0` + model `Mel-Band-RoFormer`, `VieNeu-TTS`, và `pyVideoTrans v4.19`) $\rightarrow$ bật máy Vast.ai là chạy ngay, không chờ cài đặt lại.
+### Bước 1 — Chuẩn hóa nguồn & Image GPU
+* **1.1 Nguồn gốc & Image GPU:** Tải phim gốc (tách gọn theo `P1`, `P2`...) vào `Download/`, giữ nguyên 100% file gốc không sửa đè. Dùng Docker Image đóng gói sẵn trên GitHub Container Registry **`ghcr.io/clevinilu-droid/mt-reel-vast:latest`** làm Template Vast.ai (chứa sẵn `PyTorch 2.10 CUDA 12.8`, `FFmpeg 8.1 NVENC`, `rclone`, `audio-separator 0.48.0` + model `Mel-Band-RoFormer`, `VieNeu-TTS`, và `pyVideoTrans v4.19`).
+* **1.2 Chuẩn hóa Video Master (`scripts/step1_normalize.py`, bắt buộc trước mọi bước):** Phim gốc ghép từ hàng chục/trăm tập thường bị lệch 1–4px giữa các tập (`1080×1924` trộn `1080×1920`) và trôi nhẹ khung hình (`29.835` vs `30 fps`). Vì vậy bắt buộc xuất ra **`00_buoc1_chuan_hoa/source_norm.mp4`** khóa cứng **`1080×1920` (SAR 1:1, cắt gọn mép thừa nếu lệch pixel), `30 fps CFR`, âm thanh `48kHz Stereo` (`aresample=async=1`)** bằng phần cứng Intel QSV (`$0` trên Laptop) hoặc NVENC — toàn bộ Bước 2 → Bước 5 đọc chung 1 file chuẩn này.
 
 ### Bước 2 — Quét Bảng Tên Dọc & Canh Khung Làm Mờ Hardsub *(Chạy trên Laptop, \$0)*
 1. **Quét Hồ sơ nhân vật:** Dùng `FFmpeg` cắt lưới ảnh `6×8` nửa trên màn hình (`65%` chiều cao, `fps=1/2`, mỗi ảnh `96 giây`) $\rightarrow$ dùng Gemini Vision đọc chữ thư pháp dọc (`人物花字`) kết hợp nhìn mặt diễn viên để lập `HO_SO_NHAN_VAT.md` và `character_glossary.json` (Tên Hán-Việt, EN/JA/KO, Giới tính, Tuổi, Vai vế, Ma trận xưng hô giữa các cặp nhân vật).

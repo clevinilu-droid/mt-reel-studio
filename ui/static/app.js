@@ -241,6 +241,12 @@ async function loadProjects() {
               ${p.has_test_10m ? `<span class="badge blue">Có bản test 10 phút</span>` : ""}
             </div>
             <div class="steps-grid">
+              <div class="step-box ${p.step1_norm ? "done" : ""}">
+                <div class="step-title">Bước 1 · Chuẩn Hóa Nguồn ${p.step1_norm ? "✅" : "⏳"}</div>
+                <div class="step-items">
+                  <span>• Master 1080×1920 30fps: ${p.step1_norm ? `✅ (${p.norm_mb} MB)` : "❌ Chưa chuẩn hóa"}</span>
+                </div>
+              </div>
               <div class="step-box ${p.step2_done ? "done" : ""}">
                 <div class="step-title">Bước 2 · Nhân vật & Blur ${p.step2_done ? "✅" : "⏳"}</div>
                 <div class="step-items">

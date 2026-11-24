@@ -216,12 +216,16 @@ def list_projects():
             for p_dir in sorted(s_dir.iterdir()):
                 if not p_dir.is_dir():
                     continue
+                b1 = p_dir / "00_buoc1_chuan_hoa"
                 b2 = p_dir / "01_buoc2_nhan_vat_va_khung_blur"
                 b3 = p_dir / "02_buoc3_hardsub_va_am_thanh"
                 b4 = p_dir / "03_buoc4_ban_dich_da_ngon_ngu"
                 b5 = p_dir / "04_buoc5_thanh_pham_youtube"
+                norm_file = b1 / "source_norm.mp4"
                 parts_info.append({
                     "part": p_dir.name,
+                    "step1_norm": norm_file.exists(),
+                    "norm_mb": round(norm_file.stat().st_size / (1024 * 1024), 1) if norm_file.exists() else 0,
                     "step2_done": (b2 / "blur_config.json").exists(),
                     "has_blur_preview": (b2 / "blur_truoc_sau.jpg").exists(),
                     "blur_preview_url": f"/api/projects/{s_dir.name}/{p_dir.name}/blur-preview" if (b2 / "blur_truoc_sau.jpg").exists() else None,
