@@ -45,12 +45,12 @@ MT-Video/
 ### Bước 3 — Trích xuất Hardsub gốc & Tách âm thanh mới *(Độ khớp Nội dung + Timeline 1:1)*
 * **Nguyên tắc cốt lõi:** Phụ đề Hardsub gốc ở đáy và giọng nói gốc trong video là cặp 1:1 cùng timeline `0.000s` (không phụ thuộc việc trên hình có thấy mặt người đang nói hay không).
 * **Tách 2 luồng song song từ file gốc:**
-  1. **Luồng Âm thanh (`audio-separator` + `Mel-Band-RoFormer` trên GPU Vast.ai):** Tách mới hoàn toàn từ video gốc ra **Giọng nói sạch (`vocals_48k_mono.flac`)** và **Nhạc nền + Hiệu ứng (`instrumental_48k.flac`)** chuẩn `48kHz` Lossless (vừa nhẹ hơn `.wav` gần 4 lần, vừa giữ trọn 48kHz cho clone giọng `CosyVoice`/`F5-TTS`).
-  2. **Luồng Chữ (`Đọc Hardsub gốc` trên Laptop + Gemini Vision):** Tách chữ từ vùng đáy cố định đã đo ở Bước 2 theo cơ chế bắt viền chữ đổi câu (mỗi câu 1 dải ảnh ghép lưới) ra file `zh_hardsub_raw.srt` — đúng 100% mặt chữ tác giả, không sai tên nhân vật đồng âm.
-* **Khớp sóng âm (`Audio-Snap` & Phân vai bằng âm thanh):**
-  * Kéo mốc `start --> end` của `zh_hardsub_raw.srt` bám khít vào sóng âm thực tế của `vocals_48k_mono.flac` $\rightarrow$ xuất `zh_master_synced.srt`.
-  * Gộp câu dài bị màn hình dọc cắt đôi (nếu hai dòng nối liền không có khoảng nghỉ lấy hơi trên `vocals`).
-  * Phân biệt **Lời thoại** (có tiếng trên `vocals` $\rightarrow$ đo cao độ `F0 Hz` gắn nhãn Nam/Nữ) với **Chữ chú thích câm** (im lặng trên `vocals` $\rightarrow$ chỉ giữ text softsub, không đọc TTS).
+  1. **Luồng Âm thanh (`audio-separator` + `Mel-Band-RoFormer` trên GPU Vast.ai):** Tách mới hoàn toàn từ video gốc bằng model **`melband_roformer_instvox_duality_v2.ckpt`** ra **Giọng nói sạch (`vocals_48k_mono.flac`)** và **Nhạc nền + Hiệu ứng (`instrumental_48k.flac`)** chuẩn `48kHz` Lossless (vừa nhẹ hơn `.wav` gần 4 lần, vừa giữ trọn 48kHz cho `VieNeu-TTS` và trộn BGM).
+  2. **Luồng Chữ (`Đọc Hardsub gốc` trên Laptop, `scripts/step3_extract_hardsub.py`):** Cắt vùng đáy cố định đã đo ở Bước 2 (`fps=5.0`), bắt chữ trắng/vàng có viền đen (`IoU >= 0.65`, ghép `25 dải/tờ`) $\rightarrow$ đọc ra file `zh_hardsub_raw.srt` đúng 100% mặt chữ tác giả, không sai tên nhân vật đồng âm.
+* **Khớp sóng âm (`Audio-Snap` & Phân vai bằng âm thanh, `scripts/step3_sync_and_gender.py`):**
+  * Kéo mốc `start --> end` của `zh_hardsub_raw.srt` bám khít vào sóng âm thực tế của `vocals_48k_mono.flac` (`+-0.25s`) $\rightarrow$ xuất `zh_master_synced.srt`.
+  * Gộp câu dài bị màn hình dọc cắt đôi (`merge_gap <= 0.16s`, tổng độ dài `<= 26` ký tự, không ngắt bởi dấu kết câu).
+  * Phân biệt **Lời thoại** (đo cao độ `F0 Hz`: `< 175 Hz = NAM`, `>= 175 Hz = NU`) với **Chữ chú thích câm** (`CHU_THICH_CAM`, chỉ giữ softsub) và quét lớp 2 phát hiện mọi đoạn có tiếng nói bị sót (`missing_speech_gaps.json >= 0.30s`).
 
 ---
 
@@ -73,23 +73,37 @@ gpu_ram>=12 num_gpus=1 gpu_frac=1 compute_cap>=860 gpu_name notin [A100_SXM4,A10
 * Gán vai đọc từng dòng vào `role_lines.json`.
 * 🔍 **Điểm bạn duyệt #2:** Đọc lướt 30–50 dòng đầu và 1 đoạn giữa của `vi.srt` để chốt văn phong & xưng hô trước khi chạy lồng tiếng hàng loạt.
 
-### Bước 5 — Lồng tiếng, Trộn BGM & Xuất Thành Phẩm YouTube *(Trên Vast.ai GPU)*
-1. **Lồng tiếng (`VieNeu-TTS` + `pyVideoTrans` trên Vast.ai):**
-   * **Tiếng Việt:** Dùng **`VieNeu-TTS` (`vieneu[cuda]`, 48 kHz)** chỉ dùng **2 giọng Nam – Nữ tự nhiên cố định**: toàn bộ vai Nam dùng **`Hải Đăng`** (`Nam · Bắc · Phong cách tự nhiên`), toàn bộ vai Nữ dùng **`Trúc Ly`** (`Nữ · Bắc · Phong cách tự nhiên`).
-   * **Anh / Nhật / Hàn:** Không clone; dùng **`pyVideoTrans` (`edge-tts` Neural)** mỗi quốc gia **1 giọng Nữ bản địa tự nhiên** (`en-US-AvaMultilingualNeural`, `ja-JP-NanamiNeural`, `ko-KR-SunHiNeural`), tự chỉnh tốc độ đọc + `FFmpeg atempo` mượt (không cắt cụt chữ).
-2. **Trộn âm (`Mix` + Bảo toàn tiếng đám đông + Tăng +30% âm lượng riêng lời thoại):**
-   * Tăng **+30% âm lượng riêng của giọng nói các nhân vật (`×1.30` + soft-limiter chống rè)** cho cả 4 ngôn ngữ; mức dìm BGM (`-10.5 dB` lúc nói) giữ nguyên.
-   * **Giữ lại ~92% âm lượng `vocals_48k_mono.flac` ở mọi khoảng ngoài mốc thời gian phụ đề** (cắt êm `~90ms` về 0% đúng trong khung `[start, end]` của câu thoại) để bảo toàn nguyên vẹn tiếng reo hò, tiếng cười đám đông, tiếng hét võ đài.
+### Bước 5 — Lồng tiếng, Trộn BGM & Xuất Thành Phẩm YouTube *(Trên Vast.ai GPU, `scripts/vast_step5_dub_and_render.py`)*
+1. **Lồng tiếng (Chốt cố định không clone ngoại ngữ):**
+   * **Tiếng Việt:** Dùng **`VieNeu-TTS` (`mode="v3turbo"`, 48 kHz CUDA)** chỉ dùng **2 giọng Nam – Nữ tự nhiên cố định**: toàn bộ vai Nam dùng **`Hải Đăng`**, toàn bộ vai Nữ dùng **`Trúc Ly`**.
+   * **Anh / Nhật / Hàn:** Không clone; dùng **`edge-tts`** mỗi quốc gia **1 giọng Nữ bản địa tự nhiên**:
+     * `en`: **`en-US-AvaMultilingualNeural`**
+     * `ja`: **`ja-JP-NanamiNeural`**
+     * `ko`: **`ko-KR-SunHiNeural`**
+     * Căn chỉnh tốc độ trước khi đọc (`rate` tối đa `+32%`) kết hợp **`FFmpeg atempo`** (`1.55x–1.70x`) mượt, tuyệt đối không cắt cụt chữ giữa câu.
+2. **Trộn âm (`Mix` — Tham số đã duyệt):**
+   * **Chỉ tăng +30% âm lượng riêng của giọng nói nhân vật (`VOICE_GAIN = 1.30`, soft-limiter `knee=0.78, ceil=0.95`)** cho cả 4 ngôn ngữ.
+   * **Giữ nguyên mức dìm BGM (`gain = 1.0 - 0.70 * smooth`, tương đương `-10.5 dB` khi có thoại)** trên `instrumental_48k.flac`.
+   * **Giữ lại 92% âm lượng `vocals_48k_mono.flac` ở mọi khoảng ngoài mốc thời gian phụ đề** (cắt êm `~90ms` về `0%` đúng trong khung `[start, end]`) để bảo toàn nguyên vẹn tiếng reo hò, tiếng cười đám đông, tiếng hét võ đài.
+   * Xuất từng track `audio_tracks/audio_{vi,en,ja,ko}.m4a` (`AAC 128k 48kHz Stereo`).
 3. **Render Video Master (`FFmpeg hevc_nvenc` / `h264_nvenc`):**
-   * Áp dụng duy nhất bộ lọc làm mờ dải hardsub gốc (`blur_config.json`), **KHÔNG burn phụ đề mới vào video**.
-   * Tối ưu dung lượng up YouTube cho phim dài ~150 phút: dùng `hevc_nvenc -cq 29 -b:v 700k -maxrate 1200k` (~900 MB) hoặc `h264_nvenc -cq 28 -b:v 950k -maxrate 1500k` (~1.1–1.2 GB), giữ nguyên chi tiết so với nguồn gốc ~300 kbps mà upload cực nhanh.
-   * Xuất kèm bộ **Audio tracks** (`audio_en.m4a`, `audio_ja.m4a`, `audio_ko.m4a`) và bộ **Softsub** (`subtitles/*.srt` / `.vtt` giữ thiết lập màu vàng `#FFEB50`, vị trí đè dải mờ nếu dùng định dạng hỗ trợ style).
+   * Áp dụng duy nhất bộ lọc làm mờ dải hardsub gốc (`gblur=sigma=22` theo `blur_config.json`), **KHÔNG burn phụ đề mới vào video**.
+   * Tham số nén tối ưu YouTube: `hevc_nvenc -rc vbr -cq 29 -b:v 700k -maxrate 1200k` (fallback `h264_nvenc -cq 28 -b:v 950k`), kèm `-movflags +faststart`.
+   * Xuất kèm bộ **Audio tracks** (`audio_en.m4a`, `audio_ja.m4a`, `audio_ko.m4a`) và bộ **Softsub** (`subtitles/{vi,en,ja,ko}.srt` + `vi.vtt` style `#FFEB50`, nền `rgba(0,0,0,0.55)`).
 4. **Đóng gói YouTube (`scripts/step5_youtube_package.py`):**
-   * **Thumbnail (`1280×720`, < 2 MB):** Dùng `poster.jpg` gốc của phần đó đặt giữa nền blur đồng bộ từ chính poster, chỉ gắn **2 huy hiệu rõ nét ở góc trên: `HOT` và `P1`/`P2`**, không chèn chữ dài gây rối hay che mặt nhân vật.
-   * **Tiêu đề (KHÔNG gộp 4 ngôn ngữ vào 1 tiêu đề):** Dùng mục **Ngôn ngữ (`Languages` / `localizations`)** trong YouTube Studio để đặt riêng 4 tiêu đề (`vi`, `en`, `ja`, `ko`) dịch sát tên gốc Trung Quốc (`<= 100 ký tự`, rõ số phần `Phần 1 / Part 1` ở cuối hoặc gọn trong tiêu đề). YouTube tự hiển thị đúng ngôn ngữ máy của từng người xem.
+   * **Thumbnail (`1280×720`, `< 2 MB`):** Dùng `poster.jpg` gốc của phần đó đặt giữa nền blur đồng bộ từ chính poster, chỉ gắn **2 huy hiệu rõ nét ở góc trên: `HOT` và `P1`/`P2`**, không chèn chữ dài gây rối hay che mặt nhân vật.
+   * **Tiêu đề (KHÔNG gộp 4 ngôn ngữ vào 1 tiêu đề):** Dùng mục **Ngôn ngữ (`Languages` / `localizations`)** trong YouTube Studio để đặt riêng 4 tiêu đề (`vi`, `en`, `ja`, `ko`) dịch sát tên gốc Trung Quốc (`<= 100 ký tự`, rõ số phần `Phần 1 / Part 1` ở cuối).
    * **Mô tả (Tách riêng 4 ngôn ngữ, chuẩn chính sách chống spam / Reused Content):**
-     1. Nhập riêng từng bản mô tả vào tab ngôn ngữ tương ứng (`vi`, `en`, `ja`, `ko`), **không nhồi nhiều ngôn ngữ vào một ô mô tả** (vừa dễ bị YouTube đánh dấu spam từ khóa vừa giảm CTR).
+     1. Nhập riêng từng bản mô tả vào tab ngôn ngữ tương ứng (`vi`, `en`, `ja`, `ko`), **không nhồi nhiều ngôn ngữ vào một ô mô tả**.
      2. Viết tóm tắt bối cảnh riêng của đúng phần `P1` hoặc `P2` bằng văn phong điện ảnh trung tính (tránh từ nhạy cảm bạo lực/máu me trực diện, tránh copy-paste y hệt 100% giữa các video, không rải link rác).
-     3. Bắt buộc kèm **Mốc thời gian (`Chapters`)** trích từ kịch bản thật (tối thiểu `00:00` + 3–5 mốc cao trào chính) để YouTube nhận diện nội dung biên tập có cấu trúc, và giữ **tối đa 3 hashtags** sạch ở cuối.
-   * Sau khi kiểm tra và tải xong toàn bộ thành phẩm về máy, **tắt ngay máy Vast.ai**.
-* 🔍 **Điểm bạn duyệt #3:** Nghe kiểm tra Đầu – Giữa – Cuối video thành phẩm và các track âm thanh đa ngôn ngữ trước khi đăng YouTube.
+     3. Kèm **Mốc thời gian (`Chapters`)** trích từ kịch bản thật (`00:00` + 3–5 mốc cao trào chính) và giữ **tối đa 3 hashtags** sạch ở cuối.
+
+### Bước 6 — Đồng bộ Google Drive, Tự Hủy GPU & Sleep Máy *(Hoàn toàn tự động)*
+1. **Cấu trúc lưu trữ trên Google Drive (`rclone` -> `gdrive:MT-Video/`):**
+   * **Mỗi phim 1 thư mục riêng:** `gdrive:MT-Video/<Mã_TênPhim>/`
+   * **Mỗi phần 1 thư mục con:** `P1/`, `P2/`... Toàn bộ file thuộc phần nào lưu gọn trong thư mục phần đó gồm: video master `.mp4`, `audio_tracks/`, `subtitles/`, và `youtube_seo/` (gồm `thumb_1280x720.jpg`, `thumb_poster.jpg`, `metadata_4langs.json`, `youtube_*.txt`).
+2. **Cơ chế tự hủy GPU an toàn (`Auto-Destroy Failsafe`):**
+   * Bắt buộc bọc toàn bộ phiên chạy GPU trong khối `try...finally` phía máy điều khiển (và watchdog hẹn giờ tự dừng phía máy Vast.ai) để **tự động gọi `vastai destroy instance <ID>` ngay khi hoàn tất hoặc khi gặp bất kỳ lỗi nào**, không bao giờ để rò rỉ tiền thuê GPU.
+3. **Tự động đưa máy về Sleep sau khi hoàn tất:**
+   * Chỉ kích hoạt Sleep (`Standby S0`) sau khi đã xác nhận: **(a)** tải đủ thành phẩm lên Google Drive và **(b)** instance Vast.ai đã `destroyed` hoàn toàn.
+* 🔍 **Điểm bạn duyệt #3:** Kiểm tra file trên Google Drive (video, 4 track âm thanh, phụ đề, thumbnail & SEO text) trước khi nạp vào YouTube Studio ở chế độ `Private`.
