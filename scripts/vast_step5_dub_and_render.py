@@ -58,27 +58,25 @@ def fit_to_slot(wav: np.ndarray, sr: int, max_dur: float, max_speed: float = 1.3
 
 
 def pick_vieneu_roles(tts) -> dict[str, tuple[str, dict]]:
+    """Chuẩn quy trình: chỉ dùng đúng 2 giọng Nam–Nữ tự nhiên (Hải Đăng cho Nam, Trúc Ly cho Nữ)."""
     presets = tts.list_preset_voices()
     print(f"[5.1] VieNeu preset voices ({len(presets)}): {presets[:8]}", flush=True)
-    males = []
-    females = []
-    for label, vid in presets:
-        low = f"{label} {vid}".lower()
-        if any(k in low for k in ("nữ", "nu_", "female", "chị", "cô", "bé gái", "linh", "ngọc", "thảo", "mai", "hà", "trang", "tuyên")):
-            females.append((label, vid))
-        else:
-            males.append((label, vid))
+    males = [p for p in presets if not any(k in f"{p[0]} {p[1]}".lower() for k in ("nữ", "nu_", "female", "chị", "cô", "bé gái", "linh", "ngọc", "thảo", "mai", "hà", "trang", "trúc ly", "huyền", "dung", "duyên", "thanh"))]
+    females = [p for p in presets if p not in males]
 
     if not males:
-        males = presets[:2] or presets
+        males = presets[:1]
     if not females:
-        females = presets[-2:] or presets
+        females = presets[-1:]
+
+    male_voice = next((m for m in males if "hải đăng" in m[0].lower()), males[0])
+    female_voice = next((f for f in females if "trúc ly" in f[0].lower()), females[0])
 
     chosen = {
-        "NAM_TRE": next((m for m in males if "hải đăng" in m[0].lower() or "thiện minh" in m[0].lower()), males[0]),
-        "NAM_GIA": next((m for m in males if "quốc tuấn" in m[0].lower() or "tâm đức" in m[0].lower()), males[-1] if len(males) > 1 else males[0]),
-        "NU_TRE": next((f for f in females if "ngọc huyền" in f[0].lower() or "trúc ly" in f[0].lower()), females[0]),
-        "NU_GIA": next((f for f in females if "kim thanh" in f[0].lower() or "thùy dung" in f[0].lower()), females[-1] if len(females) > 1 else females[0]),
+        "NAM_TRE": male_voice,
+        "NAM_GIA": male_voice,
+        "NU_TRE": female_voice,
+        "NU_GIA": female_voice,
     }
     out = {}
     for role, (lbl, vid) in chosen.items():
@@ -264,6 +262,7 @@ def main():
     ap.add_argument("blur_config", type=Path, help="blur_config.json")
     ap.add_argument("out_dir", type=Path, help="Output directory")
     ap.add_argument("--name", default="P1_10m_vi.mp4", help="Output master MP4 filename")
+    ap.add_argument("--langs", default="vi,en,ja,ko", help="Comma-separated tracks to synthesize (e.g. vi or vi,en,ja,ko)")
     args = ap.parse_args()
 
     t_all = time.time()
@@ -300,22 +299,27 @@ def main():
     cache_dir = args.out_dir / "_tts_cache"
     cache_dir.mkdir(exist_ok=True)
 
+    wanted_langs = [x.strip() for x in args.langs.split(",") if x.strip()]
+    clone_langs = [x for x in wanted_langs if x in ("en", "ja", "ko")]
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
 
-        # 1. VieNeu-TTS v3 Turbo (Vietnamese)
-        vi_clips = synthesize_vieneu(lines)
         vi_m4a = audio_dir / "audio_vi.m4a"
-        build_timeline_and_mix(lines, vi_clips, orig_vocals, instr, total_samples, vi_m4a, tmp_dir)
+        if "vi" in wanted_langs:
+            # 1. VieNeu-TTS v3 Turbo (Vietnamese 2 voices: Hải Đăng + Trúc Ly)
+            vi_clips = synthesize_vieneu(lines)
+            build_timeline_and_mix(lines, vi_clips, orig_vocals, instr, total_samples, vi_m4a, tmp_dir)
 
         # 2. pyVideoTrans Qwen3-TTS voice cloning from vocals_48k_mono.flac (EN / JA / KO)
-        clone_root = cache_dir / "qwen_clones"
-        synthesize_pyvt_clones(args.vocals, args.role_lines, clone_root, langs="en,ja,ko")
-        for lang in ("en", "ja", "ko"):
-            lang_clips = load_cloned_lang_clips(clone_root / lang, lines)
-            out_m4a = audio_dir / f"audio_{lang}.m4a"
-            build_timeline_and_mix(lines, lang_clips, orig_vocals, instr, total_samples, out_m4a, tmp_dir)
-            print(f"[OK] {lang.upper()} cloned track mixed -> {out_m4a.name}", flush=True)
+        if clone_langs:
+            clone_root = cache_dir / "qwen_clones"
+            synthesize_pyvt_clones(args.vocals, args.role_lines, clone_root, langs=",".join(clone_langs))
+            for lang in clone_langs:
+                lang_clips = load_cloned_lang_clips(clone_root / lang, lines)
+                out_m4a = audio_dir / f"audio_{lang}.m4a"
+                build_timeline_and_mix(lines, lang_clips, orig_vocals, instr, total_samples, out_m4a, tmp_dir)
+                print(f"[OK] {lang.upper()} cloned track mixed -> {out_m4a.name}", flush=True)
 
         # 3. Render final blurred MP4 with Vietnamese dubbed audio
         enc_name, enc_flags = pick_video_encoder()
