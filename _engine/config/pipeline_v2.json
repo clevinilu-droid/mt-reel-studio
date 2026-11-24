@@ -28,7 +28,7 @@
     "host": "127.0.0.1",
     "port": 8001,
     "gpu_memory_utilization": 0.92,
-    "max_model_len": 4096
+    "max_model_len": 8192
   },
   "drive_remote_root": "gdrive:MT-Video"
 }

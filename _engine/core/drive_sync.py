@@ -111,7 +111,18 @@ def push_method_b_to_drive(
         ensure_lossless_flac(wav_48k, flac_path, log_cb=log_cb)
         files_to_push.append((flac_path, "audio_48k.flac"))
 
-    for meta_name in ("step1_audit.json", "manifest.json"):
+    for meta_name in (
+        "step1_audit.json",
+        "manifest.json",
+        "02a_audio_asr.json",
+        "02b_ocr_raw.json",
+        "03_aligned_master.json",
+        "03_zh_master.srt",
+        "05a_roles.jsonl",
+        "05b_sub_vi.jsonl",
+        "glossary.json",
+        "relationship_bible.json",
+    ):
         mp = work_dir / meta_name
         if mp.exists():
             dst_meta = stage_dir / meta_name

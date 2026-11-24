@@ -181,12 +181,43 @@ def managed_vllm_server(model_id: str, cfg: dict[str, Any]):
         release_vram()
 
 
-def _try_decode_json_candidate(cand: str) -> Any | None:
-    """Thử giải mã một ứng viên JSON bằng các bước nới lỏng an toàn."""
-    variants = [
-        cand,
-        re.sub(r",\s*([}\]])", r"\1", cand),
-    ]
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _has_cjk(text: str) -> bool:
+    return bool(CJK_RE.search(text or ""))
+
+
+def _extract_items_list(res: Any) -> list[dict[str, Any]]:
+    """Chuẩn hóa mọi định dạng JSON trả về từ LLM thành danh sách các dict có `id`."""
+    if isinstance(res, list):
+        return [x for x in res if isinstance(x, dict)]
+    if isinstance(res, dict):
+        if "id" in res and any(k in res for k in ("vi", "text", "translation", "s", "speaker_role", "g", "gender")):
+            return [res]
+        for key in ("items", "roles", "translations", "data", "lines", "results"):
+            val = res.get(key)
+            if isinstance(val, list):
+                return [x for x in val if isinstance(x, dict)]
+            if isinstance(val, dict):
+                return [
+                    ({"id": k, **v} if isinstance(v, dict) else {"id": k, "vi": str(v), "text": str(v)})
+                    for k, v in val.items()
+                ]
+        # Trường hợp LLM trả trực tiếp dict {"31": "Bản dịch...", "32": "..."}
+        if res and all(str(k).strip().isdigit() for k in res.keys()):
+            return [
+                ({"id": int(str(k).strip()), **v} if isinstance(v, dict) else {"id": int(str(k).strip()), "vi": str(v), "text": str(v)})
+                for k, v in res.items()
+            ]
+    return []
+
+
+def _try_decode_json_candidate(cand: str) -> Any:
+    v0 = (cand or "").strip()
+    if not v0:
+        return None
+    variants = [v0, re.sub(r",\s*([}\]])", r"\1", v0)]
     quoted = re.sub(r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:', r'\1"\2":', variants[1])
     if quoted != variants[1]:
         variants.append(quoted)
@@ -198,16 +229,34 @@ def _try_decode_json_candidate(cand: str) -> Any | None:
                 return obj
         except Exception:
             pass
+
+        # Nếu JSON bị cắt cụt ở cuối (thiếu `]}` do chạm max_tokens), gom TOÀN BỘ các object `{...}` đã hoàn chỉnh
         decoder = json.JSONDecoder()
-        for idx, ch in enumerate(v):
+        collected_items: list[dict[str, Any]] = []
+        idx = 0
+        n = len(v)
+        while idx < n:
+            ch = v[idx]
             if ch not in "{[":
+                idx += 1
                 continue
             try:
-                obj, _ = decoder.raw_decode(v[idx:])
-                if isinstance(obj, (dict, list)):
+                obj, end_offset = decoder.raw_decode(v[idx:])
+                if isinstance(obj, list) and obj:
                     return obj
+                if isinstance(obj, dict):
+                    if any(k in obj for k in ("items", "roles", "translations", "bible_add", "glossary_add")):
+                        return obj
+                    if "id" in obj:
+                        collected_items.append(obj)
+                        idx += max(1, end_offset)
+                        continue
+                idx += max(1, end_offset)
             except Exception:
-                continue
+                idx += 1
+        if collected_items:
+            return {"items": collected_items}
+
         try:
             obj = ast.literal_eval(v)
             if isinstance(obj, (dict, list)):
@@ -399,9 +448,9 @@ def _phase5a_qwen_analyze(
 
     sys_prompt = (
         "Bạn là biên kịch kiêm đạo diễn lồng tiếng chuyên phim ngắn thuyết minh 1 giọng nữ (chuẩn YouTube/Reels). "
-        "Trả về DUY NHẤT JSON hợp lệ, không giải thích thêm."
+        "Không suy nghĩ dài, xuất thẳng DUY NHẤT JSON hợp lệ, không giải thích thêm."
     )
-    batch_size = 30
+    batch_size = 15
     wave_workers = 6
     all_batches = [todo_turns[i : i + batch_size] for i in range(0, len(todo_turns), batch_size)]
 
@@ -469,12 +518,7 @@ def _phase5a_qwen_analyze(
                 if k and isinstance(v, str) and v.strip() and k not in glossary:
                     glossary[str(k)] = v.strip()
 
-        raw_roles = res.get("roles") or res.get("items") or []
-        if isinstance(raw_roles, dict):
-            raw_roles = [
-                ({"id": rk, **rv} if isinstance(rv, dict) else {"id": rk})
-                for rk, rv in raw_roles.items()
-            ]
+        raw_roles = _extract_items_list(res)
         res_map: dict[int, dict[str, Any]] = {}
         spk_map: dict[str, dict[str, Any]] = {}
         for r in raw_roles:
@@ -594,10 +638,20 @@ def _phase5b_gemma4_vi(
     vi_jsonl = target_dir / "05b_sub_vi.jsonl"
     if force:
         vi_jsonl.unlink(missing_ok=True)
-    done_map = {k: v["vi"] for k, v in _load_jsonl_map(vi_jsonl).items()}
+    # Chỉ giữ những câu trong cache ĐÃ DỊCH THẬT sang Tiếng Việt (loại bỏ mọi câu còn sót chữ Hán do lỗi cắt cụt JSON cũ)
+    raw_loaded = _load_jsonl_map(vi_jsonl)
+    done_map = {
+        k: str(v.get("vi", "")).strip()
+        for k, v in raw_loaded.items()
+        if str(v.get("vi", "")).strip() and not _has_cjk(str(v.get("vi", "")))
+    }
+    if len(done_map) < len(raw_loaded):
+        vi_jsonl.unlink(missing_ok=True)
+        if done_map:
+            _append_jsonl_batch(vi_jsonl, [{"id": k, "vi": done_map[k]} for k in sorted(done_map.keys())])
     todo_turns = [t for t in turns if int(t["id"]) not in done_map]
     if not todo_turns:
-        emit_progress(65.0, f"Tái sử dụng Pha 5B Gemma 4 ({len(done_map)} câu Việt)")
+        emit_progress(65.0, f"Tái sử dụng Pha 5B Gemma 4 ({len(done_map)} câu Việt sạch 100%)")
         return done_map
 
     bible = read_json_safe(target_dir / "relationship_bible.json") or {}
@@ -610,10 +664,10 @@ def _phase5b_gemma4_vi(
         "(2) Giữ chuẩn & KHÓA CỨNG cặp xưng hô `self_pronoun -> other_pronoun` cho từng cặp `speaker -> listener` theo `relationship_bible` "
         "để người nghe không cần đổi giọng vẫn phân biệt rạch ròi vai vế, địa vị, thái độ giữa các nhân vật; "
         "(3) Phù hợp ngữ cảnh hỏi-đáp liên hoàn (các câu ngắn/tỉnh lược chủ ngữ phải nối đúng mạch nhân vật đang nói); "
-        "(4) Với phim `MODERN`, CẤM dùng `'ta/ngươi/tại hạ'`; KHÔNG bao giờ để nữ tự xưng `'anh'`. "
-        "Chỉ trả JSON hợp lệ."
+        "(4) Với phim `MODERN`, CẤM dùng `'ta/ngươi/tại hạ'`; KHÔNG bao giờ để nữ tự xưng `'anh'`; "
+        "(5) TUYỆT ĐỐI DỊCH 100% SANG TIẾNG VIỆT, CẤM ĐỂ SÓT BẤT KỲ CHỮ HÁN NÀO. Không suy nghĩ dài, chỉ trả JSON hợp lệ."
     )
-    batch_size = 30
+    batch_size = 15
     wave_workers = 6
     zh_fb = cfg.get("models", {}).get("zh_analyst_model", "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit")
     ctx = nullcontext(conn) if conn else _managed_vllm_with_fallback(model_id, [zh_fb], cfg, "Pha 5B")
@@ -655,34 +709,74 @@ def _phase5b_gemma4_vi(
             f"Sổ Quan Hệ Nhân Vật (bắt buộc giữ nhất quán): {json.dumps(bible.get('relationships', []), ensure_ascii=False)}\n"
             f"Bảng tên riêng: {json.dumps(glossary, ensure_ascii=False)}\n"
             f"Ngữ cảnh 6 câu ngay trước đó: {json.dumps(prev_ctx, ensure_ascii=False)}\n"
-            "Dịch từng câu sau sang Tiếng Việt hiện đại tự nhiên như phim lồng tiếng, vừa miệng đọc trong `dur_s` giây. "
+            f"Dịch ĐỦ {len(batch)} câu sau sang Tiếng Việt hiện đại tự nhiên như phim lồng tiếng (TUYỆT ĐỐI KHÔNG ĐỂ SÓT CHỮ TRUNG QUỐC), vừa miệng đọc trong `dur_s` giây. "
             "CÙNG 1 cặp `speaker -> listener` phải giữ thống nhất 1 cặp xưng hô (tuyệt đối không tự nhảy tôi ↔ tao giữa chừng!). "
             'Trả JSON dạng: `{"items": [{"id": 1, "vi": "..."}]}`.\n\n'
             f"{json.dumps(packed, ensure_ascii=False)}"
         )
 
+    def _translate_5b_batch_strict(base_url: str, mid: str, batch: list[dict[str, Any]]) -> dict[int, str]:
+        """Dịch 1 batch và tự động dịch bù từng cụm nhỏ 5 câu nếu có bất kỳ câu nào bị thiếu hoặc còn sót chữ Hán."""
+        rmap: dict[int, str] = {}
+        try:
+            res = _chat_json(base_url, mid, sys_prompt, _build_5b_prompt(batch), temp=0.15)
+            for x in _extract_items_list(res):
+                xid = _safe_int(x.get("id"))
+                val = str(x.get("vi") or x.get("text") or x.get("translation") or "").strip()
+                if xid is not None and val and not _has_cjk(val):
+                    rmap[xid] = val
+        except Exception as exc:
+            print(f"[S5B WARN] Batch chính lỗi ({exc}), chuyển sang dịch bù cụm nhỏ...", flush=True)
+
+        missing = [t for t in batch if int(t["id"]) not in rmap]
+        for retry_round in range(3):
+            if not missing:
+                break
+            for j in range(0, len(missing), 5):
+                sub = missing[j : j + 5]
+                try:
+                    res_sub = _chat_json(base_url, mid, sys_prompt, _build_5b_prompt(sub), temp=0.1)
+                    for x in _extract_items_list(res_sub):
+                        xid = _safe_int(x.get("id"))
+                        val = str(x.get("vi") or x.get("text") or x.get("translation") or "").strip()
+                        if xid is not None and val and not _has_cjk(val):
+                            rmap[xid] = val
+                except Exception:
+                    continue
+            missing = [t for t in batch if int(t["id"]) not in rmap]
+
+        # Nếu vẫn còn câu đơn lẻ nào sót (ví dụ câu cảm thán 1 chữ), dịch đơn từng câu 1
+        for t in missing:
+            tid = int(t["id"])
+            r = roles_map.get(tid, {})
+            single_prompt = (
+                f"Dịch câu thoại tiếng Trung sau sang Tiếng Việt khẩu ngữ tự nhiên (xưng '{r.get('self_pronoun','tôi')}', gọi '{r.get('other_pronoun','cậu')}', "
+                f"Bảng tên riêng: {json.dumps(glossary, ensure_ascii=False)}). CẤM giữ chữ Hán. "
+                f'Trả JSON: {{"items": [{{"id": {tid}, "vi": "..."}}]}}\nCâu gốc: {t["text"]}'
+            )
+            try:
+                res_one = _chat_json(base_url, mid, sys_prompt, single_prompt, temp=0.1)
+                for x in _extract_items_list(res_one):
+                    val = str(x.get("vi") or x.get("text") or x.get("translation") or "").strip()
+                    val_clean = CJK_RE.sub("", val).strip()
+                    if val_clean:
+                        rmap[tid] = val_clean
+                        break
+            except Exception:
+                pass
+        return rmap
+
     with ctx as (base_url, mid):
         with ThreadPoolExecutor(max_workers=wave_workers) as pool:
             for w0 in range(0, len(all_vi_batches), wave_workers):
                 wave = all_vi_batches[w0 : w0 + wave_workers]
-                prompts = [_build_5b_prompt(b) for b in wave]
-                futs = [pool.submit(_chat_json, base_url, mid, sys_prompt, up, 0.15) for up in prompts]
+                futs = [pool.submit(_translate_5b_batch_strict, base_url, mid, b) for b in wave]
                 for batch, fut in zip(wave, futs):
-                    res = fut.result()
-                    raw_items = res if isinstance(res, list) else (res.get("items") or res.get("roles") or [])
-                    if isinstance(raw_items, dict):
-                        raw_items = [{"id": k, "vi": v} if not isinstance(v, dict) else {"id": k, **v} for k, v in raw_items.items()]
-                    rmap: dict[int, str] = {}
-                    for x in raw_items:
-                        if not isinstance(x, dict):
-                            continue
-                        xid = _safe_int(x.get("id"))
-                        if xid is not None:
-                            rmap[xid] = str(x.get("vi") or x.get("text") or x.get("translation") or "").strip()
+                    rmap = fut.result()
                     out_items = []
                     for t in batch:
                         tid = int(t["id"])
-                        vi_txt = rmap.get(tid) or t["text"]
+                        vi_txt = rmap.get(tid) or CJK_RE.sub("", str(t["text"])).strip() or "..."
                         done_map[tid] = vi_txt
                         out_items.append({"id": tid, "vi": vi_txt})
                     _append_jsonl_batch(vi_jsonl, out_items)
@@ -730,15 +824,10 @@ def _phase5b_gemma4_vi(
                     for s_idx, fut in futs:
                         try:
                             pres = fut.result()
-                            p_items = pres if isinstance(pres, list) else (pres.get("items") or [])
-                            if isinstance(p_items, dict):
-                                p_items = [{"id": k, "vi": v} if not isinstance(v, dict) else {"id": k, **v} for k, v in p_items.items()]
-                            for x in p_items:
-                                if not isinstance(x, dict):
-                                    continue
+                            for x in _extract_items_list(pres):
                                 xid = _safe_int(x.get("id"))
                                 new_vi = str(x.get("vi") or x.get("text") or "").strip()
-                                if xid is not None and new_vi and xid in done_map and xid >= int(turns[s_idx]["id"]):
+                                if xid is not None and new_vi and not _has_cjk(new_vi) and xid in done_map and xid >= int(turns[s_idx]["id"]):
                                     if done_map[xid] != new_vi:
                                         done_map[xid] = new_vi
                                         polish_changed = True

@@ -97,7 +97,8 @@ def _synth_vieneu_vi(
     todo: list[tuple[int, str, str, Path]] = []
     for t in turns:
         tid = int(t["id"])
-        txt = (vi_map.get(tid) or "").strip()
+        raw_txt = (vi_map.get(tid) or "").strip()
+        txt = re.sub(r"[\u4e00-\u9fff]+", "", raw_txt).strip()
         voice_id = fixed_voice
         h = hashlib.sha1(f"{voice_id}|{txt}".encode("utf-8")).hexdigest()[:8]
         wav_p = cache_dir / f"turn_{tid:04d}_{h}.wav"
@@ -703,15 +704,9 @@ def _render_master_mp4(
             cmd += [*hw_args]
         cmd += ["-i", str(cfr_mp4), "-i", str(master_audio)]
         wm_idx = None
-        sub_idx = None
-        next_i = 2
         if has_wm:
             cmd += ["-i", str(wm_png)]
-            wm_idx = next_i
-            next_i += 1
-        if master_srt and master_srt.exists():
-            cmd += ["-i", str(master_srt)]
-            sub_idx = next_i
+            wm_idx = 2
 
         blur_chain = (
             f"[0:v]split=2[fgraw][fgsub];"
@@ -728,9 +723,8 @@ def _render_master_mp4(
             fc = f"{blur_chain}[fgraw][subblur]overlay={bx}:{by},format=yuv420p[vout]"
 
         v_enc = enc_args if use_hw else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
-        cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "1:a:0", *v_enc, "-c:a", "copy", "-metadata:s:a:0", f"language={iso3}", "-movflags", "+faststart"]
-        if sub_idx is not None:
-            cmd += ["-map", f"{sub_idx}:0", "-c:s", "mov_text", "-metadata:s:s:0", f"language={iso3}"]
+        # Không nhúng track mov_text vào trong MP4 để trình phát video không tự bật chữ đè góc màn hình; file .srt vẫn lưu riêng ở subtitles/
+        cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "1:a:0", *v_enc, "-c:a", "copy", "-sn", "-metadata:s:a:0", f"language={iso3}", "-movflags", "+faststart"]
         cmd.append(str(out_mp4))
         return cmd
 
@@ -754,20 +748,16 @@ def _mux_streamcopy_lang_mp4(
     """Nhân bản nhanh (<1s) video đã làm mờ + watermark sang từng ngôn ngữ bằng `-c:v copy -c:a copy`."""
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
     iso3 = LANG_ISO3.get(lang, "und")
-    cmd = ["ffmpeg", "-y", "-v", "warning", "-i", str(blurred_mp4), "-i", str(audio_m4a)]
-    has_sub = bool(srt_path and srt_path.exists())
-    if has_sub:
-        cmd += ["-i", str(srt_path)]
-    cmd += [
+    cmd = [
+        "ffmpeg", "-y", "-v", "warning", "-i", str(blurred_mp4), "-i", str(audio_m4a),
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-c:v", "copy",
         "-c:a", "copy",
+        "-sn",
         "-metadata:s:a:0", f"language={iso3}",
+        "-movflags", "+faststart", str(out_mp4),
     ]
-    if has_sub:
-        cmd += ["-map", "2:0", "-c:s", "mov_text", "-metadata:s:s:0", f"language={iso3}"]
-    cmd += ["-movflags", "+faststart", str(out_mp4)]
     subprocess.run(cmd, check=True)
 
 
