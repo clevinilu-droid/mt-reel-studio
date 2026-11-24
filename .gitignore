@@ -13,14 +13,12 @@ __pycache__/
 *.py[cod]
 *.log
 
-# Thư mục video nặng, kết quả làm việc, tài liệu kinh doanh riêng & công cụ rời
+# Thư mục video nặng, kết quả làm việc, công cụ tải rời & mã nguồn ngoài
 Download/
-output/
-_engine/work/
-_engine/tools/
+projects/
+pyvideotrans/
 node_modules/
 docs/
-cloud/
 data/
 DANH_SACH_PHIM*
 hongguo-downloader-*.exe
@@ -37,3 +35,4 @@ hongguo-downloader-*.exe
 *.pth
 *.safetensors
 *.bin
+*.ckpt
