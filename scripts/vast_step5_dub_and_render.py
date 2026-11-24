@@ -1,10 +1,10 @@
 """
 Bước 5 (Chạy trên GPU Vast.ai với Image ghcr.io/clevinilu-droid/mt-reel-vast:latest):
-  1. Tiếng Việt: VieNeu-TTS v3 Turbo (48 kHz CUDA infer_batch) theo 4 vai (NAM_TRE, NAM_GIA, NU_TRE, NU_GIA).
-  2. Anh / Nhật / Hàn (EN / JA / KO): pyVideoTrans v4.19 (Qwen3-TTS-12Hz-0.6B-Base trên /opt/pyvideotrans/.venv)
-     clone trực tiếp giọng diễn viên gốc từ vocals_48k_mono.flac!
-  3. Căn chỉnh thời lượng từng câu (cắt khoảng lặng thừa, tự co giãn vừa slot, chống đè lên câu kế),
-     rồi trộn lên instrumental_48k.flac với ducking (-10.5 dB khi có lời thoại).
+  1. Tiếng Việt: VieNeu-TTS v3 Turbo (48 kHz CUDA infer_batch) chỉ 2 giọng tự nhiên (Hải Đăng + Trúc Ly).
+  2. Anh / Nhật / Hàn (EN / JA / KO): pyVideoTrans v4.19 (Qwen3-TTS-12Hz-0.6B-CustomVoice)
+     dùng 1 giọng NỮ bản địa tự nhiên theo từng quốc gia (Serena, Ono_anna, Sohee), không clone.
+  3. Căn chỉnh thời lượng từng câu, tăng âm lượng giọng nhân vật +30% (soft limiter chống rè),
+     giữ 92% tiếng reo hò/tiếng cười ngoài thoại, trộn lên instrumental_48k.flac với ducking (-12 dB).
   4. Render video Master làm mờ dải hardsub gốc theo blur_config.json bằng NVENC (hevc_nvenc / h264_nvenc),
      KHÔNG burn sub mới vào hình; xuất kèm audio_en/ja/ko.m4a và bộ softsub (.srt / .vtt).
 """
@@ -23,8 +23,9 @@ import soundfile as sf
 
 
 TARGET_SR = 48000
+VOICE_GAIN = 1.30  # +30% âm lượng lời thoại theo yêu cầu chuẩn
 PYVT_PYTHON = Path("/opt/pyvideotrans/.venv/bin/python")
-PYVT_CLONE_SCRIPT = Path("/workspace/pyvt_qwen_clone.py")
+PYVT_TTS_SCRIPT = Path("/workspace/pyvt_qwen_tts.py")
 
 
 def parse_ts(ts: str) -> float:
@@ -112,12 +113,12 @@ def synthesize_vieneu(lines: list[dict]) -> dict[int, np.ndarray]:
     return clips
 
 
-def synthesize_pyvt_clones(vocals: Path, role_lines: Path, clone_root: Path, langs: str = "en,ja,ko"):
-    script = PYVT_CLONE_SCRIPT if PYVT_CLONE_SCRIPT.exists() else (Path(__file__).resolve().parent / "pyvt_qwen_clone.py")
+def synthesize_pyvt_native(role_lines: Path, out_root: Path, langs: str = "en,ja,ko"):
+    script = PYVT_TTS_SCRIPT if PYVT_TTS_SCRIPT.exists() else (Path(__file__).resolve().parent / "pyvt_qwen_tts.py")
     py = str(PYVT_PYTHON) if PYVT_PYTHON.exists() else "python3"
-    print(f"[5.2] Running pyVideoTrans voice clone ({py} {script})...", flush=True)
+    print(f"[5.2] Running pyVideoTrans native female voices ({py} {script})...", flush=True)
     subprocess.run([
-        py, str(script), str(vocals), str(role_lines), str(clone_root), "--langs", langs
+        py, str(script), str(role_lines), str(out_root), "--langs", langs
     ], check=True)
 
 
@@ -134,6 +135,18 @@ def load_cloned_lang_clips(lang_dir: Path, lines: list[dict]) -> dict[int, np.nd
             w = librosa.resample(w, orig_sr=sr, target_sr=TARGET_SR)
         clips[x["id"]] = trim_silence(w.astype(np.float32))
     return clips
+
+
+def soft_limit(arr: np.ndarray, knee: float = 0.78, ceil: float = 0.96) -> np.ndarray:
+    """Apply smooth soft-knee limiting above `knee` up to `ceil` without shrinking quiet speech."""
+    head = ceil - knee
+    mag = np.abs(arr)
+    over = mag > knee
+    if np.any(over):
+        out = arr.copy()
+        out[over] = np.sign(arr[over]) * (knee + head * np.tanh((mag[over] - knee) / head))
+        return out
+    return arr
 
 
 def build_timeline_and_mix(
@@ -164,9 +177,8 @@ def build_timeline_and_mix(
             allowed_end = max(en, min(next_st - 0.04, en + 0.25))
             max_dur = max(0.25, allowed_end - st)
             w_fit = fit_to_slot(w, TARGET_SR, max_dur)
-            peak = float(np.max(np.abs(w_fit)))
-            if peak > 0.92:
-                w_fit = w_fit * (0.88 / peak)
+            # Boost character voice loudness by +30% with smooth soft-knee limiting
+            w_fit = soft_limit(w_fit * VOICE_GAIN, knee=0.78, ceil=0.95)
             s0 = int(st * TARGET_SR)
             s1 = min(total_samples, s0 + len(w_fit))
             if s1 > s0:
@@ -177,10 +189,8 @@ def build_timeline_and_mix(
         f1 = min(n_frames, int(mute_end_sec * TARGET_SR // hop) + 1)
         orig_keep_frames[f0:f1] = 0.0
 
-    # Smooth fade transitions (~80ms) on orig_keep so cheers/laughter fade cleanly without clicks
     fade_win = np.ones(9, dtype=np.float32) / 9.0
     orig_keep_smooth = np.convolve(orig_keep_frames, fade_win, mode="same")
-    # Force exact 0 inside core subtitle dialogue centers so zero Chinese dialogue leaks
     for item in lines:
         f0 = max(0, int(parse_ts(item["start"]) * TARGET_SR // hop))
         f1 = min(n_frames, int(parse_ts(item["end"]) * TARGET_SR // hop) + 1)
@@ -197,7 +207,7 @@ def build_timeline_and_mix(
     active = (env > 0.015).astype(np.float32)
     win = np.ones(25, dtype=np.float32) / 25.0
     smooth = np.clip(np.convolve(active, win, mode="same") * 1.8, 0.0, 1.0)
-    gain_frames = 1.0 - 0.70 * smooth
+    gain_frames = 1.0 - 0.76 * smooth  # Duck BGM deeper (-12.4dB) during louder speech
     gain_samples = np.interp(
         np.arange(total_samples, dtype=np.float32),
         np.arange(n_frames, dtype=np.float32) * hop,
@@ -211,9 +221,7 @@ def build_timeline_and_mix(
     mixed *= gain_samples[:, None]
     mixed[:, 0] += voice_track
     mixed[:, 1] += voice_track
-    peak = float(np.max(np.abs(mixed)))
-    if peak > 0.98:
-        mixed *= 0.95 / peak
+    mixed = soft_limit(mixed, knee=0.86, ceil=0.97)
 
     tmp_wav = tmp_dir / f"{out_m4a.stem}.wav"
     sf.write(str(tmp_wav), mixed, TARGET_SR, subtype="PCM_16")
@@ -311,15 +319,15 @@ def main():
             vi_clips = synthesize_vieneu(lines)
             build_timeline_and_mix(lines, vi_clips, orig_vocals, instr, total_samples, vi_m4a, tmp_dir)
 
-        # 2. pyVideoTrans Qwen3-TTS voice cloning from vocals_48k_mono.flac (EN / JA / KO)
+        # 2. pyVideoTrans Qwen3-TTS CustomVoice (1 native female voice per country: EN/JA/KO)
         if clone_langs:
-            clone_root = cache_dir / "qwen_clones"
-            synthesize_pyvt_clones(args.vocals, args.role_lines, clone_root, langs=",".join(clone_langs))
+            tts_root = cache_dir / "qwen_native"
+            synthesize_pyvt_native(args.role_lines, tts_root, langs=",".join(clone_langs))
             for lang in clone_langs:
-                lang_clips = load_cloned_lang_clips(clone_root / lang, lines)
+                lang_clips = load_cloned_lang_clips(tts_root / lang, lines)
                 out_m4a = audio_dir / f"audio_{lang}.m4a"
                 build_timeline_and_mix(lines, lang_clips, orig_vocals, instr, total_samples, out_m4a, tmp_dir)
-                print(f"[OK] {lang.upper()} cloned track mixed -> {out_m4a.name}", flush=True)
+                print(f"[OK] {lang.upper()} native track mixed -> {out_m4a.name}", flush=True)
 
         # 3. Render final blurred MP4 with Vietnamese dubbed audio
         enc_name, enc_flags = pick_video_encoder()
