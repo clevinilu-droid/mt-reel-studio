@@ -192,6 +192,8 @@ def vast_rent(req: RentRequest):
             "-e NVIDIA_DRIVER_CAPABILITIES=compute,video,utility -p 7860:7860",
             "--ssh",
             "--direct",
+            "--onstart-cmd",
+            "chmod 700 /root /root/.ssh 2>/dev/null; chmod 600 /root/.ssh/authorized_keys 2>/dev/null; chown -R root:root /root/.ssh 2>/dev/null || true",
             "--label",
             req.label,
         ],
