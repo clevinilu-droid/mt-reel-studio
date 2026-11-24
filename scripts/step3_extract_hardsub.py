@@ -1,6 +1,8 @@
 """
-Bước 3.2: Trích xuất các câu Hardsub gốc (vùng đáy cố định) thành các tấm ảnh dải chữ gọn nhẹ.
-Chỉ chụp 1 dải ảnh rõ nhất ở giữa mỗi câu để đọc chính xác 100% chữ tác giả mà không tốn thời gian OCR trùng lặp.
+Bước 3.2 (Nâng cấp 4 lớp chống sót câu):
+- Khung quét nới rộng (40:1380:1000:220) bao trọn cả hardsub 1 dòng lẫn 2 dòng.
+- Bắt cả chữ trắng lẫn chữ vàng/màu sáng (max(R,G,B) > 205 kèm viền tối min(R,G,B) < 75).
+- Ngưỡng IoU >= 0.65 (cộng kiểm tra thay đổi chữ tâm) tránh gộp nhầm 2 câu ngắn liên tiếp.
 """
 import argparse
 import json
@@ -14,29 +16,41 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 def extract_text_mask(frame_bgr: np.ndarray) -> np.ndarray:
-    """Detect bright white Chinese hardsub strokes surrounded by dark outline."""
+    """Detect pure white or bright yellow hardsub strokes surrounded by true black outline."""
     b, g, r = frame_bgr[:, :, 0], frame_bgr[:, :, 1], frame_bgr[:, :, 2]
-    white = (b > 225) & (g > 225) & (r > 225)
+    is_white = (b > 218) & (g > 218) & (r > 218)
+    is_yellow = (r > 218) & (g > 180) & (b < 115)
+    bright = is_white | is_yellow
+    # True dark outline (all 3 channels dark)
+    dark = (b < 68) & (g < 68) & (r < 68)
     kernel = np.ones((7, 7), np.uint8)
-    near_white = cv2.dilate(white.astype(np.uint8), kernel, iterations=1) > 0
-    dark = (b < 65) & (g < 65) & (r < 65)
-    bordered = near_white & dark
+    near_bright = cv2.dilate(bright.astype(np.uint8), kernel, iterations=1) > 0
+    bordered = near_bright & dark
     has_border = cv2.dilate(bordered.astype(np.uint8), kernel, iterations=1) > 0
-    return (white & has_border).astype(np.uint8)
+    mask = (bright & has_border).astype(np.uint8)
+    # Reject huge solid reflections (> 22% of any local 40x40 block) by keeping only text-thin strokes
+    if mask.sum() > 0:
+        thick = cv2.erode(mask, np.ones((11, 11), np.uint8), iterations=1)
+        if thick.sum() > 0:
+            mask = mask & (1 - cv2.dilate(thick, np.ones((15, 15), np.uint8), iterations=1))
+    return mask
 
 
 def main():
     ap = argparse.ArgumentParser(description="Extract unique bottom hardsub line strips into numbered sheets.")
     ap.add_argument("video", type=Path, help="Input video file (.mp4)")
-    ap.add_argument("out_dir", type=Path, help="Output Step 3 directory (e.g. projects/.../P1/02_buoc3_hardsub_va_am_thanh)")
-    ap.add_argument("--crop", default="80:1455:920:95", help="X:Y:W:H crop box of bottom hardsub")
+    ap.add_argument("out_dir", type=Path, help="Output Step 3 directory")
+    ap.add_argument("--crop", default="40:1380:1000:220", help="X:Y:W:H crop box covering 1-2 line hardsubs")
     ap.add_argument("--fps", type=float, default=5.0, help="Scan FPS (default 5.0)")
-    ap.add_argument("--per-sheet", type=int, default=30, help="Subtitle strips per output sheet")
+    ap.add_argument("--iou-thresh", type=float, default=0.65, help="Same-line IoU threshold (default 0.65)")
+    ap.add_argument("--per-sheet", type=int, default=25, help="Subtitle strips per output sheet")
     args = ap.parse_args()
 
     cx, cy, cw, ch = (int(x) for x in args.crop.split(":"))
     sub_grids_dir = args.out_dir / "hardsub_grids"
     sub_grids_dir.mkdir(parents=True, exist_ok=True)
+    for old_f in sub_grids_dir.glob("sub_sheet_*.jpg"):
+        old_f.unlink()
 
     t0 = time.time()
     cmd = [
@@ -55,8 +69,10 @@ def main():
             break
         frame = np.frombuffer(raw, dtype=np.uint8).reshape((ch, cw, 3))
         mask = extract_text_mask(frame)
-        ink = int(mask.sum())
-        frames_meta.append((idx / args.fps, ink, mask, frame if ink > 80 else None))
+        # Centered subtitle region check prevents side highlights from triggering
+        center_ink = int(mask[:, cw // 5 : cw - cw // 5].sum())
+        ink = int(mask.sum()) if center_ink >= 90 else 0
+        frames_meta.append((idx / args.fps, ink, mask, frame if ink > 90 else None))
         idx += 1
     proc.stdout.close()
     proc.wait()
@@ -64,7 +80,7 @@ def main():
     events = []
     cur = None
     for t, ink, mask, frame in frames_meta:
-        if ink < 110:
+        if ink < 120:
             if cur is not None:
                 cur["end"] = t
                 events.append(cur)
@@ -77,7 +93,7 @@ def main():
             inter = int(np.logical_and(mask, prev_mask).sum())
             union = int(np.logical_or(mask, prev_mask).sum())
             iou = inter / union if union else 0.0
-            if iou >= 0.42:
+            if iou >= args.iou_thresh:
                 cur["end"] = t + 1.0 / args.fps
                 cur["samples"].append((t, ink, mask, frame))
             else:
@@ -100,7 +116,7 @@ def main():
         d = ImageDraw.Draw(canvas)
         sm, ss = divmod(ev["start"], 60)
         em, es = divmod(ev["end"], 60)
-        d.text((10, 18), f"#{i:03d}\n{int(sm):02d}:{ss:05.2f} -> {int(em):02d}:{es:05.2f}", font=font, fill=(255, 230, 80))
+        d.text((10, 22), f"#{i:03d}\n{int(sm):02d}:{ss:05.2f} -> {int(em):02d}:{es:05.2f}", font=font, fill=(255, 230, 80))
         strips.append(canvas)
         meta_out.append({"id": i, "start": round(ev["start"], 3), "end": round(ev["end"], 3)})
 

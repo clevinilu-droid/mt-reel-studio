@@ -1,11 +1,13 @@
 """
-Bước 3.4: Khớp sóng âm (Audio-Snap), gộp câu dài bị cắt đôi và đo giới tính (F0 Hz) trên file vocals sạch.
-Đầu vào: zh_hardsub_raw.srt + vocals (.flac/.wav)
-Đầu ra: zh_master_synced.srt + voice_profile.json
+Bước 3.4: Khớp sóng âm (Audio-Snap), gộp câu dài, đo giới tính (F0 Hz)
+và KIỂM TRA CHÉO 2 LỚP phát hiện mọi đoạn có tiếng nói trên vocals nhưng chưa có trong .srt.
+Đầu vào: zh_hardsub_raw.srt + vocals (.flac/.wav) [+ optional video gốc để chụp frame bổ sung]
+Đầu ra: zh_master_synced.srt + voice_profile.json + missing_speech_gaps.json
 """
 import argparse
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import librosa
@@ -54,7 +56,7 @@ def snap_bounds(audio: np.ndarray, sr: int, start: float, end: float, pad: float
         return start, end, 0.0
 
     win = audio[w_s:w_e]
-    hop = int(0.01 * sr)  # 10ms frames
+    hop = int(0.01 * sr)
     frame_len = int(0.025 * sr)
     rms = librosa.feature.rms(y=win, frame_length=frame_len, hop_length=hop)[0]
     peak = float(np.max(rms)) if len(rms) else 0.0
@@ -90,11 +92,50 @@ def estimate_voice_profile(seg: np.ndarray, sr: int) -> tuple[float, str]:
     return round(med_f0, 1), gender
 
 
+def find_uncovered_speech(audio: np.ndarray, sr: int, items: list[dict], min_dur: float = 0.30) -> list[dict]:
+    """Cross-check Layer 2: detect vocal segments >= min_dur not covered by any subtitle line."""
+    hop = int(0.02 * sr)  # 20ms grid
+    rms = librosa.feature.rms(y=audio, frame_length=int(0.04 * sr), hop_length=hop)[0]
+    covered = np.zeros(len(rms), dtype=bool)
+    for it in items:
+        i0 = max(0, int((it["start"] - 0.15) * sr / hop))
+        i1 = min(len(rms), int((it["end"] + 0.15) * sr / hop) + 1)
+        covered[i0:i1] = True
+
+    active = (rms >= 0.015) & (~covered)
+    gaps = []
+    start_idx = None
+    for idx, val in enumerate(active):
+        if val and start_idx is None:
+            start_idx = idx
+        elif not val and start_idx is not None:
+            dur = (idx - start_idx) * hop / sr
+            if dur >= min_dur:
+                gaps.append({
+                    "start": round(start_idx * hop / sr, 2),
+                    "end": round(idx * hop / sr, 2),
+                    "duration": round(dur, 2),
+                    "rms_peak": round(float(np.max(rms[start_idx:idx])), 4),
+                })
+            start_idx = None
+    if start_idx is not None:
+        dur = (len(active) - start_idx) * hop / sr
+        if dur >= min_dur:
+            gaps.append({
+                "start": round(start_idx * hop / sr, 2),
+                "end": round(len(active) * hop / sr, 2),
+                "duration": round(dur, 2),
+                "rms_peak": round(float(np.max(rms[start_idx:])), 4),
+            })
+    return gaps
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Audio-Snap hardsub SRT against clean vocals and tag speaker gender/F0.")
+    ap = argparse.ArgumentParser(description="Audio-Snap hardsub SRT, tag gender/F0, and cross-check uncovered speech.")
     ap.add_argument("raw_srt", type=Path, help="Input zh_hardsub_raw.srt")
     ap.add_argument("vocals", type=Path, help="Clean vocals audio (.flac or .wav)")
     ap.add_argument("out_dir", type=Path, help="Output directory")
+    ap.add_argument("--video", type=Path, default=None, help="Optional video to snapshot frames for uncovered speech gaps")
     ap.add_argument("--merge-gap", type=float, default=0.16, help="Max gap (s) to merge split continuous lines")
     args = ap.parse_args()
 
@@ -120,7 +161,6 @@ def main():
             "rms_peak": peak,
         })
 
-    # Merge split lines if gap <= merge_gap, same gender tag, continuous energy, and no terminal punctuation
     merged = []
     for cur in snapped:
         if (
@@ -141,7 +181,6 @@ def main():
         else:
             merged.append(cur)
 
-    # Prevent overlap with next line
     for i in range(len(merged) - 1):
         if merged[i]["end"] > merged[i + 1]["start"]:
             mid = round((merged[i]["end"] + merged[i + 1]["start"]) / 2, 3)
@@ -159,8 +198,22 @@ def main():
     out_srt.write_text("\n".join(srt_lines), encoding="utf-8")
     out_prof.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    # Cross-check Layer 2: detect uncovered speech segments on vocals
+    gaps = find_uncovered_speech(audio, sr, merged)
+    (args.out_dir / "missing_speech_gaps.json").write_text(json.dumps(gaps, indent=2), encoding="utf-8")
+    if gaps and args.video and args.video.exists():
+        miss_dir = args.out_dir / "missing_check"
+        miss_dir.mkdir(parents=True, exist_ok=True)
+        for i, g in enumerate(gaps, 1):
+            mid_t = round((g["start"] + g["end"]) / 2.0, 2)
+            subprocess.run([
+                "ffmpeg", "-y", "-v", "error", "-ss", str(mid_t), "-i", str(args.video),
+                "-vf", "crop=1000:220:40:1380", "-frames:v", "1", "-q:v", "2",
+                str(miss_dir / f"gap_{i:02d}_{mid_t:.2f}s.jpg")
+            ], check=True)
+
     counts = {k: sum(1 for x in merged if x["tag"] == k) for k in ("NAM", "NU", "UNKNOWN", "CHU_THICH_CAM")}
-    print(f"[OK] {len(items)} raw -> {len(merged)} synced lines -> {out_srt.name} | Tags: {counts}")
+    print(f"[OK] {len(items)} raw -> {len(merged)} synced lines -> {out_srt.name} | Tags: {counts} | Uncovered speech gaps: {len(gaps)}")
 
 
 if __name__ == "__main__":
