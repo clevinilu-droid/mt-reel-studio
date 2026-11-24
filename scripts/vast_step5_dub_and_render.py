@@ -141,33 +141,59 @@ def load_cloned_lang_clips(lang_dir: Path, lines: list[dict]) -> dict[int, np.nd
 def build_timeline_and_mix(
     lines: list[dict],
     clips: dict[int, np.ndarray],
+    orig_vocals: np.ndarray,
     instr_stereo: np.ndarray,
     total_samples: int,
     out_m4a: Path,
     tmp_dir: Path,
 ):
-    voice_track = np.zeros(total_samples, dtype=np.float32)
-    for idx, item in enumerate(lines):
-        w = clips.get(item["id"])
-        if w is None or len(w) == 0:
-            continue
-        st = parse_ts(item["start"])
-        en = parse_ts(item["end"])
-        next_st = parse_ts(lines[idx + 1]["start"]) if idx + 1 < len(lines) else total_samples / TARGET_SR
-        allowed_end = max(en, min(next_st - 0.04, en + 0.25))
-        max_dur = max(0.25, allowed_end - st)
-        w_fit = fit_to_slot(w, TARGET_SR, max_dur)
-        peak = float(np.max(np.abs(w_fit)))
-        if peak > 0.92:
-            w_fit = w_fit * (0.88 / peak)
-        s0 = int(st * TARGET_SR)
-        s1 = min(total_samples, s0 + len(w_fit))
-        if s1 > s0:
-            voice_track[s0:s1] += w_fit[: s1 - s0]
-
-    hop = 480
+    hop = 480  # 10ms frame resolution
     n_frames = (total_samples + hop - 1) // hop
     pad_len = n_frames * hop - total_samples
+
+    voice_track = np.zeros(total_samples, dtype=np.float32)
+    # Keep non-dialogue vocals (crowd cheers, laughter, fight grunts) outside subtitle spans
+    orig_keep_frames = np.ones(n_frames, dtype=np.float32) * 0.92
+
+    for idx, item in enumerate(lines):
+        st = parse_ts(item["start"])
+        en = parse_ts(item["end"])
+        mute_end_sec = en + 0.10
+
+        w = clips.get(item["id"])
+        if w is not None and len(w) > 0:
+            next_st = parse_ts(lines[idx + 1]["start"]) if idx + 1 < len(lines) else total_samples / TARGET_SR
+            allowed_end = max(en, min(next_st - 0.04, en + 0.25))
+            max_dur = max(0.25, allowed_end - st)
+            w_fit = fit_to_slot(w, TARGET_SR, max_dur)
+            peak = float(np.max(np.abs(w_fit)))
+            if peak > 0.92:
+                w_fit = w_fit * (0.88 / peak)
+            s0 = int(st * TARGET_SR)
+            s1 = min(total_samples, s0 + len(w_fit))
+            if s1 > s0:
+                voice_track[s0:s1] += w_fit[: s1 - s0]
+                mute_end_sec = max(mute_end_sec, s1 / TARGET_SR + 0.06)
+
+        f0 = max(0, int((st - 0.08) * TARGET_SR // hop))
+        f1 = min(n_frames, int(mute_end_sec * TARGET_SR // hop) + 1)
+        orig_keep_frames[f0:f1] = 0.0
+
+    # Smooth fade transitions (~80ms) on orig_keep so cheers/laughter fade cleanly without clicks
+    fade_win = np.ones(9, dtype=np.float32) / 9.0
+    orig_keep_smooth = np.convolve(orig_keep_frames, fade_win, mode="same")
+    # Force exact 0 inside core subtitle dialogue centers so zero Chinese dialogue leaks
+    for item in lines:
+        f0 = max(0, int(parse_ts(item["start"]) * TARGET_SR // hop))
+        f1 = min(n_frames, int(parse_ts(item["end"]) * TARGET_SR // hop) + 1)
+        orig_keep_smooth[f0:f1] = 0.0
+
+    orig_keep_samples = np.interp(
+        np.arange(total_samples, dtype=np.float32),
+        np.arange(n_frames, dtype=np.float32) * hop,
+        orig_keep_smooth,
+    ).astype(np.float32)
+
     v_pad = np.pad(voice_track, (0, pad_len))
     env = np.max(np.abs(v_pad.reshape(n_frames, hop)), axis=1)
     active = (env > 0.015).astype(np.float32)
@@ -180,7 +206,11 @@ def build_timeline_and_mix(
         gain_frames,
     ).astype(np.float32)
 
-    mixed = instr_stereo[:total_samples].copy() * gain_samples[:, None]
+    ambient_vocals = orig_vocals[:total_samples] * orig_keep_samples
+    mixed = instr_stereo[:total_samples].copy()
+    mixed[:, 0] += ambient_vocals
+    mixed[:, 1] += ambient_vocals
+    mixed *= gain_samples[:, None]
     mixed[:, 0] += voice_track
     mixed[:, 1] += voice_track
     peak = float(np.max(np.abs(mixed)))
@@ -247,13 +277,18 @@ def main():
     blur_cfg = json.loads(args.blur_config.read_text(encoding="utf-8"))
     vf_blur = blur_cfg["ffmpeg_filter"]
 
-    print("[5.0] Loading instrumental 48kHz stereo...", flush=True)
+    print("[5.0] Loading vocals & instrumental 48kHz...", flush=True)
+    orig_vocals, vsr = sf.read(str(args.vocals), dtype="float32")
+    if orig_vocals.ndim > 1:
+        orig_vocals = np.mean(orig_vocals, axis=1)
+    if vsr != TARGET_SR:
+        orig_vocals = librosa.resample(orig_vocals, orig_sr=vsr, target_sr=TARGET_SR)
     instr, sr = sf.read(str(args.instrumental), dtype="float32")
     if sr != TARGET_SR:
         raise RuntimeError(f"Expected 48kHz instrumental, got {sr}")
     if instr.ndim == 1:
         instr = np.column_stack([instr, instr])
-    total_samples = len(instr)
+    total_samples = min(len(instr), len(orig_vocals)) if len(orig_vocals) else len(instr)
 
     for lang in ("vi", "en", "ja", "ko"):
         blocks = [f"{x['id']}\n{x['start']} --> {x['end']}\n{x[lang]}\n" for x in lines]
@@ -262,21 +297,24 @@ def main():
         if lang == "vi":
             srt_to_vtt(srt_p, sub_dir / "vi.vtt")
 
+    cache_dir = args.out_dir / "_tts_cache"
+    cache_dir.mkdir(exist_ok=True)
+
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
 
         # 1. VieNeu-TTS v3 Turbo (Vietnamese)
         vi_clips = synthesize_vieneu(lines)
         vi_m4a = audio_dir / "audio_vi.m4a"
-        build_timeline_and_mix(lines, vi_clips, instr, total_samples, vi_m4a, tmp_dir)
+        build_timeline_and_mix(lines, vi_clips, orig_vocals, instr, total_samples, vi_m4a, tmp_dir)
 
         # 2. pyVideoTrans Qwen3-TTS voice cloning from vocals_48k_mono.flac (EN / JA / KO)
-        clone_root = tmp_dir / "qwen_clones"
+        clone_root = cache_dir / "qwen_clones"
         synthesize_pyvt_clones(args.vocals, args.role_lines, clone_root, langs="en,ja,ko")
         for lang in ("en", "ja", "ko"):
             lang_clips = load_cloned_lang_clips(clone_root / lang, lines)
             out_m4a = audio_dir / f"audio_{lang}.m4a"
-            build_timeline_and_mix(lines, lang_clips, instr, total_samples, out_m4a, tmp_dir)
+            build_timeline_and_mix(lines, lang_clips, orig_vocals, instr, total_samples, out_m4a, tmp_dir)
             print(f"[OK] {lang.upper()} cloned track mixed -> {out_m4a.name}", flush=True)
 
         # 3. Render final blurred MP4 with Vietnamese dubbed audio
