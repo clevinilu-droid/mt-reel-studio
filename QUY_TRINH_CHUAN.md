@@ -76,9 +76,9 @@ gpu_ram>=12 num_gpus=1 gpu_frac=1 compute_cap>=860 gpu_name notin [A100_SXM4,A10
 ### Bước 5 — Lồng tiếng, Trộn BGM & Xuất Thành Phẩm YouTube *(Trên Vast.ai GPU)*
 1. **Lồng tiếng (`VieNeu-TTS` + `pyVideoTrans` trên Vast.ai):**
    * **Tiếng Việt:** Dùng **`VieNeu-TTS` (`vieneu[cuda]`, 48 kHz)** chỉ dùng **2 giọng Nam – Nữ tự nhiên cố định**: toàn bộ vai Nam dùng **`Hải Đăng`** (`Nam · Bắc · Phong cách tự nhiên`), toàn bộ vai Nữ dùng **`Trúc Ly`** (`Nữ · Bắc · Phong cách tự nhiên`).
-   * **Anh / Nhật / Hàn:** Không clone; dùng **`pyVideoTrans v4.19`** (`Qwen3-TTS-12Hz-0.6B-CustomVoice`) mỗi quốc gia **1 giọng Nữ bản địa tự nhiên** (`Serena` cho Anh, `Ono_anna` cho Nhật, `Sohee` cho Hàn).
-2. **Trộn âm (`Mix` + Tăng +30% âm lượng thoại + Bảo toàn tiếng đám đông):**
-   * Tăng **+30% âm lượng giọng nói nhân vật (`×1.30` + soft-limiter chống rè)** cho cả 4 ngôn ngữ và dìm BGM xuống `-12.4 dB` khi có lời thoại.
+   * **Anh / Nhật / Hàn:** Không clone; dùng **`pyVideoTrans` (`edge-tts` Neural)** mỗi quốc gia **1 giọng Nữ bản địa tự nhiên** (`en-US-AvaMultilingualNeural`, `ja-JP-NanamiNeural`, `ko-KR-SunHiNeural`), tự chỉnh tốc độ đọc + `FFmpeg atempo` mượt (không cắt cụt chữ).
+2. **Trộn âm (`Mix` + Bảo toàn tiếng đám đông + Tăng +30% âm lượng riêng lời thoại):**
+   * Tăng **+30% âm lượng riêng của giọng nói các nhân vật (`×1.30` + soft-limiter chống rè)** cho cả 4 ngôn ngữ; mức dìm BGM (`-10.5 dB` lúc nói) giữ nguyên.
    * **Giữ lại ~92% âm lượng `vocals_48k_mono.flac` ở mọi khoảng ngoài mốc thời gian phụ đề** (cắt êm `~90ms` về 0% đúng trong khung `[start, end]` của câu thoại) để bảo toàn nguyên vẹn tiếng reo hò, tiếng cười đám đông, tiếng hét võ đài.
 3. **Render Video Master (`FFmpeg hevc_nvenc` / `h264_nvenc`):**
    * Áp dụng duy nhất bộ lọc làm mờ dải hardsub gốc (`blur_config.json`), **KHÔNG burn phụ đề mới vào video**.

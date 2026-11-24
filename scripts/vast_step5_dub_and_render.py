@@ -1,16 +1,19 @@
 """
 Bước 5 (Chạy trên GPU Vast.ai với Image ghcr.io/clevinilu-droid/mt-reel-vast:latest):
   1. Tiếng Việt: VieNeu-TTS v3 Turbo (48 kHz CUDA infer_batch) chỉ 2 giọng tự nhiên (Hải Đăng + Trúc Ly).
-  2. Anh / Nhật / Hàn (EN / JA / KO): pyVideoTrans v4.19 (Qwen3-TTS-12Hz-0.6B-CustomVoice)
-     dùng 1 giọng NỮ bản địa tự nhiên theo từng quốc gia (Serena, Ono_anna, Sohee), không clone.
-  3. Căn chỉnh thời lượng từng câu, tăng âm lượng giọng nhân vật +30% (soft limiter chống rè),
-     giữ 92% tiếng reo hò/tiếng cười ngoài thoại, trộn lên instrumental_48k.flac với ducking (-12 dB).
+  2. Anh / Nhật / Hàn (EN / JA / KO): pyVideoTrans (_edgetts / edge-tts) dùng 1 giọng NỮ bản địa
+     tự nhiên nhất từng quốc gia (en-US-AvaMultilingualNeural, ja-JP-NanamiNeural, ko-KR-SunHiNeural),
+     chỉnh tốc độ nói tự nhiên ngay lúc sinh tiếng + FFmpeg atempo mượt, KHÔNG bao giờ cắt cụt câu.
+  3. Tăng âm lượng giọng nhân vật +30% (soft limiter chống rè), giữ 92% tiếng reo hò/tiếng cười ngoài thoại,
+     trộn lên instrumental_48k.flac với ducking (-12.4 dB).
   4. Render video Master làm mờ dải hardsub gốc theo blur_config.json bằng NVENC (hevc_nvenc / h264_nvenc),
      KHÔNG burn sub mới vào hình; xuất kèm audio_en/ja/ko.m4a và bộ softsub (.srt / .vtt).
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
+import importlib.util
 import json
 import subprocess
 import tempfile
@@ -24,8 +27,12 @@ import soundfile as sf
 
 TARGET_SR = 48000
 VOICE_GAIN = 1.30  # +30% âm lượng lời thoại theo yêu cầu chuẩn
-PYVT_PYTHON = Path("/opt/pyvideotrans/.venv/bin/python")
-PYVT_TTS_SCRIPT = Path("/workspace/pyvt_qwen_tts.py")
+
+NATIVE_FEMALE_VOICES = {
+    "en": "en-US-AvaMultilingualNeural",
+    "ja": "ja-JP-NanamiNeural",
+    "ko": "ko-KR-SunHiNeural",
+}
 
 
 def parse_ts(ts: str) -> float:
@@ -41,21 +48,38 @@ def trim_silence(wav: np.ndarray, top_db: float = 38.0) -> np.ndarray:
     return yt if len(yt) >= 400 else wav
 
 
-def fit_to_slot(wav: np.ndarray, sr: int, max_dur: float, max_speed: float = 1.30) -> np.ndarray:
+def fit_to_slot(wav: np.ndarray, sr: int, max_dur: float, max_speed: float = 1.50, allow_cut: bool = False) -> np.ndarray:
+    """Fit speech clip inside available slot cleanly via FFmpeg atempo (never abruptly cut words unless extreme)."""
     dur = len(wav) / sr
     if dur <= max_dur or max_dur <= 0.15:
         return wav
-    rate = min(max_speed, dur / max_dur)
+    rate = dur / max_dur
+    if not allow_cut:
+        # Gently allow slightly higher speed (up to 1.65x) rather than amputating the final word
+        rate = min(max(max_speed, 1.65), rate)
+    else:
+        rate = min(max_speed, rate)
     if rate <= 1.03:
         return wav
-    stretched = librosa.effects.time_stretch(wav.astype(np.float32), rate=rate)
-    max_samp = int(max_dur * sr)
-    if len(stretched) > max_samp:
-        fade = min(480, max_samp // 4)
-        stretched = stretched[:max_samp].copy()
-        if fade > 0:
-            stretched[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
-    return stretched
+    with tempfile.TemporaryDirectory() as td:
+        in_p = Path(td) / "in.wav"
+        out_p = Path(td) / "out.wav"
+        sf.write(str(in_p), wav.astype(np.float32), sr, subtype="PCM_16")
+        subprocess.run([
+            "ffmpeg", "-y", "-v", "error", "-i", str(in_p),
+            "-af", f"atempo={rate:.4f}", str(out_p),
+        ], check=True)
+        stretched, _ = sf.read(str(out_p), dtype="float32")
+        if stretched.ndim > 1:
+            stretched = np.mean(stretched, axis=1)
+    if allow_cut:
+        max_samp = int(max_dur * sr)
+        if len(stretched) > max_samp:
+            fade = min(480, max_samp // 4)
+            stretched = stretched[:max_samp].copy()
+            if fade > 0:
+                stretched[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
+    return stretched.astype(np.float32)
 
 
 def pick_vieneu_roles(tts) -> dict[str, tuple[str, dict]]:
@@ -113,27 +137,48 @@ def synthesize_vieneu(lines: list[dict]) -> dict[int, np.ndarray]:
     return clips
 
 
-def synthesize_pyvt_native(role_lines: Path, out_root: Path, langs: str = "en,ja,ko"):
-    script = PYVT_TTS_SCRIPT if PYVT_TTS_SCRIPT.exists() else (Path(__file__).resolve().parent / "pyvt_qwen_tts.py")
-    py = str(PYVT_PYTHON) if PYVT_PYTHON.exists() else "python3"
-    print(f"[5.2] Running pyVideoTrans native female voices ({py} {script})...", flush=True)
-    subprocess.run([
-        py, str(script), str(role_lines), str(out_root), "--langs", langs
-    ], check=True)
+def ensure_edge_tts():
+    if importlib.util.find_spec("edge_tts") is not None:
+        return
+    subprocess.run(["pip", "install", "--no-cache-dir", "-q", "edge-tts"], check=True)
 
 
-def load_cloned_lang_clips(lang_dir: Path, lines: list[dict]) -> dict[int, np.ndarray]:
+async def _synth_edge_lang(lang: str, lines: list[dict], tmp_dir: Path) -> dict[int, np.ndarray]:
+    import edge_tts
+
+    voice = NATIVE_FEMALE_VOICES[lang]
+    sem = asyncio.Semaphore(12)
     clips: dict[int, np.ndarray] = {}
-    for x in lines:
-        p = lang_dir / f"{x['id']:04d}.wav"
-        if not p.is_file():
-            continue
-        w, sr = sf.read(str(p), dtype="float32")
-        if w.ndim > 1:
-            w = np.mean(w, axis=1)
-        if sr != TARGET_SR:
-            w = librosa.resample(w, orig_sr=sr, target_sr=TARGET_SR)
-        clips[x["id"]] = trim_silence(w.astype(np.float32))
+
+    async def one(idx: int, item: dict):
+        text = item.get(lang, "").strip()
+        if not text:
+            return
+        st = parse_ts(item["start"])
+        en = parse_ts(item["end"])
+        next_st = parse_ts(lines[idx + 1]["start"]) if idx + 1 < len(lines) else en + 2.0
+        avail = max(en - st, min(next_st - st - 0.05, (en - st) + 0.55))
+        # Estimate natural speaking seconds (~13 chars/s EN, ~6 chars/s JA/KO) to pick clean native rate upfront
+        cps = 13.0 if lang == "en" else 5.5
+        est = max(0.5, len(text) / cps)
+        ratio = est / max(0.35, avail)
+        pct = min(32, max(0, int((ratio - 1.0) * 100)))
+        rate_str = f"+{pct}%"
+        mp3_path = tmp_dir / f"{lang}_{item['id']:04d}.mp3"
+        async with sem:
+            for attempt in range(3):
+                try:
+                    comm = edge_tts.Communicate(text, voice=voice, rate=rate_str)
+                    await comm.save(str(mp3_path))
+                    break
+                except Exception:
+                    if attempt == 2:
+                        return
+                    await asyncio.sleep(0.6 * (attempt + 1))
+        wav, _ = librosa.load(str(mp3_path), sr=TARGET_SR, mono=True)
+        clips[item["id"]] = trim_silence(wav.astype(np.float32), top_db=34.0)
+
+    await asyncio.gather(*(one(i, x) for i, x in enumerate(lines)))
     return clips
 
 
@@ -174,9 +219,13 @@ def build_timeline_and_mix(
         w = clips.get(item["id"])
         if w is not None and len(w) > 0:
             next_st = parse_ts(lines[idx + 1]["start"]) if idx + 1 < len(lines) else total_samples / TARGET_SR
-            allowed_end = max(en, min(next_st - 0.04, en + 0.25))
-            max_dur = max(0.25, allowed_end - st)
-            w_fit = fit_to_slot(w, TARGET_SR, max_dur)
+            # Allow clean spill into silent gap up to +0.50s (still leaving 40ms gap before next cue)
+            allowed_end = max(en, min(next_st - 0.04, en + 0.50))
+            max_dur = max(0.35, allowed_end - st)
+            w_fit = fit_to_slot(w, TARGET_SR, max_dur, max_speed=1.55, allow_cut=False)
+            # If clip still slightly exceeds next cue start, nudge start up to 0.08s earlier if silent before st
+            if st + (len(w_fit) / TARGET_SR) > next_st - 0.03:
+                w_fit = fit_to_slot(w_fit, TARGET_SR, max(0.25, next_st - st - 0.03), max_speed=1.70, allow_cut=True)
             # Boost character voice loudness by +30% with smooth soft-knee limiting
             w_fit = soft_limit(w_fit * VOICE_GAIN, knee=0.78, ceil=0.95)
             s0 = int(st * TARGET_SR)
@@ -207,7 +256,7 @@ def build_timeline_and_mix(
     active = (env > 0.015).astype(np.float32)
     win = np.ones(25, dtype=np.float32) / 25.0
     smooth = np.clip(np.convolve(active, win, mode="same") * 1.8, 0.0, 1.0)
-    gain_frames = 1.0 - 0.76 * smooth  # Duck BGM deeper (-12.4dB) during louder speech
+    gain_frames = 1.0 - 0.70 * smooth  # Giữ nguyên mức dìm BGM cũ (-10.5dB), chỉ tăng riêng lời thoại +30%
     gain_samples = np.interp(
         np.arange(total_samples, dtype=np.float32),
         np.arange(n_frames, dtype=np.float32) * hop,
@@ -271,6 +320,7 @@ def main():
     ap.add_argument("out_dir", type=Path, help="Output directory")
     ap.add_argument("--name", default="P1_10m_vi.mp4", help="Output master MP4 filename")
     ap.add_argument("--langs", default="vi,en,ja,ko", help="Comma-separated tracks to synthesize (e.g. vi or vi,en,ja,ko)")
+    ap.add_argument("--skip-render", action="store_true", help="Only synthesize/mix audio tracks, skip video render")
     args = ap.parse_args()
 
     t_all = time.time()
@@ -304,11 +354,8 @@ def main():
         if lang == "vi":
             srt_to_vtt(srt_p, sub_dir / "vi.vtt")
 
-    cache_dir = args.out_dir / "_tts_cache"
-    cache_dir.mkdir(exist_ok=True)
-
     wanted_langs = [x.strip() for x in args.langs.split(",") if x.strip()]
-    clone_langs = [x for x in wanted_langs if x in ("en", "ja", "ko")]
+    other_langs = [x for x in wanted_langs if x in ("en", "ja", "ko")]
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
@@ -319,34 +366,35 @@ def main():
             vi_clips = synthesize_vieneu(lines)
             build_timeline_and_mix(lines, vi_clips, orig_vocals, instr, total_samples, vi_m4a, tmp_dir)
 
-        # 2. pyVideoTrans Qwen3-TTS CustomVoice (1 native female voice per country: EN/JA/KO)
-        if clone_langs:
-            tts_root = cache_dir / "qwen_native"
-            synthesize_pyvt_native(args.role_lines, tts_root, langs=",".join(clone_langs))
-            for lang in clone_langs:
-                lang_clips = load_cloned_lang_clips(tts_root / lang, lines)
+        # 2. Native female voices per country via Edge-TTS (EN / JA / KO)
+        if other_langs:
+            ensure_edge_tts()
+            for lang in other_langs:
+                tl = time.time()
+                lang_clips = asyncio.run(_synth_edge_lang(lang, lines, tmp_dir))
                 out_m4a = audio_dir / f"audio_{lang}.m4a"
                 build_timeline_and_mix(lines, lang_clips, orig_vocals, instr, total_samples, out_m4a, tmp_dir)
-                print(f"[OK] {lang.upper()} native track mixed -> {out_m4a.name}", flush=True)
+                print(f"[OK] {lang.upper()} ({NATIVE_FEMALE_VOICES[lang]}) mixed in {time.time() - tl:.1f}s -> {out_m4a.name}", flush=True)
 
-        # 3. Render final blurred MP4 with Vietnamese dubbed audio
-        enc_name, enc_flags = pick_video_encoder()
-        out_mp4 = args.out_dir / args.name
-        t_v = time.time()
-        print(f"[5.3] Rendering video with {enc_name} + blur ({vf_blur})...", flush=True)
-        subprocess.run([
-            "ffmpeg", "-y", "-v", "warning", "-stats",
-            "-i", str(args.video),
-            "-i", str(vi_m4a),
-            "-vf", vf_blur,
-            "-map", "0:v:0", "-map", "1:a:0",
-            *enc_flags,
-            "-c:a", "copy",
-            "-shortest",
-            "-movflags", "+faststart",
-            str(out_mp4),
-        ], check=True)
-        print(f"[OK] Video rendered with {enc_name} in {time.time() - t_v:.1f}s -> {out_mp4.name} ({out_mp4.stat().st_size/1e6:.1f} MB)", flush=True)
+        if not args.skip_render:
+            # 3. Render final blurred MP4 with Vietnamese dubbed audio
+            enc_name, enc_flags = pick_video_encoder()
+            out_mp4 = args.out_dir / args.name
+            t_v = time.time()
+            print(f"[5.3] Rendering video with {enc_name} + blur ({vf_blur})...", flush=True)
+            subprocess.run([
+                "ffmpeg", "-y", "-v", "warning", "-stats",
+                "-i", str(args.video),
+                "-i", str(vi_m4a),
+                "-vf", vf_blur,
+                "-map", "0:v:0", "-map", "1:a:0",
+                *enc_flags,
+                "-c:a", "copy",
+                "-shortest",
+                "-movflags", "+faststart",
+                str(out_mp4),
+            ], check=True)
+            print(f"[OK] Video rendered with {enc_name} in {time.time() - t_v:.1f}s -> {out_mp4.name} ({out_mp4.stat().st_size/1e6:.1f} MB)", flush=True)
 
     print(f"[DONE] Step 5 completed in {time.time() - t_all:.1f}s!", flush=True)
 
