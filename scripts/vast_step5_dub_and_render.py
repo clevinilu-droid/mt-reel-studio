@@ -75,10 +75,10 @@ def pick_vieneu_roles(tts) -> dict[str, tuple[str, dict]]:
         females = presets[-2:] or presets
 
     chosen = {
-        "NAM_TRE": males[0],
-        "NAM_GIA": males[-1] if len(males) > 1 else males[0],
-        "NU_TRE": females[0],
-        "NU_GIA": females[-1] if len(females) > 1 else females[0],
+        "NAM_TRE": next((m for m in males if "hải đăng" in m[0].lower() or "thiện minh" in m[0].lower()), males[0]),
+        "NAM_GIA": next((m for m in males if "quốc tuấn" in m[0].lower() or "tâm đức" in m[0].lower()), males[-1] if len(males) > 1 else males[0]),
+        "NU_TRE": next((f for f in females if "ngọc huyền" in f[0].lower() or "trúc ly" in f[0].lower()), females[0]),
+        "NU_GIA": next((f for f in females if "kim thanh" in f[0].lower() or "thùy dung" in f[0].lower()), females[-1] if len(females) > 1 else females[0]),
     }
     out = {}
     for role, (lbl, vid) in chosen.items():

@@ -85,7 +85,13 @@ def main():
     role_refs, line_refs = build_ref_clips(lines, vocals, sr, ref_dir)
 
     t0 = time.time()
-    model_src = args.model_dir if Path(args.model_dir, "model.safetensors").exists() else "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    local_dir = Path(args.model_dir)
+    if not (local_dir / "config.json").exists():
+        from huggingface_hub import snapshot_download
+        local_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[pyVideoTrans Qwen3-TTS] Downloading Qwen/Qwen3-TTS-12Hz-0.6B-Base -> {local_dir}...", flush=True)
+        snapshot_download("Qwen/Qwen3-TTS-12Hz-0.6B-Base", local_dir=str(local_dir))
+    model_src = str(local_dir)
     print(f"[pyVideoTrans Qwen3-TTS] Loading {model_src} on CUDA...", flush=True)
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
     model = Qwen3TTSModel.from_pretrained(model_src, device_map="auto", dtype=dtype)
@@ -109,48 +115,64 @@ def main():
         tl = time.time()
         print(f"[Qwen3-TTS] Cloning {len(lines)} lines -> {lang_name}...", flush=True)
 
-        # If prompt API exists, batch per role for maximum GPU speed
+        # If prompt API exists, batch per role sorted by duration with bounded max_new_tokens
         if has_prompt_api:
             for role in ("NAM_TRE", "NAM_GIA", "NU_TRE", "NU_GIA"):
                 grp = [x for x in lines if x["voice_role"] == role and x.get(lang, "").strip()]
                 if not grp:
                     continue
-                # Process in chunks of 16 to avoid VRAM spikes while maxing GPU throughput
-                for i in range(0, len(grp), 16):
-                    chunk = grp[i : i + 16]
+                grp.sort(key=lambda x: len(x[lang]))
+                for i in range(0, len(grp), 8):
+                    chunk = grp[i : i + 8]
                     texts = [x[lang].strip() for x in chunk]
-                    try:
-                        wavs, out_sr = model.generate_voice_clone(
-                            text=texts,
-                            language=[lang_name] * len(texts),
-                            voice_clone_prompt=role_prompts[role],
-                        )
-                    except Exception:
-                        # Fallback one-by-one if batching isn't supported for list prompt
-                        wavs, out_sr = [], None
-                        for t in texts:
-                            w_one, sr_one = model.generate_voice_clone(
-                                text=t,
-                                language=lang_name,
+                    max_slot = max(parse_ts(x["end"]) - parse_ts(x["start"]) for x in chunk)
+                    max_toks = min(135, max(36, int(max_slot * 18) + 28))
+                    with torch.inference_mode():
+                        try:
+                            wavs, out_sr = model.generate_voice_clone(
+                                text=texts,
+                                language=[lang_name] * len(texts),
                                 voice_clone_prompt=role_prompts[role],
+                                non_streaming_mode=True,
+                                max_new_tokens=max_toks,
                             )
-                            wavs.append(w_one[0])
-                            out_sr = sr_one
+                        except Exception:
+                            wavs, out_sr = [], None
+                            for x_one, t in zip(chunk, texts):
+                                slot_one = parse_ts(x_one["end"]) - parse_ts(x_one["start"])
+                                tok_one = min(135, max(36, int(slot_one * 18) + 28))
+                                w_one, sr_one = model.generate_voice_clone(
+                                    text=t,
+                                    language=lang_name,
+                                    voice_clone_prompt=role_prompts[role],
+                                    non_streaming_mode=True,
+                                    max_new_tokens=tok_one,
+                                )
+                                wavs.append(w_one[0])
+                                out_sr = sr_one
                     for x, w in zip(chunk, wavs):
                         sf.write(str(lang_dir / f"{x['id']:04d}.wav"), np.asarray(w, dtype=np.float32), out_sr)
+                    del wavs
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
         else:
-            for x in lines:
-                txt = x.get(lang, "").strip()
-                if not txt:
-                    continue
-                r_wav, r_txt = line_refs[x["id"]]
-                wavs, out_sr = model.generate_voice_clone(
-                    text=txt,
-                    language=lang_name,
-                    ref_audio=str(r_wav),
-                    ref_text=r_txt,
-                )
-                sf.write(str(lang_dir / f"{x['id']:04d}.wav"), np.asarray(wavs[0], dtype=np.float32), out_sr)
+            with torch.inference_mode():
+                for x in lines:
+                    txt = x.get(lang, "").strip()
+                    if not txt:
+                        continue
+                    r_wav, r_txt = line_refs[x["id"]]
+                    slot_one = parse_ts(x["end"]) - parse_ts(x["start"])
+                    tok_one = min(135, max(36, int(slot_one * 18) + 28))
+                    wavs, out_sr = model.generate_voice_clone(
+                        text=txt,
+                        language=lang_name,
+                        ref_audio=str(r_wav),
+                        ref_text=r_txt,
+                        non_streaming_mode=True,
+                        max_new_tokens=tok_one,
+                    )
+                    sf.write(str(lang_dir / f"{x['id']:04d}.wav"), np.asarray(wavs[0], dtype=np.float32), out_sr)
 
         print(f"[OK] Cloned {lang_name} in {time.time() - tl:.1f}s -> {lang_dir}", flush=True)
 
