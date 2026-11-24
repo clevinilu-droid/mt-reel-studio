@@ -40,7 +40,7 @@ def main():
     ap = argparse.ArgumentParser(description="Extract unique bottom hardsub line strips into numbered sheets.")
     ap.add_argument("video", type=Path, help="Input video file (.mp4)")
     ap.add_argument("out_dir", type=Path, help="Output Step 3 directory")
-    ap.add_argument("--crop", default="40:1380:1000:220", help="X:Y:W:H crop box covering 1-2 line hardsubs")
+    ap.add_argument("--crop", default="60:1410:960:170", help="X:Y:W:H crop box covering 1-2 line hardsubs")
     ap.add_argument("--fps", type=float, default=5.0, help="Scan FPS (default 5.0)")
     ap.add_argument("--iou-thresh", type=float, default=0.65, help="Same-line IoU threshold (default 0.65)")
     ap.add_argument("--per-sheet", type=int, default=25, help="Subtitle strips per output sheet")
@@ -69,10 +69,10 @@ def main():
             break
         frame = np.frombuffer(raw, dtype=np.uint8).reshape((ch, cw, 3))
         mask = extract_text_mask(frame)
-        # Centered subtitle region check prevents side highlights from triggering
-        center_ink = int(mask[:, cw // 5 : cw - cw // 5].sum())
-        ink = int(mask.sum()) if center_ink >= 90 else 0
-        frames_meta.append((idx / args.fps, ink, mask, frame if ink > 90 else None))
+        # Centered subtitle region check prevents side highlights/shorts stripes from triggering
+        center_ink = int(mask[:, cw // 4 : cw - cw // 4].sum())
+        ink = int(mask.sum()) if center_ink >= 140 else 0
+        frames_meta.append((idx / args.fps, ink, mask, frame if ink > 140 else None))
         idx += 1
     proc.stdout.close()
     proc.wait()
