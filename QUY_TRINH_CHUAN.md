@@ -84,5 +84,12 @@ gpu_ram>=12 num_gpus=1 gpu_frac=1 compute_cap>=860 gpu_name notin [A100_SXM4,A10
    * Áp dụng duy nhất bộ lọc làm mờ dải hardsub gốc (`blur_config.json`), **KHÔNG burn phụ đề mới vào video**.
    * Tối ưu dung lượng up YouTube cho phim dài ~150 phút: dùng `hevc_nvenc -cq 29 -b:v 700k -maxrate 1200k` (~900 MB) hoặc `h264_nvenc -cq 28 -b:v 950k -maxrate 1500k` (~1.1–1.2 GB), giữ nguyên chi tiết so với nguồn gốc ~300 kbps mà upload cực nhanh.
    * Xuất kèm bộ **Audio tracks** (`audio_en.m4a`, `audio_ja.m4a`, `audio_ko.m4a`) và bộ **Softsub** (`subtitles/*.srt` / `.vtt` giữ thiết lập màu vàng `#FFEB50`, vị trí đè dải mờ nếu dùng định dạng hỗ trợ style).
-4. **Đóng gói YouTube:** Tạo Thumbnail + Tiêu đề/Mô tả/Chapters đa ngôn ngữ, tải về máy và tắt ngay máy Vast.ai.
+4. **Đóng gói YouTube (`scripts/step5_youtube_package.py`):**
+   * **Thumbnail (`1280×720`, < 2 MB):** Dùng `poster.jpg` gốc của phần đó đặt giữa nền blur đồng bộ từ chính poster, chỉ gắn **2 huy hiệu rõ nét ở góc trên: `HOT` và `P1`/`P2`**, không chèn chữ dài gây rối hay che mặt nhân vật.
+   * **Tiêu đề (KHÔNG gộp 4 ngôn ngữ vào 1 tiêu đề):** Dùng mục **Ngôn ngữ (`Languages` / `localizations`)** trong YouTube Studio để đặt riêng 4 tiêu đề (`vi`, `en`, `ja`, `ko`) dịch sát tên gốc Trung Quốc (`<= 100 ký tự`, rõ số phần `Phần 1 / Part 1` ở cuối hoặc gọn trong tiêu đề). YouTube tự hiển thị đúng ngôn ngữ máy của từng người xem.
+   * **Mô tả (Tách riêng 4 ngôn ngữ, chuẩn chính sách chống spam / Reused Content):**
+     1. Nhập riêng từng bản mô tả vào tab ngôn ngữ tương ứng (`vi`, `en`, `ja`, `ko`), **không nhồi nhiều ngôn ngữ vào một ô mô tả** (vừa dễ bị YouTube đánh dấu spam từ khóa vừa giảm CTR).
+     2. Viết tóm tắt bối cảnh riêng của đúng phần `P1` hoặc `P2` bằng văn phong điện ảnh trung tính (tránh từ nhạy cảm bạo lực/máu me trực diện, tránh copy-paste y hệt 100% giữa các video, không rải link rác).
+     3. Bắt buộc kèm **Mốc thời gian (`Chapters`)** trích từ kịch bản thật (tối thiểu `00:00` + 3–5 mốc cao trào chính) để YouTube nhận diện nội dung biên tập có cấu trúc, và giữ **tối đa 3 hashtags** sạch ở cuối.
+   * Sau khi kiểm tra và tải xong toàn bộ thành phẩm về máy, **tắt ngay máy Vast.ai**.
 * 🔍 **Điểm bạn duyệt #3:** Nghe kiểm tra Đầu – Giữa – Cuối video thành phẩm và các track âm thanh đa ngôn ngữ trước khi đăng YouTube.
