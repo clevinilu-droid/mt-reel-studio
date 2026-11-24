@@ -4,6 +4,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
     AUDIO_SEPARATOR_MODEL_DIR=/opt/audio-separator-models \
     UV_LINK_MODE=copy
 
@@ -29,7 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN pip install --no-cache-dir -U pip uv \
     && pip install --no-cache-dir -U "audio-separator[gpu]" "vieneu[cuda]" audioread librosa soundfile scipy opencv-python-headless google-genai \
     && pip uninstall -y onnxruntime || true \
-    && pip install --no-cache-dir -U onnxruntime-gpu
+    && pip install --no-cache-dir --force-reinstall --no-deps onnxruntime-gpu
 
 # 3. Pre-download Mel-Band-RoFormer (InstVoc Duality V2) so Step 3.1 starts in 0s
 RUN mkdir -p /opt/audio-separator-models \
