@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MT-Reel Studio v3 — Điều Khiển & Chọn GPU</title>
+  <link rel="stylesheet" href="/static/style.css?v=3" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-badge">MT</span>
+      <div>
+        <div class="brand-title">MT-Reel Studio</div>
+        <div class="brand-sub">GHCR Image Ready · 5-Step Pipeline</div>
+      </div>
+    </div>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="vast">☁️ Vast.ai & Chọn GPU</button>
+      <button class="tab" data-tab="pipeline">🎬 Tiến Độ 5 Bước</button>
+      <button class="tab" data-tab="storage">📁 Kho Phim & Drive</button>
+      <button class="tab" data-tab="docs">📖 Quy Trình Chuẩn</button>
+    </nav>
+
+    <div class="topbar-right">
+      <div class="pill" id="creditPill">💳 Số dư: <b>--</b></div>
+      <div class="pill" id="runningPill">🖥️ Đang thuê: <b>0</b></div>
+    </div>
+  </header>
+
+  <main class="container">
+    <!-- TAB 1: VAST.AI & GPU PICKER -->
+    <section id="tab-vast" class="view active">
+      <div class="status-banner" id="runningInstancesCard">
+        <div class="section-head">
+          <div>
+            <h2>🖥️ Máy GPU Đang Chạy Trên Vast.ai</h2>
+            <p class="muted">Image mặc định: <code>ghcr.io/clevinilu-droid/mt-reel-vast:latest</code> (cài sẵn RoFormer, VieNeu-TTS, pyVideoTrans v4.19, FFmpeg 8.1 NVENC)</p>
+          </div>
+          <button class="btn ghost" id="btnRefreshStatus">🔄 Làm mới trạng thái</button>
+        </div>
+        <div id="instancesList" class="instances-grid">
+          <div class="empty-box">Đang kiểm tra máy đang chạy...</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="section-head">
+          <div>
+            <h2>⚡ Chọn Thuê GPU Tối Ưu (Lọc Theo Quy Trình Mới)</h2>
+            <p class="muted">Ưu tiên chỉ số <b>DLP/$ cao nhất</b> (hiệu quả xử lý AI trên mỗi đô-la) · Tự động chặn node Trung Quốc (GFW).</p>
+          </div>
+          <div class="preset-group">
+            <button class="btn preset active" data-preset="balanced">💎 Rẻ & Hiệu quả nhất</button>
+            <button class="btn preset" data-preset="asia">🌏 Gần Việt Nam</button>
+            <button class="btn preset" data-preset="fast">⚡ Siêu tốc Full 150p</button>
+          </div>
+        </div>
+
+        <div class="filter-bar">
+          <label>VRAM &ge;
+            <select id="fVram">
+              <option value="12" selected>12 GB (Đủ dùng RoFormer/TTS)</option>
+              <option value="16">16 GB (RTX 4060Ti / 5060Ti)</option>
+              <option value="24">24 GB (RTX 3090 / 4090)</option>
+            </select>
+          </label>
+          <label>Giá tối đa ($/giờ)
+            <input type="number" id="fMaxDph" value="0.25" step="0.02" min="0.05" max="2.0" />
+          </label>
+          <label>Ổ đĩa &ge; (GB)
+            <input type="number" id="fMinDisk" value="45" step="5" min="30" max="500" />
+          </label>
+          <label>Mạng tải &ge; (Mbps)
+            <input type="number" id="fMinDown" value="200" step="50" min="50" max="2000" />
+          </label>
+          <label class="ck-inline">
+            <input type="checkbox" id="fExcludeCn" checked /> Chặn Trung Quốc (non-CN)
+          </label>
+          <button class="btn primary" id="btnSearchOffers">🔍 Quét GPU Live</button>
+        </div>
+
+        <div class="query-preview">
+          <span>Lệnh lọc:</span>
+          <code id="queryStrBox">--</code>
+        </div>
+
+        <div class="table-wrap">
+          <table class="gpu-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Offer ID</th>
+                <th>Card GPU & VRAM</th>
+                <th>Giá Thuê / Giờ</th>
+                <th>Hiệu Quả (DLP / $)</th>
+                <th>CPU · RAM · Disk</th>
+                <th>Mạng (Up / Down)</th>
+                <th>Vị Trí · Tin Cậy</th>
+                <th>Thao Tác</th>
+              </tr>
+            </thead>
+            <tbody id="offersTbody">
+              <tr><td colspan="9" class="center muted">Đang tải danh sách GPU từ Vast.ai...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 2: TIẾN ĐỘ 5 BƯỚC -->
+    <section id="tab-pipeline" class="view">
+      <div id="projectsContainer" class="projects-stack">
+        <div class="empty-box">Đang quét tiến độ dự án...</div>
+      </div>
+    </section>
+
+    <!-- TAB 3: KHO PHIM & GOOGLE DRIVE -->
+    <section id="tab-storage" class="view">
+      <div class="grid-2">
+        <div class="card">
+          <div class="section-head">
+            <h2>📂 Phim Gốc Trong <code>Download/</code></h2>
+            <button class="btn ghost sm" id="btnReloadProjects">🔄 Làm mới</button>
+          </div>
+          <div id="downloadsList" class="list-box">Đang tải...</div>
+        </div>
+
+        <div class="card">
+          <div class="section-head">
+            <h2>☁️ Kho Lưu Trữ <code>gdrive:MT-Video</code></h2>
+            <button class="btn ghost sm" id="btnReloadDrive">🔄 Quét Drive</button>
+          </div>
+          <div id="driveList" class="list-box">Bấm "Quét Drive" để kiểm tra file trên Google Drive...</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: QUY TRÌNH CHUẨN -->
+    <section id="tab-docs" class="view">
+      <div class="card">
+        <h2>📖 Quy Trình Chuẩn & Hồ Sơ Nhân Vật</h2>
+        <pre id="docContent" class="doc-pre">Đang tải...</pre>
+      </div>
+    </section>
+  </main>
+
+  <!-- MODAL XÁC NHẬN THUÊ GPU -->
+  <div id="rentModal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card">
+      <h3>🚀 Xác Nhận Thuê Máy GPU Vast.ai</h3>
+      <div id="rentModalBody" class="modal-body"></div>
+      <div class="modal-fields">
+        <label>Dung lượng ổ đĩa thuê (GB):
+          <input type="number" id="rentDiskInput" value="45" min="35" max="200" />
+        </label>
+        <label>Nhãn ghi chú máy:
+          <input type="text" id="rentLabelInput" value="mt-reel-step3" />
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button class="btn ghost" id="btnCancelRent">Hủy</button>
+        <button class="btn primary" id="btnConfirmRent">✅ Bấm Thuê Ngay</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js?v=3"></script>
+</body>
+</html>
