@@ -57,7 +57,7 @@ MT-Video/
 ## 3. Bộ Lọc Thuê GPU Vast.ai Tối Ưu Giá Rẻ & Hiệu Quả Cao Nhất
 
 ```text
-gpu_ram>=12 num_gpus=1 compute_cap>=860 dlperf>=22 dph<=0.22 verified=True reliability>0.97 cuda_max_good>=12.8 cpu_cores_effective>=4 cpu_ram>=16 pcie_bw>=5 inet_down>=200 inet_up>=100 disk_space>=45 direct_port_count>=1 geolocation notin [CN] rented=False
+gpu_ram>=12 num_gpus=1 compute_cap>=860 gpu_name notin [A100_SXM4,A100_PCIE,H100_SXM,H100_PCIE,H200] dlperf>=22 dph<=0.22 verified=True reliability>0.97 cuda_max_good>=12.8 cpu_cores_effective>=4 cpu_ram>=16 pcie_bw>=5 inet_down>=200 inet_up>=100 disk_space>=45 direct_port_count>=1 geolocation notin [CN] rented=False
 ```
 *(Sắp xếp theo `-o dph_total` để lấy giá/giờ thấp nhất, ưu tiên máy có chỉ số **`DLP/$ >= 350`**).*
 
