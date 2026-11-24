@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # 2. Core AI audio tools on system PyTorch 2.10 + CUDA 12.8 (audio-separator + VieNeu-TTS)
 RUN pip install --no-cache-dir -U pip uv \
-    && pip install --no-cache-dir -U "audio-separator[gpu]" "vieneu[cuda]" librosa soundfile scipy opencv-python-headless google-genai \
+    && pip install --no-cache-dir -U "audio-separator[gpu]" "vieneu[cuda]" audioread librosa soundfile scipy opencv-python-headless google-genai \
     && pip uninstall -y onnxruntime || true \
     && pip install --no-cache-dir -U onnxruntime-gpu
 
