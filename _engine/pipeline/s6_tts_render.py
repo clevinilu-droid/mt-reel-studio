@@ -28,7 +28,7 @@ import numpy as np
 
 from _engine.core.checkpoint import ENGINE_DIR, OUTPUT_ROOT, ROOT_DIR, atomic_write_json, read_json_safe
 from _engine.core.vram_guard import emit_progress, load_pipeline_config, release_vram
-from _engine.pipeline.s1_prepare import detect_gpu_encoder
+from _engine.pipeline.s1_prepare import detect_gpu_encoder, probe_media
 
 SR = 48000
 LANG_ISO3 = {"vi": "vie", "en": "eng", "ja": "jpn", "ko": "kor", "es": "spa", "zh": "zho"}
@@ -570,7 +570,7 @@ def _mix_track_streaming(turns: list[dict[str, Any]], turn_files: list[Path], cl
                 wf_out.writeframes(np.clip(mixed * 32767.0, -32768, 32767).astype(np.int16).tobytes())
 
         subprocess.run(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(raw_wav), "-c:a", "aac", "-b:a", "192k", "-ar", str(SR), "-ac", "2", str(out_m4a)],
+            ["ffmpeg", "-y", "-v", "error", "-i", str(raw_wav), "-c:a", "aac", "-b:a", "128k", "-ar", str(SR), "-ac", "2", str(out_m4a)],
             check=True,
         )
     finally:
@@ -677,6 +677,36 @@ def _compute_wm_alpha_scale(wm_png: Path, target_opacity: float = 0.10) -> float
     return round(target_opacity, 3)
 
 
+def _compute_smart_video_bitrate_kbps(cfr_mp4: Path) -> tuple[int, int]:
+    """Đo bitrate thật của video gốc để khóa bitrate đầu ra tương xứng (~450–650MB cho phim gốc 438MB, tránh phình lên 6GB)."""
+    candidates: list[Path] = []
+    # Ưu tiên file source.mp4 gốc trong thư mục work hoặc đường dẫn source lưu trong step1_audit.json
+    for p in (cfr_mp4.parent / "source.mp4", cfr_mp4.parent.parent / "source.mp4"):
+        if p.exists() and p.stat().st_size > 100_000:
+            candidates.append(p)
+    for audit_p in (cfr_mp4.parent / "step1_audit.json", cfr_mp4.parent.parent / "step1_audit.json"):
+        if audit_p.exists():
+            audit = read_json_safe(audit_p) or {}
+            sp = audit.get("source")
+            if sp and Path(sp).exists():
+                candidates.append(Path(sp))
+    candidates.append(cfr_mp4)
+
+    # Chọn file có dung lượng nhỏ nhất (chính là bản nén gốc chưa bị phình CFR cũ)
+    ref_mp4 = min(candidates, key=lambda x: x.stat().st_size)
+    try:
+        info = probe_media(ref_mp4)
+        dur_s = max(1.0, float(info.get("duration_s") or 1.0))
+        total_kbps = (ref_mp4.stat().st_size * 8.0) / 1000.0 / dur_s
+        orig_v_kbps = max(240.0, total_kbps - 64.0)
+        # Bù nhẹ ~15% khi chuyển từ HEVC gốc sang H.264, giới hạn trong khoảng 380..1200 kbps
+        target_kbps = int(min(1200, max(380, round(orig_v_kbps * 1.15))))
+        max_kbps = int(round(target_kbps * 1.35))
+        return target_kbps, max_kbps
+    except Exception:
+        return 500, 680
+
+
 def _render_master_mp4(
     cfr_mp4: Path,
     master_audio: Path,
@@ -685,9 +715,11 @@ def _render_master_mp4(
     turns: list[dict[str, Any]] | None = None,
     primary_lang: str = "vi",
 ):
-    """Render MP4 9:16 chuẩn chất lượng cao: làm mờ sub Trung + watermark 10% đè lên dải mờ + soft sub."""
+    """Render MP4 9:16 chuẩn dung lượng gọn theo bản gốc: làm mờ sub Trung + watermark 10% đè lên dải mờ."""
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
-    enc_name, hw_args, enc_args = detect_gpu_encoder()
+    enc_name, hw_args, _ = detect_gpu_encoder()
+    target_kbps, max_kbps = _compute_smart_video_bitrate_kbps(cfr_mp4)
+    buf_kbps = max_kbps * 2
     wm_png = ROOT_DIR / "branding" / "MT_Reel_Strip_Watermark.png"
     iso3 = LANG_ISO3.get(primary_lang, "und")
 
@@ -697,6 +729,22 @@ def _render_master_mp4(
 
     has_wm = wm_png.exists()
     wm_aa = _compute_wm_alpha_scale(wm_png, target_opacity=0.10) if has_wm else 0.10
+
+    def _build_v_enc(use_hw: bool) -> list[str]:
+        if use_hw and enc_name == "h264_nvenc":
+            return [
+                "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "27",
+                "-b:v", f"{target_kbps}k", "-maxrate", f"{max_kbps}k", "-bufsize", f"{buf_kbps}k",
+            ]
+        if use_hw and enc_name == "h264_qsv":
+            return [
+                "-c:v", "h264_qsv", "-preset", "veryfast",
+                "-b:v", f"{target_kbps}k", "-maxrate", f"{max_kbps}k", "-bufsize", f"{buf_kbps}k",
+            ]
+        return [
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+            "-maxrate", f"{max_kbps}k", "-bufsize", f"{buf_kbps}k",
+        ]
 
     def _build_cmd(use_hw: bool) -> list[str]:
         cmd = ["ffmpeg", "-y", "-v", "warning"]
@@ -717,19 +765,18 @@ def _render_master_mp4(
                 f"{blur_chain}"
                 f"[fgraw][subblur]overlay={bx}:{by}[vblur];"
                 f"[{wm_idx}:v]scale={bw}:{bh}:force_original_aspect_ratio=decrease,format=rgba,colorchannelmixer=aa={wm_aa:.3f}[wm];"
-                f"[vblur][wm]overlay={bx}+({bw}-w)/2:{by}+({bh}-h)/2,format=yuv420p[vout]"
+                f"[vblur][wm]overlay={bx}+({bw}-w)/2:{by}+({bh}-h)/2,scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[vout]"
             )
         else:
-            fc = f"{blur_chain}[fgraw][subblur]overlay={bx}:{by},format=yuv420p[vout]"
+            fc = f"{blur_chain}[fgraw][subblur]overlay={bx}:{by},scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p[vout]"
 
-        v_enc = enc_args if use_hw else ["-c:v", "libx264", "-preset", "veryfast", "-crf", "19"]
-        # Không nhúng track mov_text vào trong MP4 để trình phát video không tự bật chữ đè góc màn hình; file .srt vẫn lưu riêng ở subtitles/
+        v_enc = _build_v_enc(use_hw)
         cmd += ["-filter_complex", fc, "-map", "[vout]", "-map", "1:a:0", *v_enc, "-c:a", "copy", "-sn", "-metadata:s:a:0", f"language={iso3}", "-movflags", "+faststart"]
         cmd.append(str(out_mp4))
         return cmd
 
     cmd = _build_cmd(use_hw=(enc_name != "libx264"))
-    print(f"[S6 RENDER] Encoder={enc_name} | SubBlur=({bx},{by},{bw}x{bh}) | WM_aa={wm_aa} -> {out_mp4}", flush=True)
+    print(f"[S6 RENDER] Encoder={enc_name} ({target_kbps}k/{max_kbps}k) | SubBlur=({bx},{by},{bw}x{bh}) | WM_aa={wm_aa} -> {out_mp4}", flush=True)
     res = subprocess.run(cmd)
     if res.returncode != 0 and enc_name != "libx264":
         print(f"[S6 RENDER WARN] {enc_name} lỗi (exit={res.returncode}) -> tự chuyển sang libx264...", flush=True)

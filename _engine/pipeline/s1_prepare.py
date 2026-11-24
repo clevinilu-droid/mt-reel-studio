@@ -175,6 +175,29 @@ def _fmt_eta(sec: float) -> str:
     return f"{h}h{m:02d}m{s:02d}s" if h else f"{m}m{s:02d}s"
 
 
+def _link_or_copy_video(src_mp4: Path, dst_mp4: Path, max_dur: float | None = None):
+    """Dùng trực tiếp video gốc (hardlink/copy 0.1s cho Full, hoặc stream-copy -c:v copy 1s cho Test) để KHÔNG encode video 2 lần và KHÔNG làm phình file 400MB lên 3.7GB."""
+    dst_mp4.parent.mkdir(parents=True, exist_ok=True)
+    if max_dur is not None:
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", str(src_mp4),
+            "-t", f"{max_dur:.3f}",
+            "-map", "0:v:0",
+            "-c:v", "copy",
+            "-an",
+            str(dst_mp4),
+        ]
+        subprocess.run(cmd, check=True)
+        return
+    if dst_mp4.exists():
+        dst_mp4.unlink(missing_ok=True)
+    try:
+        os.link(src_mp4, dst_mp4)
+    except Exception:
+        shutil.copy2(src_mp4, dst_mp4)
+
+
 def _run_ffmpeg_normalize(
     src_mp4: Path,
     cfr_mp4: Path,
@@ -188,12 +211,10 @@ def _run_ffmpeg_normalize(
     prog_cb: ProgFn | None = None,
     cancel_event: threading.Event | None = None,
 ):
-    vf = (
-        "fps=30,"
-        "scale=1080:1920:force_original_aspect_ratio=decrease,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
-        "format=nv12"
-    )
+    if prog_cb:
+        prog_cb(8.0, "Đang gắn liên kết video gốc (không encode lại để giữ dung lượng gốc ~400MB)...")
+    _link_or_copy_video(src_mp4, cfr_mp4, max_dur=max_dur)
+
     t_args = ["-t", f"{max_dur:.3f}"] if max_dur is not None else []
     cmd = [
         "ffmpeg",
@@ -203,21 +224,8 @@ def _run_ffmpeg_normalize(
         "-progress",
         "pipe:1",
         "-nostats",
-        "-fflags",
-        "+genpts",
-        *hw_args,
         "-i",
         str(src_mp4),
-        *t_args,
-        "-map",
-        "0:v:0",
-        "-vf",
-        vf,
-        _ffmpeg_cfr_flag(),
-        "cfr",
-        *enc_args,
-        "-an",
-        str(cfr_mp4),
         *t_args,
         "-map",
         "0:a:0",
@@ -560,40 +568,16 @@ def run_step1(
     if drive_audit_ok:
         full_audit = json.loads((work_dir / "step1_audit.json").read_text(encoding="utf-8"))
         if log_cb:
-            log_cb("[STEP 1] Đã có hồ sơ Spot-Check & Audio 48k từ Google Drive → chỉ chuẩn hóa lại video CFR (bỏ qua Spot-Check).")
+            log_cb("[STEP 1] Đã có gói Cách B từ Google Drive → gắn trực tiếp video gốc (<1s, không encode lại, không phình dung lượng).")
         src_info = full_audit.get("source_probe") or probe_media(src_mp4)
-        enc_name, hw_args, enc_args = detect_gpu_encoder()
+        enc_name, _, _ = detect_gpu_encoder()
         max_dur = min(120.0, float(src_info.get("duration_s") or 120.0)) if is_test else None
-        expected_dur = max_dur if max_dur is not None else float(src_info.get("duration_s") or 0.0)
         cfr_mp4 = target_dir / "01_cfr_raw.mp4"
         wav_48k = target_dir / "01_orig_48k_stereo.wav"
         wav_16k = target_dir / "01_orig_16k_ai.wav"
         t1 = time.perf_counter()
         if not cfr_mp4.exists() or cfr_mp4.stat().st_size < 100_000:
-            vf = (
-                "fps=30,"
-                "scale=1080:1920:force_original_aspect_ratio=decrease,"
-                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
-                "format=nv12"
-            )
-            t_args = ["-t", f"{max_dur:.3f}"] if max_dur is not None else []
-            vcmd = [
-                "ffmpeg", "-y", "-v", "warning", "-progress", "pipe:1", "-nostats",
-                "-fflags", "+genpts", *hw_args, "-i", str(src_mp4), *t_args,
-                "-map", "0:v:0", "-vf", vf, _ffmpeg_cfr_flag(), "cfr", *enc_args, "-an", str(cfr_mp4),
-            ]
-            proc = subprocess.Popen(vcmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
-            if proc.stdout:
-                for raw_line in proc.stdout:
-                    if cancel_event and cancel_event.is_set():
-                        proc.terminate()
-                        raise InterruptedError("Người dùng đã tạm dừng Bước 1")
-                    m = FF_TIME_RE.search(raw_line.strip())
-                    if m and expected_dur > 0 and prog_cb:
-                        cur_s = int(m.group(1)) / 1_000_000.0
-                        prog_cb(min(92.0, 10.0 + (cur_s / expected_dur) * 82.0), f"Encode video CFR {cur_s:.0f}/{expected_dur:.0f}s ({enc_name})")
-            if proc.wait() != 0:
-                raise RuntimeError("FFmpeg encode video CFR từ gói Drive thất bại")
+            _link_or_copy_video(src_mp4, cfr_mp4, max_dur=max_dur)
         if is_test:
             _slice_wav_head(work_dir / "01_orig_48k_stereo.wav", wav_48k, 120.0)
             _slice_wav_head(work_dir / "01_orig_16k_ai.wav", wav_16k, 120.0)
@@ -611,7 +595,7 @@ def run_step1(
         }
         atomic_write_json(audit_json, report)
         if prog_cb:
-            prog_cb(100.0, f"Xong CFR nhanh từ gói Drive ({enc_name}, {elapsed}s)")
+            prog_cb(100.0, f"Xong Bước 1 tức thì từ gói Drive ({elapsed}s, giữ nguyên dung lượng gốc)")
         return report
 
     t_total0 = time.perf_counter()
