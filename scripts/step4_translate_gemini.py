@@ -34,7 +34,7 @@ def fmt_ts(sec: float) -> str:
 
 def build_prompt(profile_md: str, glossary_json: str, prev_ctx: list[dict], batch: list[dict], part_note: str) -> str:
     ctx_txt = "\n".join(
-        f"[{c['id']}] ({c['tag']}, {c['f0_hz']}Hz) ZH: {c['text']} -> VI: {c.get('vi', '')}"
+        f"[{c['id']}] ({c.get('voice_role', '')}) ZH: {c.get('zh', '')} -> VI: {c.get('vi', '')}"
         for c in prev_ctx
     )
     in_items = [
@@ -72,8 +72,13 @@ LINES TO TRANSLATE:
 """
 
 
+EXHAUSTED_MODELS: set[str] = set()
+
+
 def translate_batch(client: genai.Client, prompt: str, expected_ids: list[int]) -> list[dict]:
-    for model_name in ("gemini-3.5-flash", "gemini-3.1-flash-lite"):
+    for model_name in ("gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-2.5-flash-lite"):
+        if model_name in EXHAUSTED_MODELS:
+            continue
         for attempt in range(4):
             try:
                 resp = client.models.generate_content(
@@ -95,7 +100,12 @@ def translate_batch(client: genai.Client, prompt: str, expected_ids: list[int]) 
                     return [by_id[eid] for eid in expected_ids]
                 print(f"[STEP4] Missing IDs from {model_name} attempt {attempt+1}: got {len(by_id)}/{len(expected_ids)}", flush=True)
             except Exception as e:
-                print(f"[STEP4] {model_name} err attempt {attempt+1}: {str(e)[:140]}", flush=True)
+                emsg = str(e)
+                print(f"[STEP4] {model_name} err attempt {attempt+1}: {emsg[:140]}", flush=True)
+                if "RESOURCE_EXHAUSTED" in emsg or "429" in emsg:
+                    if "limit: 0" in emsg or "exceeded your current quota" in emsg:
+                        EXHAUSTED_MODELS.add(model_name)
+                        break
             time.sleep(2.0 * (attempt + 1))
     raise RuntimeError(f"Failed translating batch starting ID {expected_ids[0]}")
 

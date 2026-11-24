@@ -166,15 +166,16 @@ async def _synth_edge_lang(lang: str, lines: list[dict], tmp_dir: Path) -> dict[
         rate_str = f"+{pct}%"
         mp3_path = tmp_dir / f"{lang}_{item['id']:04d}.mp3"
         async with sem:
-            for attempt in range(3):
+            for attempt in range(6):
                 try:
                     comm = edge_tts.Communicate(text, voice=voice, rate=rate_str)
                     await comm.save(str(mp3_path))
                     break
-                except Exception:
-                    if attempt == 2:
+                except Exception as exc:
+                    if attempt == 5:
+                        print(f"[WARN] Edge-TTS failed {lang} line #{item['id']}: {exc}", flush=True)
                         return
-                    await asyncio.sleep(0.6 * (attempt + 1))
+                    await asyncio.sleep(0.8 * (attempt + 1))
         wav, _ = librosa.load(str(mp3_path), sr=TARGET_SR, mono=True)
         clips[item["id"]] = trim_silence(wav.astype(np.float32), top_db=34.0)
 

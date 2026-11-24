@@ -103,7 +103,17 @@ def main():
         events.append(cur)
 
     events = [e for e in events if (e["end"] - e["start"]) >= 0.20]
-    font = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", 22)
+    font = None
+    for fpath in (
+        "C:/Windows/Fonts/arialbd.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ):
+        if Path(fpath).exists():
+            font = ImageFont.truetype(fpath, 22)
+            break
+    if font is None:
+        font = ImageFont.load_default()
 
     meta_out = []
     strips = []

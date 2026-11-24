@@ -30,15 +30,23 @@ def fmt_ts(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def _imread_utf8(path: Path) -> np.ndarray:
+    buf = np.fromfile(str(path), dtype=np.uint8)
+    img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError(f"Khong doc duoc anh: {path}")
+    return img
+
+
 def load_strips(step3_dir: Path, events: list[dict], bar_w: int = 230, per_sheet: int = 25) -> list[np.ndarray]:
     sheets = sorted((step3_dir / "hardsub_grids").glob("sub_sheet_*.jpg"))
     if not sheets:
         raise FileNotFoundError(f"Khong tim thay sub_sheet_*.jpg trong {step3_dir / 'hardsub_grids'}")
-    first = cv2.imread(str(sheets[0]))
+    first = _imread_utf8(sheets[0])
     strip_h = first.shape[0] // min(per_sheet, len(events))
     strips: list[np.ndarray] = []
     for s_path in sheets:
-        img = cv2.imread(str(s_path))
+        img = _imread_utf8(s_path)
         n_rows = img.shape[0] // strip_h
         for r in range(n_rows):
             crop = img[r * strip_h : (r + 1) * strip_h, bar_w:]
