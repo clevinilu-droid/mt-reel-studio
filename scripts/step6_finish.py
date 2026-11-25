@@ -16,7 +16,10 @@ import sys
 import time
 from pathlib import Path
 
-from vast_guard import destroy_instance, list_instances
+try:
+    from vast_guard import destroy_instance, list_instances
+except ImportError:
+    from scripts.vast_guard import destroy_instance, list_instances
 
 
 def verify_part_outputs(part_dir: Path, part_name: str) -> None:
