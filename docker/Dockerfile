@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # 1. System tools + FFmpeg 8.1 static (NVENC + libass + gblur) + rclone + OpenSSH
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl wget xz-utils unzip git libsndfile1 \
-    openssh-server tmux htop nano \
+    libgl1 libglib2.0-0 openssh-server tmux htop nano \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/run/sshd \
     && curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz" -o /tmp/ffmpeg.tar.xz \
@@ -27,15 +27,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && chmod +x /usr/local/bin/rclone \
     && rm -rf /tmp/rclone*
 
-# 2. Core AI audio tools on system PyTorch 2.10 + CUDA 12.8 (audio-separator + VieNeu-TTS)
+# 2. Core AI audio + OCR + TTS tools on system PyTorch 2.10 + CUDA 12.8
 RUN pip install --no-cache-dir -U pip uv \
-    && pip install --no-cache-dir -U "audio-separator[gpu]" "vieneu[cuda]" audioread librosa soundfile scipy opencv-python-headless google-genai \
+    && pip install --no-cache-dir -U "audio-separator[gpu]" "vieneu[cuda]" audioread librosa soundfile scipy opencv-python-headless google-genai rapidocr-onnxruntime edge-tts python-dotenv pillow \
     && pip uninstall -y onnxruntime || true \
     && pip install --no-cache-dir --force-reinstall --no-deps onnxruntime-gpu
 
-# 3. Pre-download Mel-Band-RoFormer (InstVoc Duality V2) so Step 3.1 starts in 0s
+# 3. Pre-download Mel-Band-RoFormer (InstVoc Duality V2) & verify RapidOCR ONNX init
 RUN mkdir -p /opt/audio-separator-models \
-    && python3 -c "from audio_separator.separator import Separator; Separator(model_file_dir='/opt/audio-separator-models', info_only=True).download_model_files('melband_roformer_instvox_duality_v2.ckpt')"
+    && python3 -c "from audio_separator.separator import Separator; Separator(model_file_dir='/opt/audio-separator-models', info_only=True).download_model_files('melband_roformer_instvox_duality_v2.ckpt')" \
+    && python3 -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(); print('RapidOCR_OK')"
 
 # 4. Pre-install pyVideoTrans v4.19 in isolated uv Python 3.10 venv (for Step 5 dubbing)
 RUN git clone --depth 1 https://github.com/jianchang512/pyvideotrans.git /opt/pyvideotrans \
