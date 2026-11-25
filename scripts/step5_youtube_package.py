@@ -210,19 +210,44 @@ def format_description(
     return "\n".join(parts).strip() + "\n"
 
 
+def save_custom_16x9_thumbnail(custom_src: Path, out_dir: Path) -> Path:
+    """Chuẩn hóa thumbnail 16:9 thiết kế riêng (không dùng poster gốc có chữ Trung) về đúng 1280x720 (<2MB)."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    im = Image.open(custom_src).convert("RGB")
+    tw, th = 1280, 720
+    scale = max(tw / im.width, th / im.height)
+    rw, rh = int(round(im.width * scale)), int(round(im.height * scale))
+    res = im.resize((rw, rh), Image.Resampling.LANCZOS)
+    left = (rw - tw) // 2
+    top = (rh - th) // 2
+    out = res.crop((left, top, left + tw, top + th))
+    thumb_16x9 = out_dir / "thumb_1280x720.jpg"
+    out.save(thumb_16x9, format="JPEG", quality=94, optimize=True)
+    return thumb_16x9
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Đóng gói Thumbnail & Metadata YouTube 4 ngôn ngữ")
-    parser.add_argument("--poster", required=True, help="Đường dẫn tới poster.jpg gốc")
+    parser.add_argument("--poster", default="", help="Đường dẫn tới poster.jpg gốc (dự phòng khi chưa có --custom-thumb)")
+    parser.add_argument("--custom-thumb", default="", help="Ảnh thumbnail 16:9 thiết kế riêng (ưu tiên, không dùng poster gốc)")
     parser.add_argument("--part", default="P1", help="Nhãn tập/phần, ví dụ P1 hoặc P2")
     parser.add_argument("--config", required=True, help="File JSON chứa title/plot/chapters 4 ngôn ngữ")
     parser.add_argument("--out-dir", required=True, help="Thư mục xuất thumbnail & SEO txt/json")
     args = parser.parse_args()
 
-    poster_path = Path(args.poster)
     out_dir = Path(args.out_dir)
     cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
 
-    thumb_16x9, thumb_vert = build_thumbnails(poster_path, args.part, out_dir)
+    thumb_vert = None
+    existing_thumb = out_dir / "thumb_1280x720.jpg"
+    if args.custom_thumb:
+        thumb_16x9 = save_custom_16x9_thumbnail(Path(args.custom_thumb), out_dir)
+    elif existing_thumb.is_file() and not args.poster:
+        thumb_16x9 = existing_thumb
+    elif args.poster:
+        thumb_16x9, thumb_vert = build_thumbnails(Path(args.poster), args.part, out_dir)
+    else:
+        raise SystemExit("Cần truyền --custom-thumb hoặc --poster")
 
     localizations: dict[str, dict[str, str]] = {}
     for lang in ("vi", "en", "ja", "ko"):
@@ -244,16 +269,17 @@ def main() -> int:
             encoding="utf-8",
         )
 
+    thumbs_meta = {"youtube_16x9": str(thumb_16x9)}
+    if thumb_vert is not None:
+        thumbs_meta["poster_vertical"] = str(thumb_vert)
+
     payload = {
         "part": args.part,
         "defaultLanguage": cfg.get("defaultLanguage", "vi"),
         "defaultAudioLanguage": cfg.get("defaultAudioLanguage", "vi"),
         "privacyStatus": cfg.get("privacyStatus", "private"),
         "categoryId": cfg.get("categoryId", "24"),
-        "thumbnails": {
-            "youtube_16x9": str(thumb_16x9),
-            "poster_vertical": str(thumb_vert),
-        },
+        "thumbnails": thumbs_meta,
         "snippet": {
             "title": localizations[cfg.get("defaultLanguage", "vi")]["title"],
             "description": localizations[cfg.get("defaultLanguage", "vi")]["description"],
@@ -265,7 +291,8 @@ def main() -> int:
     meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print(f"THUMB_16X9={thumb_16x9} ({thumb_16x9.stat().st_size / 1024:.1f} KB)")
-    print(f"THUMB_POSTER={thumb_vert} ({thumb_vert.stat().st_size / 1024:.1f} KB)")
+    if thumb_vert is not None:
+        print(f"THUMB_POSTER={thumb_vert} ({thumb_vert.stat().st_size / 1024:.1f} KB)")
     print(f"METADATA_JSON={meta_path}")
     return 0
 

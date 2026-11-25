@@ -181,14 +181,15 @@ def wait_remote(endpoints: list[tuple[str, int]], job_name: str, poll_sec: int =
                 return
 
 
-def pull_part_outputs(endpoints: list[tuple[str, int]], part: str) -> None:
+def pull_part_outputs(endpoints: list[tuple[str, int]], part: str, slug: str = "Cuu_Dac_Nhiem_Lam_Ve_Si") -> None:
     out_local = SERIES / part / "04_buoc5_thanh_pham_youtube"
     r_out = f"/workspace/full/{part.lower()}/out"
-    pull_file(endpoints, f"{r_out}/{part}_vi.mp4", out_local / f"{part}_vi.mp4")
+    stem = f"{slug}_{part}"
+    pull_file(endpoints, f"{r_out}/{stem}.mp4", out_local / f"{stem}.mp4")
     for lang in ("vi", "en", "ja", "ko"):
-        pull_file(endpoints, f"{r_out}/audio_tracks/audio_{lang}.m4a", out_local / "audio_tracks" / f"audio_{lang}.m4a")
-        pull_file(endpoints, f"{r_out}/subtitles/{lang}.srt", out_local / "subtitles" / f"{lang}.srt")
-    pull_file(endpoints, f"{r_out}/subtitles/vi.vtt", out_local / "subtitles" / "vi.vtt")
+        pull_file(endpoints, f"{r_out}/{stem}.{lang}.m4a", out_local / f"{stem}.{lang}.m4a")
+        pull_file(endpoints, f"{r_out}/subtitles/{stem}.{lang}.srt", out_local / "subtitles" / f"{stem}.{lang}.srt")
+    pull_file(endpoints, f"{r_out}/subtitles/{stem}.vi.vtt", out_local / "subtitles" / f"{stem}.vi.vtt")
 
 
 def main() -> int:
@@ -235,7 +236,7 @@ def main() -> int:
             "/workspace/full/p2/step3/instrumental_48k.flac "
             "/workspace/full/p2/role_lines.json "
             "/workspace/full/p2/blur_config.json "
-            "/workspace/full/p2/out --name P2_vi.mp4 --langs vi,en,ja,ko",
+            "/workspace/full/p2/out --name Cuu_Dac_Nhiem_Lam_Ve_Si_P2.mp4 --langs vi,en,ja,ko",
         )
 
         # 4. While GPU runs P2 Step 5 (~35m), upload P1 source_norm.mp4 + vocals_48k_mono.flac
@@ -256,7 +257,7 @@ def main() -> int:
             "/workspace/full/p1/step3/instrumental_48k.flac "
             "/workspace/full/p1/role_lines.json "
             "/workspace/full/p1/blur_config.json "
-            "/workspace/full/p1/out --name P1_vi.mp4 --langs vi,en,ja,ko",
+            "/workspace/full/p1/out --name Cuu_Dac_Nhiem_Lam_Ve_Si_P1.mp4 --langs vi,en,ja,ko",
         )
         pull_part_outputs(endpoints, "P2")
         # Giải phóng file P2 lớn trên disk local? Không, cứ giữ gọn; đợi P1 xong rồi kéo P1

@@ -23,7 +23,7 @@ MT-Video/
             ├── 01_buoc2_nhan_vat_va_khung_blur/ ← 🔍 Chốt duyệt #1 (grids/, blur_truoc_sau.jpg, blur_config.json)
             ├── 02_buoc3_hardsub_va_am_thanh/    ← zh_hardsub.srt + vocals + instrumental
             ├── 03_buoc4_ban_dich_da_ngon_ngu/   ← 🔍 Chốt duyệt #2 (vi.srt, en.srt, ja.srt, ko.srt + role_lines.json)
-            └── 04_buoc5_thanh_pham_youtube/     ← 🔍 Chốt duyệt #3 (.mp4 làm mờ sạch sub cũ, audio_tracks/, subtitles/ softsub, youtube_seo/)
+            └── 04_buoc5_thanh_pham_youtube/     ← 🔍 Chốt duyệt #3 (<TenPhim>_P1.mp4, <TenPhim>_P1.{vi,en,ja,ko}.m4a cùng cấp, subtitles/<TenPhim>_P1.{vi,en,ja,ko}.srt + .vi.vtt, youtube_seo/)
 ```
 
 ---
@@ -31,8 +31,8 @@ MT-Video/
 ## 2. Quy Trình 5 Bước Chuẩn (Từ A–Z)
 
 ### Bước 1 — Chuẩn hóa nguồn & Image GPU
-* **1.1 Nguồn gốc & Image GPU:** Tải phim gốc (tách gọn theo `P1`, `P2`...) vào `Download/`, giữ nguyên 100% file gốc không sửa đè. Dùng Docker Image đóng gói sẵn trên GitHub Container Registry **`ghcr.io/clevinilu-droid/mt-reel-vast:latest`** làm Template Vast.ai (chứa sẵn `PyTorch 2.10 CUDA 12.8`, `FFmpeg 8.1 NVENC`, `rclone`, `audio-separator 0.48.0` + model `Mel-Band-RoFormer`, `VieNeu-TTS`, và `pyVideoTrans v4.19`).
-* **1.2 Chuẩn hóa Video Master (`scripts/step1_normalize.py`, bắt buộc trước mọi bước):** Phim gốc ghép từ hàng chục/trăm tập thường bị lệch 1–4px giữa các tập (`1080×1924` trộn `1080×1920`) và trôi nhẹ khung hình (`29.835` vs `30 fps`). Vì vậy bắt buộc xuất ra **`00_buoc1_chuan_hoa/source_norm.mp4`** khóa cứng **`1080×1920` (SAR 1:1, cắt gọn mép thừa nếu lệch pixel), `30 fps CFR`, âm thanh `48kHz Stereo` (`aresample=async=1`)** bằng phần cứng Intel QSV (`$0` trên Laptop) hoặc NVENC — toàn bộ Bước 2 → Bước 5 đọc chung 1 file chuẩn này.
+* **1.1 Nguồn gốc & Image GPU:** Tải phim gốc (tách gọn theo `P1`, `P2`...) vào `Download/`, giữ nguyên 100% file gốc không sửa đè. Dùng Docker Image đóng gói sẵn trên GitHub Container Registry **`ghcr.io/clevinilu-droid/mt-reel-vast:latest`** làm Template Vast.ai (chứa sẵn `PyTorch 2.10 CUDA 12.8`, `FFmpeg 8.1 NVENC`, `rclone`, `libgl1`, `libglib2.0-0`, `rapidocr-onnxruntime` + `onnxruntime-gpu`, `edge-tts`, `python-dotenv`, `pillow`, `audio-separator` + model `Mel-Band-RoFormer`, `VieNeu-TTS`, và `pyVideoTrans v4.19`).
+* **1.2 Chuẩn hóa Video Master (`scripts/step1_normalize.py`, chạy trên GPU hoặc Laptop):** Phim gốc ghép từ hàng chục/trăm tập thường bị lệch 1–4px giữa các tập (`1080×1924` trộn `1080×1920`) và trôi nhẹ khung hình (`29.835` vs `30 fps`). Vì vậy bắt buộc xuất ra **`00_buoc1_chuan_hoa/source_norm.mp4`** khóa cứng **`1080×1920` (SAR 1:1, cắt gọn mép thừa nếu lệch pixel), `30 fps CFR`, âm thanh `48kHz Stereo` (`aresample=async=1`)** bằng phần cứng NVENC (GPU Vast.ai) hoặc Intel QSV (`$0` trên Laptop) — toàn bộ Bước 2 → Bước 5 đọc chung 1 file chuẩn này.
 
 ### Bước 2 — Quét Bảng Tên Dọc & Canh Khung Làm Mờ Hardsub *(Chạy trên Laptop, \$0)*
 1. **Quét Hồ sơ nhân vật:** Dùng `FFmpeg` cắt lưới ảnh `6×8` nửa trên màn hình (`65%` chiều cao, `fps=1/2`, mỗi ảnh `96 giây`) $\rightarrow$ dùng Gemini Vision đọc chữ thư pháp dọc (`人物花字`) kết hợp nhìn mặt diễn viên để lập `HO_SO_NHAN_VAT.md` và `character_glossary.json` (Tên Hán-Việt, EN/JA/KO, Giới tính, Tuổi, Vai vế, Ma trận xưng hô giữa các cặp nhân vật).
@@ -44,9 +44,10 @@ MT-Video/
 
 ### Bước 3 — Trích xuất Hardsub gốc & Tách âm thanh mới *(Độ khớp Nội dung + Timeline 1:1)*
 * **Nguyên tắc cốt lõi:** Phụ đề Hardsub gốc ở đáy và giọng nói gốc trong video là cặp 1:1 cùng timeline `0.000s` (không phụ thuộc việc trên hình có thấy mặt người đang nói hay không).
+* **Phân công chạy GPU vs Trợ lý AI:** Toàn bộ các bước xử lý nặng từ **Bước 1 $\rightarrow$ Bước 3.4** (`step1_normalize.py`, tách khung `FFmpeg`, `step3_ocr_rapid.py`, `audio-separator` + `Mel-Band-RoFormer`, `step3_sync_and_gender.py`) đều có thể chạy trực tiếp trên **GPU Vast.ai** với Image mới (đã cài sẵn `libgl1`, `rapidocr-onnxruntime`, `onnxruntime-gpu`) để rút ngắn thời gian hàng loạt; riêng **Bước 4 (dịch thuật đa ngôn ngữ)** do trợ lý AI thực hiện trực tiếp để giữ chất lượng ngữ cảnh & xưng hô.
 * **Tách 2 luồng song song từ file gốc:**
   1. **Luồng Âm thanh (`audio-separator` + `Mel-Band-RoFormer` trên GPU Vast.ai):** Tách mới hoàn toàn từ video gốc bằng model **`melband_roformer_instvox_duality_v2.ckpt`** ra **Giọng nói sạch (`vocals_48k_mono.flac`)** và **Nhạc nền + Hiệu ứng (`instrumental_48k.flac`)** chuẩn `48kHz` Lossless (vừa nhẹ hơn `.wav` gần 4 lần, vừa giữ trọn 48kHz cho `VieNeu-TTS` và trộn BGM).
-  2. **Luồng Chữ (`Đọc Hardsub gốc` trên Laptop, `scripts/step3_extract_hardsub.py`):** Cắt vùng đáy cố định đã đo ở Bước 2 (`fps=5.0`), bắt chữ trắng/vàng có viền đen (`IoU >= 0.65`, ghép `25 dải/tờ`) $\rightarrow$ đọc ra file `zh_hardsub_raw.srt` đúng 100% mặt chữ tác giả, không sai tên nhân vật đồng âm.
+  2. **Luồng Chữ (`Đọc Hardsub gốc`, `scripts/step3_extract_hardsub.py` + `scripts/step3_ocr_rapid.py`):** Cắt vùng đáy cố định đã đo ở Bước 2 (`fps=5.0`), bắt chữ trắng/vàng có viền đen (`IoU >= 0.65`, ghép `25 dải/tờ`) $\rightarrow$ OCR tốc độ cao đọc ra file `zh_hardsub_raw.srt` đúng 100% mặt chữ tác giả, không sai tên nhân vật đồng âm.
 * **Khớp sóng âm (`Audio-Snap` & Phân vai bằng âm thanh, `scripts/step3_sync_and_gender.py`):**
   * Kéo mốc `start --> end` của `zh_hardsub_raw.srt` bám khít vào sóng âm thực tế của `vocals_48k_mono.flac` (`+-0.25s`) $\rightarrow$ xuất `zh_master_synced.srt`.
   * Gộp câu dài bị màn hình dọc cắt đôi (`merge_gap <= 0.16s`, tổng độ dài `<= 26` ký tự, không ngắt bởi dấu kết câu).
@@ -76,22 +77,21 @@ gpu_ram>=12 num_gpus=1 gpu_frac=1 compute_cap>=860 gpu_name notin [A100_SXM4,A10
 ### Bước 5 — Lồng tiếng, Trộn BGM & Xuất Thành Phẩm YouTube *(Trên Vast.ai GPU, `scripts/vast_step5_dub_and_render.py`)*
 1. **Lồng tiếng (Chốt cố định không clone ngoại ngữ):**
    * **Tiếng Việt:** Dùng **`VieNeu-TTS` (`mode="v3turbo"`, 48 kHz CUDA)** chỉ dùng **2 giọng Nam – Nữ tự nhiên cố định**: toàn bộ vai Nam dùng **`Hải Đăng`**, toàn bộ vai Nữ dùng **`Trúc Ly`**.
-   * **Anh / Nhật / Hàn:** Không clone; dùng **`edge-tts`** mỗi quốc gia **1 giọng Nữ bản địa tự nhiên**:
-     * `en`: **`en-US-AvaMultilingualNeural`**
-     * `ja`: **`ja-JP-NanamiNeural`**
-     * `ko`: **`ko-KR-SunHiNeural`**
-     * Căn chỉnh tốc độ trước khi đọc (`rate` tối đa `+32%`) kết hợp **`FFmpeg atempo`** (`1.55x–1.70x`) mượt, tuyệt đối không cắt cụt chữ giữa câu.
+   * **Anh / Nhật / Hàn:** Không clone từ tiếng Trung; hiện dùng **`edge-tts`** mỗi quốc gia **1 giọng Nữ bản địa** (`en-US-AvaMultilingualNeural`, `ja-JP-NanamiNeural`, `ko-KR-SunHiNeural`) với tốc độ `rate` tối đa `+32%` kết hợp **`FFmpeg atempo`** mượt, tuyệt đối không cắt cụt chữ giữa câu. *(Ghi chú nâng cấp sau: để diễn xuất giàu cảm xúc hơn thay cho kiểu đọc đều của `edge-tts`, có thể nâng cấp sang **Qwen-TTS / Fish Speech / IndexTTS2** trên GPU hoặc **ElevenLabs / MiniMax** theo cấu hình phim chủ lực).*
 2. **Trộn âm (`Mix` — Tham số đã duyệt):**
    * **Chỉ tăng +30% âm lượng riêng của giọng nói nhân vật (`VOICE_GAIN = 1.30`, soft-limiter `knee=0.78, ceil=0.95`)** cho cả 4 ngôn ngữ.
    * **Giữ nguyên mức dìm BGM (`gain = 1.0 - 0.70 * smooth`, tương đương `-10.5 dB` khi có thoại)** trên `instrumental_48k.flac`.
    * **Giữ lại 92% âm lượng `vocals_48k_mono.flac` ở mọi khoảng ngoài mốc thời gian phụ đề** (cắt êm `~90ms` về `0%` đúng trong khung `[start, end]`) để bảo toàn nguyên vẹn tiếng reo hò, tiếng cười đám đông, tiếng hét võ đài.
-   * Xuất từng track `audio_tracks/audio_{vi,en,ja,ko}.m4a` (`AAC 128k 48kHz Stereo`).
-3. **Render Video Master (`FFmpeg hevc_nvenc` / `h264_nvenc`):**
+   * Xuất từng track **`<TenPhim>_<Phan>.{vi,en,ja,ko}.m4a`** (`AAC 128k 48kHz Stereo`) **nằm cùng thư mục với file `.mp4`** (vì MPC-HC chỉ tự nạp âm thanh ngoài từ cùng thư mục chứa video).
+3. **Render Video Master & Quy tắc Đặt Tên Chuẩn MPC-HC (`FFmpeg hevc_nvenc` / `h264_nvenc`):**
    * Áp dụng duy nhất bộ lọc làm mờ dải hardsub gốc (`gblur=sigma=22` theo `blur_config.json`), **KHÔNG burn phụ đề mới vào video**.
    * Tham số nén tối ưu YouTube: `hevc_nvenc -rc vbr -cq 29 -b:v 700k -maxrate 1200k` (fallback `h264_nvenc -cq 28 -b:v 950k`), kèm `-movflags +faststart`.
-   * Xuất kèm bộ **Audio tracks** (`audio_en.m4a`, `audio_ja.m4a`, `audio_ko.m4a`) và bộ **Softsub** (`subtitles/{vi,en,ja,ko}.srt` + `vi.vtt` style `#FFEB50`, nền `rgba(0,0,0,0.55)`).
+   * **Đặt tên khớp 1:1 theo tên phim** (`<TenPhimKhongDau>_<Phan>`, ví dụ `Cuu_Dac_Nhiem_Lam_Ve_Si_P1`):
+     * Video chính: **`<TenPhim>_<Phan>.mp4`** (tích hợp sẵn track tiếng Việt).
+     * Audio ngoài đặt **cùng cấp** với `.mp4`: **`<TenPhim>_<Phan>.{vi,en,ja,ko}.m4a`** (MPC-HC tự nhận toàn bộ trong **Play $\rightarrow$ Audio Track**, bấm `A` để đổi).
+     * Softsub đặt trong `subtitles/`: **`<TenPhim>_<Phan>.{vi,en,ja,ko}.srt`** + **`<TenPhim>_<Phan>.vi.vtt`** (style `#FFEB50`, nền `rgba(0,0,0,0.55)`, chỉ đổi `,` $\rightarrow$ `.` ở dòng timecode). MPC-HC cấu hình `SubtitlesLanguageOrder = vie,vi,eng,en,jpn,ja,kor,ko`, tự nhận phụ đề từ `.;.\subtitles;.\subs` (`W` bật/tắt, `S` đổi ngôn ngữ).
 4. **Đóng gói YouTube (`scripts/step5_youtube_package.py`):**
-   * **Thumbnail (`1280×720`, `< 2 MB`):** Dùng `poster.jpg` gốc của phần đó đặt giữa nền blur đồng bộ từ chính poster, chỉ gắn **2 huy hiệu rõ nét ở góc trên: `HOT` và `P1`/`P2`**, không chèn chữ dài gây rối hay che mặt nhân vật.
+   * **Thumbnail (`1280×720`, `< 2 MB` — Thiết kế mới hoàn toàn, KHÔNG dùng poster gốc có chữ Trung):** Tự dựng bố cục **full-bleed 16:9** kịch tính từ ảnh cận cảnh sắc nét của các diễn viên thật trong phim (mỗi phần `P1`, `P2` một bối cảnh & tông màu riêng biệt để người xem muốn bấm vào ngay), chỉ gắn **2 huy hiệu nổi ở 2 góc trên: `HOT` (trái) và `P1`/`P2` (phải)**, giữ góc dưới-phải tối sạch tránh đồng hồ thời lượng YouTube.
    * **Tiêu đề (KHÔNG gộp 4 ngôn ngữ vào 1 tiêu đề):** Dùng mục **Ngôn ngữ (`Languages` / `localizations`)** trong YouTube Studio để đặt riêng 4 tiêu đề (`vi`, `en`, `ja`, `ko`) dịch sát tên gốc Trung Quốc (`<= 100 ký tự`, rõ số phần `Phần 1 / Part 1` ở cuối).
    * **Mô tả (Tách riêng 4 ngôn ngữ, chuẩn chính sách chống spam / Reused Content):**
      1. Nhập riêng từng bản mô tả vào tab ngôn ngữ tương ứng (`vi`, `en`, `ja`, `ko`), **không nhồi nhiều ngôn ngữ vào một ô mô tả**.
@@ -101,9 +101,9 @@ gpu_ram>=12 num_gpus=1 gpu_frac=1 compute_cap>=860 gpu_name notin [A100_SXM4,A10
 ### Bước 6 — Đồng bộ Google Drive, Tự Hủy GPU & Sleep Máy *(Hoàn toàn tự động)*
 1. **Cấu trúc lưu trữ trên Google Drive (`rclone` -> `gdrive:MT-Video/`):**
    * **Mỗi phim 1 thư mục riêng:** `gdrive:MT-Video/<Mã_TênPhim>/`
-   * **Mỗi phần 1 thư mục con:** `P1/`, `P2/`... Toàn bộ file thuộc phần nào lưu gọn trong thư mục phần đó gồm: video master `.mp4`, `audio_tracks/`, `subtitles/`, và `youtube_seo/` (gồm `thumb_1280x720.jpg`, `thumb_poster.jpg`, `metadata_4langs.json`, `youtube_*.txt`).
+   * **Mỗi phần 1 thư mục con:** `P1/`, `P2/`... Toàn bộ file thuộc phần nào lưu gọn đúng cấu trúc phẳng chuẩn MPC-HC + YouTube gồm: **`<TenPhim>_<Phan>.mp4`**, **`<TenPhim>_<Phan>.{vi,en,ja,ko}.m4a`** (cùng cấp `.mp4`), **`subtitles/<TenPhim>_<Phan>.{vi,en,ja,ko}.srt`** + **`.vi.vtt`**, và **`youtube_seo/`** (`thumb_1280x720.jpg` 16:9 thiết kế mới, `metadata_4langs.json`, `youtube_*.txt`).
 2. **Cơ chế tự hủy GPU an toàn (`Auto-Destroy Failsafe`):**
    * Bắt buộc bọc toàn bộ phiên chạy GPU trong khối `try...finally` phía máy điều khiển (và watchdog hẹn giờ tự dừng phía máy Vast.ai) để **tự động gọi `vastai destroy instance <ID>` ngay khi hoàn tất hoặc khi gặp bất kỳ lỗi nào**, không bao giờ để rò rỉ tiền thuê GPU.
 3. **Tự động đưa máy về Sleep sau khi hoàn tất:**
    * Chỉ kích hoạt Sleep (`Standby S0`) sau khi đã xác nhận: **(a)** tải đủ thành phẩm lên Google Drive và **(b)** instance Vast.ai đã `destroyed` hoàn toàn.
-* 🔍 **Điểm bạn duyệt #3:** Kiểm tra file trên Google Drive (video, 4 track âm thanh, phụ đề, thumbnail & SEO text) trước khi nạp vào YouTube Studio ở chế độ `Private`.
+* 🔍 **Điểm bạn duyệt #3:** Kiểm tra file trên Google Drive (video, 4 track âm thanh cùng tên, phụ đề, thumbnail 16:9 mới & SEO text) trước khi nạp vào YouTube Studio ở chế độ `Private`.

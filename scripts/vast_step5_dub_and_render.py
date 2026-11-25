@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import importlib.util
 import json
+import re
 import subprocess
 import tempfile
 import time
@@ -298,7 +299,7 @@ def pick_video_encoder() -> tuple[str, list[str]]:
 
 def srt_to_vtt(srt_path: Path, vtt_path: Path):
     txt = srt_path.read_text(encoding="utf-8")
-    vtt_body = txt.replace(",", ".")
+    vtt_body = re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", txt)
     header = (
         "WEBVTT\n\n"
         "STYLE\n"
@@ -312,23 +313,22 @@ def srt_to_vtt(srt_path: Path, vtt_path: Path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Step 5 GPU: VieNeu-TTS + pyVideoTrans Qwen3-TTS Voice Clone + Ducking + NVENC Blur Render.")
+    ap = argparse.ArgumentParser(description="Step 5 GPU: VieNeu-TTS + Edge-TTS + Ducking + NVENC Blur Render.")
     ap.add_argument("video", type=Path, help="Normalized video (.mp4)")
     ap.add_argument("vocals", type=Path, help="vocals_48k_mono.flac (used as voice clone ref)")
     ap.add_argument("instrumental", type=Path, help="instrumental_48k.flac")
     ap.add_argument("role_lines", type=Path, help="role_lines.json")
     ap.add_argument("blur_config", type=Path, help="blur_config.json")
     ap.add_argument("out_dir", type=Path, help="Output directory")
-    ap.add_argument("--name", default="P1_10m_vi.mp4", help="Output master MP4 filename")
+    ap.add_argument("--name", default="Phim_P1.mp4", help="Output master MP4 filename (audio/subtitles match its stem for MPC-HC)")
     ap.add_argument("--langs", default="vi,en,ja,ko", help="Comma-separated tracks to synthesize (e.g. vi or vi,en,ja,ko)")
     ap.add_argument("--skip-render", action="store_true", help="Only synthesize/mix audio tracks, skip video render")
     args = ap.parse_args()
 
     t_all = time.time()
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    audio_dir = args.out_dir / "audio_tracks"
+    stem = Path(args.name).stem
     sub_dir = args.out_dir / "subtitles"
-    audio_dir.mkdir(exist_ok=True)
     sub_dir.mkdir(exist_ok=True)
 
     lines = json.loads(args.role_lines.read_text(encoding="utf-8"))
@@ -350,10 +350,10 @@ def main():
 
     for lang in ("vi", "en", "ja", "ko"):
         blocks = [f"{x['id']}\n{x['start']} --> {x['end']}\n{x[lang]}\n" for x in lines]
-        srt_p = sub_dir / f"{lang}.srt"
+        srt_p = sub_dir / f"{stem}.{lang}.srt"
         srt_p.write_text("\n".join(blocks), encoding="utf-8")
         if lang == "vi":
-            srt_to_vtt(srt_p, sub_dir / "vi.vtt")
+            srt_to_vtt(srt_p, sub_dir / f"{stem}.vi.vtt")
 
     wanted_langs = [x.strip() for x in args.langs.split(",") if x.strip()]
     other_langs = [x for x in wanted_langs if x in ("en", "ja", "ko")]
@@ -361,7 +361,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         tmp_dir = Path(tmp)
 
-        vi_m4a = audio_dir / "audio_vi.m4a"
+        vi_m4a = args.out_dir / f"{stem}.vi.m4a"
         if "vi" in wanted_langs:
             # 1. VieNeu-TTS v3 Turbo (Vietnamese 2 voices: Hải Đăng + Trúc Ly)
             vi_clips = synthesize_vieneu(lines)
@@ -373,14 +373,14 @@ def main():
             for lang in other_langs:
                 tl = time.time()
                 lang_clips = asyncio.run(_synth_edge_lang(lang, lines, tmp_dir))
-                out_m4a = audio_dir / f"audio_{lang}.m4a"
+                out_m4a = args.out_dir / f"{stem}.{lang}.m4a"
                 build_timeline_and_mix(lines, lang_clips, orig_vocals, instr, total_samples, out_m4a, tmp_dir)
                 print(f"[OK] {lang.upper()} ({NATIVE_FEMALE_VOICES[lang]}) mixed in {time.time() - tl:.1f}s -> {out_m4a.name}", flush=True)
 
         if not args.skip_render:
             # 3. Render final blurred MP4 with Vietnamese dubbed audio
             enc_name, enc_flags = pick_video_encoder()
-            out_mp4 = args.out_dir / args.name
+            out_mp4 = args.out_dir / f"{stem}.mp4"
             t_v = time.time()
             print(f"[5.3] Rendering video with {enc_name} + blur ({vf_blur})...", flush=True)
             subprocess.run([
